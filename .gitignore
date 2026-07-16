@@ -1,0 +1,17 @@
+# ESP32 build artifacts
+.pio/
+build/
+*.bin
+*.elf
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
