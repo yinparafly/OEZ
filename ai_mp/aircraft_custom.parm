@@ -1,0 +1,41 @@
+# ========================================
+# 飞机自定义参数 - 基于真实飞机规格推导
+# 翼展2m, 巡航22m/s, 失速15m/s, 垂直俯冲空投
+# 质量7.7kg, 翼面积0.55m², 展弦比7.27
+# ========================================
+
+# --- 物理/气动 (通过defaults覆盖SITL默认值) ---
+# 这些参数由SITL模型SIM_Plane.cpp使用
+# 注意: SITL的b/s是硬编码在代码中的,需要改代码或用JSON模型
+
+# --- 飞行包线 ---
+AIRSPEED_CRUISE 22
+AIRSPEED_MAX 30
+AIRSPEED_MIN 10
+THR_MAX 100
+TRIM_THROTTLE 50
+
+# --- 关键: 空投需要俯仰到-90度 ---
+PTCH_LIM_MIN_DEG -90
+PTCH_LIM_MAX_DEG 25
+ROLL_LIMIT_DEG 65
+
+# --- PID 调参 (基于7.7kg飞机) ---
+RLL_RATE_P 0.3
+RLL_RATE_I 0.25
+RLL_RATE_D 0.017
+RLL_RATE_FF 0.24
+PTCH_RATE_P 0.15
+PTCH_RATE_I 0.11
+PTCH_RATE_D 0.007
+PTCH_RATE_FF 0.60
+RLL2SRV_RMAX 90
+RLL2SRV_TCONST 0.25
+PTCH2SRV_RMAX_DN 90
+PTCH2SRV_RMAX_UP 90
+PTCH2SRV_TCONST 0.25
+NAVL1_PERIOD 15
+
+# --- 空速校准 ---
+ARSPD_USE 1
+AIRSPEED_TYPE 1

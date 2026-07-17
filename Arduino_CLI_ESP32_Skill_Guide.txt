@@ -1,0 +1,351 @@
+=====================================================
+      Arduino CLI ESP32 智能体操作指南 (Skill)
+=====================================================
+版本：v1.0
+日期：2026-07-10
+适用开发板：YD-ESP32-S3-N8R2
+工作目录：D:\servotest\
+
+=====================================================
+一、架构概述
+=====================================================
+
+1.1 整体架构
+
+```
+用户/智能体
+    ↓
+Arduino CLI (命令行工具)
+    ↓
+Arduino Core (esp32:esp32)
+    ↓
+ESP-IDF Toolchain (xtensa-esp32s3-elf-gcc)
+    ↓
+ESPTool (烧录工具)
+    ↓
+YD-ESP32-S3 开发板
+```
+
+1.2 组件位置
+
+| 组件 | 路径 |
+|------|------|
+| Arduino CLI (IDE内置) | D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe |
+| Arduino CLI (独立) | D:\servotest\arduino-cli\arduino-cli.exe |
+| ESP32 Core | D:\Arduino\Arduino15\packages\esp32\hardware\esp32\3.3.10\ |
+| ESP32 Tools | D:\Arduino\Arduino15\packages\esp32\tools\ |
+| 用户配置 | C:\Users\tt\.arduinoIDE\arduino-cli.yaml |
+| 工作目录 | D:\servotest\ |
+
+1.3 关键约束
+
+- ✅ 可以修改：工作目录下的所有文件 (.ino, .txt, 配置文件)
+- ✅ 可以修改：Arduino15 目录下的配置文件
+- ❌ 不要修改：Arduino IDE 安装目录 (D:\Program Files\Arduino IDE\)
+- ❌ 不要修改：ESP32 Core 源码 (除非明确需要打补丁)
+
+=====================================================
+二、环境变量设置
+=====================================================
+
+在执行任何 CLI 命令前，必须设置环境变量：
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+```
+
+**原因**：告诉 CLI 去哪里找 ESP32 核心和工具链
+
+=====================================================
+三、常用命令
+=====================================================
+
+3.1 编译命令
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  compile --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\YourProject" `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+参数说明：
+- --fqbn：指定开发板型号 (esp32:esp32:yd_esp32s3_n8r2)
+- 项目路径：包含 .ino 文件的文件夹路径
+- --config-file：指定配置文件
+
+3.2 上传命令
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  upload --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\YourProject" `
+  --port COM17 `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+参数说明：
+- --port：指定串口端口 (COM17)
+- 其他参数同编译命令
+
+3.3 查看已连接开发板
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  board list --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+3.4 查看已安装库
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  lib list --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+3.5 安装库
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  lib install "Adafruit NeoPixel" `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+=====================================================
+四、项目结构要求
+=====================================================
+
+4.1 标准项目结构
+
+```
+D:\servotest\YourProject\
+└── YourProject.ino    ← 文件名必须与文件夹名相同
+```
+
+4.2 多文件项目结构
+
+```
+D:\servotest\YourProject\
+├── YourProject.ino    ← 主文件，必须包含 setup() 和 loop()
+├── header.h           ← 头文件
+├── utility.cpp        ← 源文件
+└── utility.h          ← 头文件
+```
+
+4.3 重要规则
+
+- .ino 文件必须在同名文件夹内
+- 主 .ino 文件必须包含 setup() 和 loop() 函数
+- 不能有多个 .ino 文件定义 setup()/loop()
+- 文件夹名称和文件名必须完全一致
+
+=====================================================
+五、开发板型号 (FQBN)
+=====================================================
+
+5.1 已配置的开发板
+
+| 板型名称 | FQBN | Flash | PSRAM |
+|---------|------|-------|-------|
+| YD-ESP32-S3-N8R2 | esp32:esp32:yd_esp32s3_n8r2 | 8MB | 2MB |
+| YD-ESP32-S3-N8R8 | esp32:esp32:yd_esp32s3_n8r8 | 8MB | 8MB |
+| YD-ESP32-S3-N16R8 | esp32:esp32:yd_esp32s3_n16r8 | 16MB | 8MB |
+
+5.2 默认使用
+
+默认使用 YD-ESP32-S3-N8R2：
+```
+--fqbn esp32:esp32:yd_esp32s3_n8r2
+```
+
+=====================================================
+六、端口检测
+=====================================================
+
+6.1 自动检测
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+$ports = & "D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  board list --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+$esp32Port = $ports | Select-String "ESP32-S3" | ForEach-Object { $_.Line.Split()[0] }
+Write-Host "ESP32 Port: $esp32Port"
+```
+
+6.2 已知端口
+
+YD-ESP32-S3 通常连接在：COM17
+
+=====================================================
+七、常见错误与解决方案
+=====================================================
+
+7.1 编译错误：undefined reference to setup()/loop()
+
+原因：
+- 文件扩展名不是 .ino
+- 文件夹名与文件名不一致
+- 缺少 setup() 或 loop() 函数
+
+解决方案：
+```powershell
+# 确保项目结构正确
+D:\servotest\YourProject\
+└── YourProject.ino
+```
+
+7.2 上传错误：No such file or directory: partitions.bin
+
+原因：
+- 使用了 --build-path 参数，上传时找不到编译产物
+
+解决方案：
+```powershell
+# 编译时不要使用 --build-path
+arduino-cli compile --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\YourProject"
+# 直接上传，CLI 会自动找到编译产物
+arduino-cli upload --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\YourProject" --port COM17
+```
+
+7.3 连接错误：Could not open port COM17
+
+原因：
+- 开发板未连接
+- 端口被其他程序占用
+- USB 驱动未安装
+
+解决方案：
+```powershell
+# 检查连接状态
+arduino-cli board list
+
+# 如果端口被占用，关闭其他串口工具
+```
+
+7.4 编译错误：library not found
+
+原因：
+- 缺少依赖库
+
+解决方案：
+```powershell
+# 安装所需库
+arduino-cli lib install "Adafruit NeoPixel"
+```
+
+=====================================================
+八、操作流程
+=====================================================
+
+8.1 标准操作流程
+
+```
+1. 编写/修改 .ino 文件
+    ↓
+2. 编译代码 (compile)
+    ↓
+3. 检查编译结果
+    ├─ 成功 → 继续上传
+    └─ 失败 → 修复错误，重新编译
+    ↓
+4. 上传代码 (upload)
+    ↓
+5. 检查上传结果
+    ├─ 成功 → 完成
+    └─ 失败 → 检查端口和连接，重新上传
+```
+
+8.2 完整示例
+
+```powershell
+# 1. 设置环境变量
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+
+# 2. 编译
+& "D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  compile --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\RGB_Breathing_Led" `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+
+# 3. 检查编译是否成功
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "编译成功"
+    # 4. 上传
+    & "D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+      upload --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\RGB_Breathing_Led" `
+      --port COM17 `
+      --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+} else {
+    Write-Host "编译失败"
+}
+```
+
+=====================================================
+九、注意事项
+=====================================================
+
+9.1 不要修改的内容
+
+| 路径 | 说明 |
+|------|------|
+| D:\Program Files\Arduino IDE\ | Arduino IDE 安装目录 |
+| D:\Arduino\Arduino15\packages\esp32\hardware\esp32\3.3.10\cores\ | ESP32 核心源码 |
+| D:\Arduino\Arduino15\packages\esp32\tools\ | 工具链文件 |
+
+9.2 可以修改的内容
+
+| 路径 | 说明 |
+|------|------|
+| D:\servotest\ | 工作目录，所有项目文件 |
+| D:\Arduino\Arduino15\packages\esp32\hardware\esp32\3.3.10\boards.txt | 自定义板型定义 |
+| C:\Users\tt\.arduinoIDE\arduino-cli.yaml | CLI 配置文件 |
+| C:\Users\tt\.arduinoIDE\settings.json | IDE 设置 |
+
+9.3 备份策略
+
+- 所有重要配置文件修改前应备份
+- 备份文件命名格式：文件名_时间戳 (如 arduino-cli.yaml.bak_20260710)
+
+9.4 用户手动操作兼容
+
+- 保持 .ino 文件可直接在 Arduino IDE 中打开和编译
+- 不要使用 CLI 专属语法
+- 保持代码兼容 Arduino IDE 的语法规则
+
+9.5 并发操作
+
+- 智能体操作时，用户应关闭 Arduino IDE
+- 避免同时通过 CLI 和 IDE 操作同一个项目
+
+=====================================================
+十、资源参考
+=====================================================
+
+10.1 配置文件
+
+- C:\Users\tt\.arduinoIDE\arduino-cli.yaml
+- D:\servotest\arduino-cli.yaml
+
+10.2 环境文档
+
+- D:\servotest\arduino_env_doc.md
+- D:\servotest\问题解决记录.txt
+- D:\servotest\YD-ESP32-S3_LED引脚问题总结.txt
+
+10.3 测试项目
+
+- D:\servotest\RGB_Breathing_Led\RGB_Breathing_Led.ino
+- D:\servotest\RMT_WS2812_Breathing\RMT_WS2812_Breathing.ino
+- D:\servotest\LED_Mode_Test\LED_Mode_Test.ino
+
+10.4 开发板资料
+
+- D:\servotest\YD-ESP32-S3资料\
+
+=====================================================
+十一、版本记录
+=====================================================
+
+v1.0 - 2026-07-10
+  - 初始版本，包含基本 CLI 操作指南和 ESP32 开发板支持

@@ -1,0 +1,110 @@
+================================================================
+会话恢复清单 — 重启后继续
+================================================================
+日期: 2026-07-05
+状态: 需要重启后安装 Hyper-V 离线包
+
+================================================================
+一、待办事项 (按优先级)
+================================================================
+
+1. [x] 安装 Hyper-V 离线包 ✅ 已启用
+   位置: D:\oezcon\hyper_v_offline\
+   方法: 见下方"Hyper-V 安装指南"
+
+2. [~] Windows 11 VM — 已写入VHD (13.8GB)，待内存充足时启动
+   VHD: D:\VMs\Win11\win11.vhdx (80GB动态)
+   需关闭微信等大内存程序后启动
+
+3. [~] Balloon Drop Lua v2 — 已匹配真实飞机参数
+   飞机: 翼展2m, 7.7kg, 巡航22m/s, 失速15m/s
+   仿真: 42/42 全部通过 ✅
+   SITL连接: 成功 ✅
+   Lua脚本: 已部署到WSL所有脚本目录
+   关键修复: PTCH_LIM_MIN_DEG=-90 (垂直俯冲必须)
+   下一步: 启动SITL验证脚本加载和阶段切换
+
+4. [ ] 优化 10Hz 实时显示器
+   当前方案: PNG 保存 (已验证)
+   目标: Windows 11 VM + WSLg 实现 GUI 实时显示
+
+================================================================
+二、已确认的解决方案
+================================================================
+
+SITL 连接:
+  ✅ 在 WSL 内部运行 pymavlink 完全正常
+  ✅ 连接地址: tcp:127.0.0.1:5760
+  ✅ System=1 (不是 0)
+  ✅ 1074+ 条消息/30秒
+
+关键发现:
+  - WSL2 NAT 模式下 TCP/UDP 跨系统连接不可靠
+  - 显式指定 --serial0 会触发 clock bits 问题
+  - 默认配置 (不指定 --serial0) 没有 clock bits
+  - mirrored 模式需要 Windows 11 (不支持 Win10)
+
+================================================================
+三、Hyper-V 离线安装指南
+================================================================
+
+方法 A: 使用 Windows 功能对话框 (推荐)
+  1. 按 Windows + R → 输入 optionalfeatures → 回车
+  2. 找到 "Hyper-V" → 展开
+  3. 勾选 "Hyper-V 管理工具" + "Hyper-V 平台"
+  4. 点确定 → 重启电脑
+  5. 重启后验证: PowerShell 中运行 Import-Module Hyper-V
+
+方法 B: DISM 离线安装
+  如果方法 A 不行，尝试:
+  1. 找到 Windows 10/11 安装 ISO 或 U盘
+  2. 挂载 ISO，记住盘符 (假设是 D:)
+  3. 以管理员运行:
+     dism /online /enable-feature /featurename:Microsoft-Hyper-V-Tools-All /all /source:D:\sources\install.wim
+
+方法 C: 下载离线包
+  从 Microsoft 官网下载 Windows 10/11 评估版 ISO
+  挂载后用 DISM 安装
+
+================================================================
+四、关键文件位置
+================================================================
+
+SITL 相关:
+  WSL 二进制: /root/ardupilot/build/sitl/bin/arduplane
+  Lua 脚本: /root/ardupilot/Tools/autotest/Scripts/balloon_drop.lua
+  显示器: D:\oezcon\ai_mp\display_10hz.py
+  帧输出: D:\oezcon\ai_mp\flight_frames\
+
+工具脚本:
+  ai_mp2.py: D:\oezcon\ai_mp\ai_mp2.py (sitl 模式已配置)
+  测试启动: D:\oezcon\ai_mp\test_run.sh (需重建)
+
+文档:
+  SITL 突破: D:\oezcon\SITL_突破发现.txt
+  SITL 实验报告: D:\oezcon\SITL_最终实验报告.txt
+  SITL 连接分析: D:\oezcon\SITL_CONNECTION_FIX.md
+  ArduPilot 文档: D:\oezcon\ardupilot_docs\ (29页)
+
+VM 安装:
+  ISO: D:\ISOs\Win11_25H2_Chinese_Simplified_x64_v2.iso
+  安装脚本: D:\oezcon\win11_install_admin.ps1
+  安装批处理: D:\oezcon\install_win11.bat
+
+================================================================
+五、WSL 内部快速启动命令
+================================================================
+
+启动 SITL:
+  pkill -f arduplane
+  cd /tmp && /root/ardupilot/build/sitl/bin/arduplane \
+    -I0 --model plane --speedup 3 --home CMAC \
+    --defaults /root/ardupilot/Tools/autotest/models/plane.parm &
+
+运行测试:
+  python3 /mnt/d/oezcon/ai_mp/bd_sitl_test.py
+
+运行显示器:
+  python3 /mnt/d/oezcon/ai_mp/display_10hz.py
+
+================================================================

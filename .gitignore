@@ -15,3 +15,37 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Toolchains / large binaries / build artifacts
+*.hex
+arm-gcc.zip
+arm-gcc-xpack.zip
+arm-official.zip
+arm-*.zip
+QGroundControl.exe
+dfu-util.zip
+
+# Third-party sources / docs
+ardupilot_src/
+ardupilot_docs/
+ardupilot_scripts/
+
+# Nested git repositories (managed separately)
+oez/
+balloon_drop_project/
+
+# Environment / caches / VM / editors
+snap/
+cache/
+W11/
+terrain/
+.trae/
+.trae-cn/
+.mimocode/
+
+# Large data directories (multi-GB, not suitable for remote)
+logs/
+backup/
+
+# Accidental junk directory (bad path created by mistake)
+/D/

@@ -1,0 +1,6 @@
+px4_add_library(FlightTaskBalloonDrop
+	FlightTaskBalloonDrop.cpp
+)
+
+target_link_libraries(FlightTaskBalloonDrop PUBLIC FlightTask)
+target_include_directories(FlightTaskBalloonDrop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -1,0 +1,176 @@
+ArduPilot SITL 连接问题汇总 — 寻求帮助
+========================================
+日期: 2026-07-04
+环境: Windows 10/11 + WSL2 Ubuntu 22.04 + pymavlink 2.4.49
+
+========================================
+问题一: SITL 用 TCP 模式启动后立即崩溃
+========================================
+
+现象:
+  启动命令:
+    arduplane --model plane --serial0 tcp:5760 --home CMAC
+
+  日志输出:
+    bind port 5760 for SERIAL0
+    SERIAL0 on TCP port 5760
+    Waiting for internal clock bits to be set (current=0x00)
+    (进程退出, 端口 5760 无进程监听)
+
+  pymavlink 连接时:
+    ConnectionRefusedError: [WinError 10061] 由于目标计算机积极拒绝，无法连接。
+
+分析:
+  - "clock bits" 消息来自 SIM_LP5562.cpp (LED 驱动仿真), 不是主仿真循环
+  - 进程确实启动并绑定了端口, 但几秒后自行退出
+  - 猜测: TCP 模式下需要外部系统(如 MAVProxy)立即连接并握手, 否则超时退出
+  - sim_vehicle.py 默认使用 UDP 模式 (udpclient:127.0.0.1:5760), 不是 TCP
+
+
+========================================
+问题二: SITL 用 UDP 模式启动成功, 但 pymavlink 只收到心跳
+========================================
+
+现象:
+  启动命令:
+    arduplane -I0 --model plane --speedup 1 --serial0 udpclient:127.0.0.1:5760 --home CMAC
+
+  进程存活 (PID 状态 Sl+), 不崩溃
+
+  pymavlink 连接:
+    master = mavutil.mavlink_connection('udp:127.0.0.1:5760', source_system=255)
+    master.wait_heartbeat(timeout=15)
+    → 收到心跳! System=0, Type=1(FixedWing), Mode=UNKNOWN
+
+    master.mav.request_data_stream_send(...)
+    → 10 秒内收到 0 条数据消息 (空速、姿态、GPS 等全部没有)
+
+  关键:
+    - 心跳收到 = UDP 通信链路本身是通的
+    - System=0 (应该是 1) = 自动驾驶仪可能未完成初始化
+    - Mode=UNKNOWN = 飞行模式未识别
+    - 无遥测数据 = 仿真步进可能卡住
+
+
+========================================
+问题三: WSL2 TCP 端口从 Windows 访问被拒绝
+========================================
+
+现象:
+  SITL 在 WSL 内部绑定 TCP 5760:
+    bind port 5760 for SERIAL0
+    SERIAL0 on TCP port 5760
+    Waiting for connection ....
+
+  从 Windows pymavlink 连接:
+    mavutil.mavlink_connection('tcp:127.0.0.1:5760')
+    → ConnectionRefusedError: [WinError 10061]
+
+    mavutil.mavlink_connection('tcp:172.30.31.168:5760')  # WSL IP
+    → 同样 ConnectionRefusedError
+
+  WSL 配置 (.wslconfig):
+    [wsl2]
+    memory=4GB
+    processors=4
+    swap=4GB
+    localhostForwarding=true
+
+  文档说 localhostForwarding=true 应该让 Windows 通过 localhost 访问 WSL 服务,
+  但实际上不行。
+
+  注意: 之前通过 COM15/COM16 (USB 串口) 连接真实硬件 Nora 飞控是正常的,
+  pymavlink 连接 COM 口没有问题。问题只出在 WSL TCP 连接上。
+
+
+========================================
+我们的尝试和已知信息
+========================================
+
+1. 直接用 arduplane 二进制启动 (不通过 sim_vehicle.py)
+   - TCP 模式: 崩溃
+   - UDP 模式: 进程存活但无数据流
+
+2. WSL 网络:
+   - localhostForwarding=true 已配置
+   - WSL IP: 172.30.31.168
+   - Windows 无法连接 WSL 的 TCP 端口 (5760/5762)
+   - WSL 内部也没装 nc/netstat, 无法从内部验证
+
+3. sim_vehicle.py:
+   - 每次运行会重新 waf configure, 耗时长
+   - 默认用 UDP: --serial0 udpclient:127.0.0.1:5760
+   - 默认启动 MAVProxy 连接 SITL
+
+4. pymavlink UDP 连接:
+   - udp:127.0.0.1:5760 能收到心跳
+   - 但 0 条遥测数据
+   - request_data_stream_send 无响应
+
+5. 之前的成功经验:
+   - COM15/COM16 USB 串口连接真实 Nora 飞控: 一切正常
+   - 参数读写、遥测、航点上传全部验证通过
+   - 问题仅限于 SITL 模拟器连接
+
+
+========================================
+我们想要达到的目标
+========================================
+
+1. 在 Windows 上用 pymavlink 连接 WSL 中的 ArduPilot SITL
+2. 能读取遥测数据 (空速、姿态、GPS、飞行模式等)
+3. 能发送命令 (模式切换、解锁、航点上传等)
+4. 最终用 AI-MP 工具自动化测试 Balloon Drop Lua 脚本
+
+
+========================================
+请求帮助的方向
+========================================
+
+1. WSL2 TCP 端口访问: 为什么 localhostForwarding=true 不生效?
+   - 是否需要配置 mirrored 网络模式?
+   - 是否需要 Windows 防火墙规则?
+   - 是否需要 netsh portproxy 转发?
+
+2. SITL UDP 数据流: 为什么心跳收到但遥测数据为 0?
+   - 是否需要先发送特定的初始化命令?
+   - pymavlink 的 udp: 前缀是否正确?
+   - 是否需要等待一段时间让仿真初始化?
+
+3. sim_vehicle.py 的正确用法:
+   - 是否必须通过 sim_vehicle.py 启动才能正常工作?
+   - 能否绕过 sim_vehicle.py 直接用 arduplane 二进制?
+
+4. 是否有其他人成功在 Windows + WSL2 环境下
+   用 pymavlink 直连 ArduPilot SITL 的案例?
+
+=========================================
+新增: 最新尝试 (2026-07-04 23:25)
+=========================================
+
+尝试用 Windows 主机 IP 直连:
+  WSL 中获取 Windows IP: grep nameserver /etc/resolv.conf → 172.30.16.1
+  启动: arduplane --serial0 udpclient:172.30.16.1:14550
+
+  结果:
+    - SITL 进程存活, 日志显示 "UDP connection 172.30.16.1:14550"
+    - pymavlink udp:127.0.0.1:14550 收到心跳
+    - 但 System=0 (应为 1), Mode=UNKNOWN
+    - 0 条遥测数据, request_data_stream_send 无响应
+    - 等待 30 秒系统仍未初始化
+
+尝试 sim_vehicle.py:
+  命令: sim_vehicle.py -v ArduPlane --no-mavproxy --out udp:172.30.16.1:14550
+  问题: 每次运行都重新 waf configure (约 30-60 秒), 还没等到启动就超时
+
+所有尝试汇总:
+  TCP 5760 (localhost/0.0.0.0/WSL IP)  → 全部 ConnectionRefused
+  UDP 5760 (localhost)                  → 心跳OK, 无数据
+  UDP 14550 (Windows IP)               → 心跳OK, 无数据
+  System 始终为 0, Mode 始终为 UNKNOWN
+
+=========================================
+联系方式
+=========================================
+
+(在此处填写你的联系方式)

@@ -1,0 +1,91 @@
+ArduPilot SITL 连接 — 突破性发现
+================================
+日期: 2026-07-05 01:55
+
+========================================
+核心结论
+========================================
+
+SITL 仿真器本身完全正常！
+问题 100% 在于 WSL2 网络层。
+
+证据: 在 WSL 内部运行 pymavlink 连接 arduplane:
+  - Heartbeat: sys=1, comp=1, type=1 (FixedWing), status=2
+  - 数据流: SERVO_OUTPUT_RAW, HEARTBEAT, PARAM_VALUE 全部收到
+  - System=1 (不是 0!)
+  - 之前从 Windows 连接时 System=0 是网络层导致的假象
+
+========================================
+为什么之前失败
+========================================
+
+1. TCP 从 Windows 到 WSL 全部失败
+   原因: WSL2 NAT 模式下 TCP 端口不可达
+
+2. UDP 从 Windows 连接收到心跳但 System=0
+   原因: 数据包经过 NAT 转换后, 飞控认为链路未建立
+   证据: WSL 内部连接 System=1, 说明 System=0 是网络层假象
+
+3. MAVProxy 收不到心跳
+   原因: MAVProxy 和 arduplane 都在 WSL 中, 但连接参数配置有误
+
+========================================
+解决方案
+========================================
+
+方案 A (推荐): 在 WSL 内部运行 pymavlink
+  步骤:
+  1. WSL 中启动 arduplane (默认 TCP 5760)
+  2. WSL 中运行 pymavlink 脚本
+  3. 无需跨网络, 127.0.0.1 直连
+
+  命令:
+  # 终端 1: 启动 SITL
+  cd /root/ardupilot
+  ./build/sitl/bin/arduplane -I0 --model plane --home CMAC
+
+  # 终端 2: 运行 pymavlink 脚本
+  python3 your_script.py
+
+方案 B: 用 MAVProxy 做中间层
+  步骤:
+  1. WSL 中启动 arduplane (默认 TCP 5760)
+  2. WSL 中启动 MAVProxy 连接 127.0.0.1:5760
+  3. MAVProxy 转发数据到 UDP 端口
+  4. Windows pymavlink 连接 UDP 端口
+
+  命令:
+  # WSL 中
+  mavproxy.py --master tcp:127.0.0.1:5760 --out 172.30.16.1:14550
+
+  # Windows 中
+  master = mavutil.mavlink_connection('udp:0.0.0.0:14550')
+
+方案 C: 使用 Mission Planner 内置 SITL
+  完全绕过 WSL, Windows 原生运行
+
+========================================
+关键参数说明
+========================================
+
+1. 不要显式指定 --serial0
+   - 默认 tcp:localhost:5760:wait 是正确的
+   - :wait 参数让 SITL 等待连接后才初始化硬件
+   - 显式指定会移除 :wait, 导致 LP5562 初始化卡住
+
+2. 使用 -w 参数 (如果用 sim_vehicle.py)
+   - 擦除虚拟 EEPROM
+   - 加载默认参数文件
+   - 确保硬件初始化顺序正确
+
+3. 不需要修改 .wslconfig
+   - mirrored 模式需要 Windows 11
+   - localhostForwarding=true 对 UDP 有效
+
+========================================
+下一步行动
+========================================
+
+1. 在 WSL 内部运行 pymavlink 测试 (已验证成功)
+2. 修改 ai_mp2.py 支持 WSL 内部连接模式
+3. 或者用 MAVProxy 做中间层转发到 Windows

@@ -1,0 +1,149 @@
+ArduPilot SITL 连接问题 — 完整测试总结与疑问
+================================================
+日期: 2026-07-05
+环境: Windows 10 (19045) + WSL2 Ubuntu 22.04 + pymavlink 2.4.49
+
+========================================
+一、官方文档标准做法 (我们验证过的内容)
+========================================
+
+ArduPilot 官方文档 (使用SITL测试.html) 明确说明了两种连接方式:
+
+1. TCP 模式 (默认):
+   sim_vehicle.py --no-mavproxy
+   → SITL 监听 TCP 5760, 等待 GCS 连接
+   → GCS 用 TCP 连接到 SITL
+
+2. UDP 模式:
+   sim_vehicle.py -A "--serial0=udpclient:<gcs ip>:14550"
+   → SITL 通过 UDP 发送数据到指定地址
+   → GCS 监听 UDP 端口接收数据
+
+3. MAVProxy 转发 (推荐):
+   sim_vehicle.py (不加 --no-mavproxy)
+   → MAVProxy 自动连接 SITL
+   → 用 "output add <ip>:<port>" 转发到其他 GCS
+
+========================================
+二、我们测试过的所有方案及结果
+========================================
+
+方案                      进程  串口模式  clock bits  pymavlink   数据流
+────────────────────────────────────────────────────────────────────────
+A. arduplane --serial0     存活  UDP      有         心跳OK      0条
+   udpclient:WIN_IP:5760
+
+B. arduplane --serial0     存活  UDP      有         心跳OK      0条
+   udpclient:WIN_IP:14550
+
+C. arduplane --serial0     存活  TCP      有         被拒绝      N/A
+   tcp:0.0.0.0:5760
+
+D. arduplane 默认          存活  TCP      无         被拒绝      N/A
+   (tcp:localhost:5760:wait)
+
+E. sim_vehicle.py --udp    存活  UDP      无         心跳OK      0条
+   (设置 udpclient:127.0.0.1:5760)
+
+F. sim_vehicle.py          编译中 N/A      N/A       N/A         N/A
+   --no-mavproxy --out
+
+G. sim_vehicle.py          未测试 N/A      N/A       N/A         N/A
+   (带 MAVProxy)
+
+WIN_IP = 172.30.16.1 (Windows 主机 IP)
+
+========================================
+三、关键发现
+========================================
+
+发现1: clock bits 不阻塞仿真
+  来源: SIM_LP5562.cpp (LED 驱动仿真)
+  只是 stderr 输出, 不影响主循环
+  方案D(默认)没有此消息, 方案A/B/C有
+  结论: clock bits 不是问题根因
+
+发现2: TCP 从 Windows 到 WSL 全部失败
+  tcp:127.0.0.1:5760         → ConnectionRefused
+  tcp:172.30.31.168:5760     → ConnectionRefused (WSL IP)
+  tcp:172.30.16.1:5760       → ConnectionRefused (Windows IP)
+  原因: WSL2 NAT 模式下 TCP 端口不可达
+
+发现3: UDP 能收到心跳但 System=0
+  udp:127.0.0.1:5760         → 心跳OK, 0条数据
+  udp:127.0.0.1:14550        → 心跳OK, 0条数据
+  udp:0.0.0.0:14550          → 心跳OK, 0条数据
+  request_data_stream_send 已调用但无响应
+
+发现4: sim_vehicle.py --udp 的 --out 参数
+  --out 参数只传给 MAVProxy, 不传给 arduplane
+  arduplane 收到的命令行没有 --serial0 参数
+  sim_vehicle.py --udp 设置 --serial0 udpclient:127.0.0.1:5760
+
+发现5: mirrored 模式不支持 Windows 10
+  需要 Windows 11 22H2+
+  我们的系统是 Windows 10 (19045)
+
+========================================
+四、待解决的疑问 (供咨询)
+========================================
+
+疑问1: 为什么 System=0?
+  心跳能收到说明通信链路通了
+  但飞控未完成初始化 (System 应该是 1)
+  是什么阻止了初始化完成?
+  是否需要特定的 MAVLink 命令来"踢醒"飞控?
+
+疑问2: WSL2 TCP 端口有什么可靠访问方式?
+  localhostForwarding=true 已配置但无效
+  mirrored 模式需要 Windows 11
+  netsh portproxy 需要管理员权限
+  是否有其他方案?
+
+疑问3: 有没有人在 Windows 10 + WSL2 上成功用 pymavlink 直连 SITL?
+  官方文档没有明确说明 WSL2 的网络限制
+  标准做法是否假设 GCS 和 SITL 在同一台 Linux 机器上?
+
+疑问4: clock bits 的真正影响是什么?
+  虽然不阻塞主循环, 但是否影响仿真精度?
+  为什么默认配置没有这个消息?
+
+疑问5: sim_vehicle.py 的 --out 参数到底起什么作用?
+  从源码看, 它只传给 MAVProxy
+  对 arduplane 没有任何影响
+  那官方文档说的 "--out udp:IP:PORT" 是什么意思?
+
+疑问6: Mission Planner 的 SITL 模拟功能如何工作?
+  官方文档提到可以用 MP 的模拟功能
+  这是否绕过了 WSL2 网络问题?
+
+========================================
+五、我们的环境特殊性
+========================================
+
+1. Windows 10 (不是 11) — 不支持 mirrored 模式
+2. WSL2 NAT 模式 — TCP 端口不可达
+3. Python 在 Windows 上运行 (不是 WSL 内)
+4. pymavlink 2.4.49 (Windows Python 3.12)
+5. ArduPilot 源码在 WSL 中编译
+6. arduplane 二进制在 WSL 中运行
+
+========================================
+六、已排除的方案
+========================================
+
+1. mirrored 模式 — 需要 Windows 11
+2. 直接用 udp: 前缀启动 arduplane — 源码不支持
+3. udpout: 前缀 — 源码中不存在
+4. 修改 .wslconfig 启用 localhostForwarding — 已配置但无效
+5. WSL IP 直连 — TCP 仍被拒绝
+
+========================================
+七、可能的下一步
+========================================
+
+1. 用 Mission Planner 的 SITL 模拟功能 (绕过 WSL 网络)
+2. 在 WSL 内部运行 pymavlink (不跨网络)
+3. 升级到 Windows 11 使用 mirrored 模式
+4. 用 netsh portproxy 转发 (需要管理员权限)
+5. 用 MAVProxy 做中间层 (需要先修复 future 模块)

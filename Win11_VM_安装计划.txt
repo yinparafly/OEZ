@@ -1,0 +1,128 @@
+Windows 11 虚拟机安装任务计划书
+================================
+执行时间: 2026-07-05 01:00 - 09:00
+目标: 在 D 盘创建 Windows 11 Hyper-V 虚拟机, 启用 mirrored 网络模式
+
+========================================
+前置条件检查
+========================================
+
+检查项                          状态
+────────────────────────────────────
+Hyper-V 已启用                  ✅ (WSL2 需要 Hyper-V)
+D 盘空间 > 80GB                 ✅ (剩余 235GB)
+BIOS 虚拟化已开启               ✅ (WSL2 已运行)
+Windows 11 ISO                  待下载
+
+========================================
+安装步骤
+========================================
+
+阶段 1: 准备 (01:00 - 01:30)
+  1.1 下载 Windows 11 ISO
+      来源: https://www.microsoft.com/software-download/windows11
+      选择: Windows 11 Disk Image (ISO) for x64 devices
+      大小: ~5.2GB
+
+  1.2 创建虚拟磁盘
+      位置: D:\VMs\Win11\win11.vhdx
+      大小: 动态扩展, 最大 80GB
+      命令 (PowerShell 管理员):
+      New-VHD -Path "D:\VMs\Win11\win11.vhdx" -SizeBytes 80GB -Dynamic
+
+阶段 2: 创建虚拟机 (01:30 - 02:00)
+  2.1 创建虚拟机
+      New-VM -Name "Win11" -MemoryStartupBytes 4GB -Generation 2 `
+          -VHDPath "D:\VMs\Win11\win11.vhdx"
+
+  2.2 配置虚拟机
+      Set-VM -Name "Win11" -ProcessorCount 4 -MemoryStartupBytes 4GB `
+          -DynamicMemory -MemoryMinimumBytes 2GB -MemoryMaximumBytes 8GB
+      Set-VM -Name "Win11" -CheckpointType Standard
+      Set-VMNetworkAdapter -VMName "Win11" -SwitchName "Default Switch"
+
+  2.3 挂载 ISO
+      Add-VMDvdDrive -VMName "Win11" -Path "D:\ISOs\Win11.iso"
+
+  2.4 配置启动顺序
+      $dvd = Get-VMDvdDrive -VMName "Win11"
+      Set-VMFirmware -VMName "Win11" -FirstBootDevice $dvd
+
+  2.5 启用 TPM (Windows 11 需要)
+      Enable-VMTPM -VMName "Win11"
+
+阶段 3: 安装 Windows 11 (02:00 - 04:00)
+  3.1 启动虚拟机
+      Start-VM -Name "Win11"
+
+  3.2 通过 VM Connect 或远程桌面完成安装
+      - 选择语言和区域
+      - 输入产品密钥 (可跳过)
+      - 选择 Windows 11 Pro
+      - 自定义安装
+      - 选择 80GB 未分配空间
+
+  3.3 安装 VMware Tools / 集成服务
+      (Hyper-V 自动安装)
+
+阶段 4: 配置 Windows 11 (04:00 - 05:00)
+  4.1 完成 OOBE 设置
+  4.2 安装更新
+  4.3 启用开发者模式
+  4.4 安装 WSL2:
+      wsl --install -d Ubuntu
+  4.5 在 WSL2 中安装 ArduPilot 环境:
+      sudo apt update && sudo apt upgrade -y
+      sudo apt install -y python3-pip git
+      pip3 install pymavlink
+
+阶段 5: 测试验证 (05:00 - 06:00)
+  5.1 验证 WSL2 mirrored 模式
+      检查 .wslconfig 是否有 networkingMode=mirrored
+  5.2 测试 SITL 连接
+      在 WSL2 内部运行 pymavlink
+      从 Windows 通过 mirrored 网络连接
+  5.3 验证端口互通
+      Windows: Test-NetConnection -ComputerName 127.0.0.1 -Port 5760
+
+阶段 6: 迁移开发环境 (06:00 - 08:00)
+  6.1 复制 ArduPilot 源码到新 WSL2
+  6.2 复制 ai_mp 工具到新 WSL2
+  6.3 编译 SITL
+  6.4 运行完整测试
+
+阶段 7: 备份与文档 (08:00 - 09:00)
+  7.1 导出虚拟机快照
+  7.2 记录配置
+  7.3 更新项目文档
+
+========================================
+资源估算
+========================================
+
+组件                      大小
+────────────────────────────
+Windows 11 ISO            ~5.2GB
+Windows 11 VHDX (安装后)  ~32GB
+WSL2 Ubuntu 虚拟磁盘      ~10GB
+ArduPilot 源码            ~1.5GB
+开发工具                  ~2GB
+────────────────────────────
+总计                      ~50GB (D盘剩余 235GB, 充足)
+
+========================================
+风险与回退
+========================================
+
+风险 1: Windows 11 不满足硬件要求
+  回退: 使用 Windows 10 + WSL 内部方案 (已验证可行)
+
+风险 2: Hyper-V 嵌套虚拟化性能问题
+  回退: 减少分配的 CPU/内存
+
+风险 3: 安装过程卡住
+  回退: 删除虚拟机, 重试
+
+========================================
+当前状态: 等待执行
+========================================

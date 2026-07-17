@@ -1,0 +1,219 @@
+/*
+  YD-ESP32-S3 RMT vs NeoPixel 对比测试程序
+  通过串口命令切换两种模式
+  
+  使用方法：
+  1. 复制代码到 Arduino IDE
+  2. 安装 Adafruit NeoPixel 库
+  3. 上传到开发板
+  4. 打开串口监视器（115200波特率）
+  5. 发送 '1' 切换到 RMT 模式
+  6. 发送 '2' 切换到 NeoPixel 模式
+  
+  WS2812 RGB LED 连接 GPIO 48
+*/
+
+#include <Adafruit_NeoPixel.h>
+#include <driver/rmt.h>
+
+#define WS2812_PIN GPIO_NUM_48
+#define LED_COUNT 1
+
+#define RMT_CHANNEL RMT_CHANNEL_0
+#define RMT_CLOCK_DIV 2
+#define RMT_TICK_NS (1000000000LL / (APB_CLK_FREQ / RMT_CLOCK_DIV))
+
+#define T0H 350
+#define T0L 900
+#define T1H 900
+#define T1L 350
+
+Adafruit_NeoPixel pixels(LED_COUNT, (int)WS2812_PIN, NEO_GRB + NEO_KHZ800);
+rmt_item32_t led_data[LED_COUNT * 24];
+
+int current_mode = 1;
+
+void rmt_set_color(uint8_t r, uint8_t g, uint8_t b) {
+  int item_idx = 0;
+  for (int color = 0; color < 3; color++) {
+    uint8_t byte_data;
+    if (color == 0) byte_data = g;
+    else if (color == 1) byte_data = r;
+    else byte_data = b;
+    
+    for (int bit = 7; bit >= 0; bit--) {
+      if (byte_data & (1 << bit)) {
+        led_data[item_idx].level0 = 1;
+        led_data[item_idx].duration0 = T1H / RMT_TICK_NS;
+        led_data[item_idx].level1 = 0;
+        led_data[item_idx].duration1 = T1L / RMT_TICK_NS;
+      } else {
+        led_data[item_idx].level0 = 1;
+        led_data[item_idx].duration0 = T0H / RMT_TICK_NS;
+        led_data[item_idx].level1 = 0;
+        led_data[item_idx].duration1 = T0L / RMT_TICK_NS;
+      }
+      item_idx++;
+    }
+  }
+  rmt_write_items(RMT_CHANNEL, led_data, LED_COUNT * 24, true);
+}
+
+void rmt_clear() {
+  rmt_set_color(0, 0, 0);
+}
+
+void neopixel_set_color(uint8_t r, uint8_t g, uint8_t b) {
+  pixels.setPixelColor(0, pixels.Color(r, g, b));
+  pixels.show();
+}
+
+void neopixel_clear() {
+  pixels.clear();
+  pixels.show();
+}
+
+void breathing_rmt(uint8_t r, uint8_t g, uint8_t b) {
+  for (int brightness = 0; brightness <= 255; brightness += 5) {
+    int cr = map(brightness, 0, 255, 0, r);
+    int cg = map(brightness, 0, 255, 0, g);
+    int cb = map(brightness, 0, 255, 0, b);
+    rmt_set_color(cr, cg, cb);
+    delay(20);
+  }
+  delay(200);
+  for (int brightness = 255; brightness >= 0; brightness -= 5) {
+    int cr = map(brightness, 0, 255, 0, r);
+    int cg = map(brightness, 0, 255, 0, g);
+    int cb = map(brightness, 0, 255, 0, b);
+    rmt_set_color(cr, cg, cb);
+    delay(20);
+  }
+}
+
+void breathing_neopixel(uint8_t r, uint8_t g, uint8_t b) {
+  for (int brightness = 0; brightness <= 255; brightness += 5) {
+    int cr = map(brightness, 0, 255, 0, r);
+    int cg = map(brightness, 0, 255, 0, g);
+    int cb = map(brightness, 0, 255, 0, b);
+    neopixel_set_color(cr, cg, cb);
+    delay(20);
+  }
+  delay(200);
+  for (int brightness = 255; brightness >= 0; brightness -= 5) {
+    int cr = map(brightness, 0, 255, 0, r);
+    int cg = map(brightness, 0, 255, 0, g);
+    int cb = map(brightness, 0, 255, 0, b);
+    neopixel_set_color(cr, cg, cb);
+    delay(20);
+  }
+}
+
+void loop_rmt_mode() {
+  Serial.println("RMT Mode: Red");
+  breathing_rmt(255, 0, 0);
+  delay(200);
+  
+  Serial.println("RMT Mode: Green");
+  breathing_rmt(0, 255, 0);
+  delay(200);
+  
+  Serial.println("RMT Mode: Blue");
+  breathing_rmt(0, 0, 255);
+  delay(200);
+  
+  Serial.println("RMT Mode: Yellow");
+  breathing_rmt(255, 255, 0);
+  delay(200);
+  
+  Serial.println("RMT Mode: Purple");
+  breathing_rmt(255, 0, 255);
+  delay(200);
+  
+  Serial.println("RMT Mode: Cyan");
+  breathing_rmt(0, 255, 255);
+  delay(200);
+  
+  Serial.println("RMT Mode: White");
+  breathing_rmt(255, 255, 255);
+  delay(300);
+}
+
+void loop_neopixel_mode() {
+  Serial.println("NeoPixel Mode: Red");
+  breathing_neopixel(255, 0, 0);
+  delay(200);
+  
+  Serial.println("NeoPixel Mode: Green");
+  breathing_neopixel(0, 255, 0);
+  delay(200);
+  
+  Serial.println("NeoPixel Mode: Blue");
+  breathing_neopixel(0, 0, 255);
+  delay(200);
+  
+  Serial.println("NeoPixel Mode: Yellow");
+  breathing_neopixel(255, 255, 0);
+  delay(200);
+  
+  Serial.println("NeoPixel Mode: Purple");
+  breathing_neopixel(255, 0, 255);
+  delay(200);
+  
+  Serial.println("NeoPixel Mode: Cyan");
+  breathing_neopixel(0, 255, 255);
+  delay(200);
+  
+  Serial.println("NeoPixel Mode: White");
+  breathing_neopixel(255, 255, 255);
+  delay(300);
+}
+
+void setup() {
+  rmt_config_t config = RMT_DEFAULT_CONFIG_TX(WS2812_PIN, RMT_CHANNEL);
+  config.clk_div = RMT_CLOCK_DIV;
+  config.tx_config.loop_en = false;
+  config.tx_config.carrier_en = false;
+  config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+  config.tx_config.idle_output_en = true;
+  rmt_config(&config);
+  rmt_driver_install(RMT_CHANNEL, 0, 0);
+  
+  pixels.begin();
+  pixels.setBrightness(255);
+  pixels.clear();
+  pixels.show();
+  
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("==================================");
+  Serial.println("YD-ESP32-S3 LED Mode Test");
+  Serial.println("==================================");
+  Serial.println("Commands:");
+  Serial.println("  1 - RMT Driver Mode");
+  Serial.println("  2 - Adafruit NeoPixel Mode");
+  Serial.println("==================================");
+  Serial.print("Current mode: ");
+  Serial.println(current_mode == 1 ? "RMT Driver" : "Adafruit NeoPixel");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+    if (cmd == '1') {
+      current_mode = 1;
+      neopixel_clear();
+      Serial.println("Switched to RMT Driver Mode");
+    } else if (cmd == '2') {
+      current_mode = 2;
+      rmt_clear();
+      Serial.println("Switched to Adafruit NeoPixel Mode");
+    }
+  }
+  
+  if (current_mode == 1) {
+    loop_rmt_mode();
+  } else {
+    loop_neopixel_mode();
+  }
+}

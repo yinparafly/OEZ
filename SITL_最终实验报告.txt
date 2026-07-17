@@ -1,0 +1,127 @@
+ArduPilot SITL 连接问题 — 最终实验报告
+========================================
+日期: 2026-07-05 02:30
+实验者: MiMo Code Agent
+
+========================================
+一、实验目标
+========================================
+
+1. 验证朋友建议的方案: WSL 内部运行 pymavlink
+2. 测试 MAVProxy 从 WSL 转发到 Windows
+3. 测试 pymavlink 转发器方案
+4. 回答 Windows 11 升级问题
+
+========================================
+二、实验结果
+========================================
+
+实验 1: WSL 内部 pymavlink 直连 SITL
+  结果: ✅ 完全成功
+  - Heartbeat: sys=1, comp=1, type=1 (FixedWing), status=2
+  - 数据流: 1074 条消息正常收到
+  - 类型: SERVO_OUTPUT_RAW, HEARTBEAT, PARAM_VALUE 等
+
+实验 2: MAVProxy 连接 SITL
+  结果: ❌ 失败
+  - MAVProxy 连接 TCP 5760 成功
+  - 但收不到心跳, 立即退出
+  - arduplane 日志: "Closed connection on SERIAL0"
+  - 原因: clock bits 导致连接关闭
+
+实验 3: pymavlink 转发到 Windows
+  结果: ❌ 失败
+  - WSL 内部: 转发 1074 条消息到 172.30.16.1:14550
+  - Windows 端: 0 条消息收到
+  - 原因: WSL2 NAT 下 UDP 从 WSL 到 Windows 不通
+
+实验 4: Windows 直接连 WSL TCP
+  结果: ❌ 失败
+  - tcp:127.0.0.1:5760 → ConnectionRefused
+  - tcp:172.30.31.168:5760 → ConnectionRefused
+  - tcp:172.30.16.1:5760 → ConnectionRefused
+
+========================================
+三、关键发现
+========================================
+
+发现 1: SITL 本身完全正常
+  - 在 WSL 内部连接, System=1, 数据流正常
+  - 之前所有问题都是网络层导致的
+
+发现 2: WSL2 NAT 下所有跨系统网络都不可靠
+  - TCP: 全部 ConnectionRefused
+  - UDP: WSL→Windows 不通
+  - localhostForwarding=true 对 TCP 无效
+  - mirrored 模式需要 Windows 11
+
+发现 3: clock bits 不影响仿真
+  - 只是 stderr 输出
+  - 仿真主循环正常运行
+  - pymavlink 能正常收发数据
+
+发现 4: 显式指定 --serial0 有副作用
+  - 移除了 :wait 参数
+  - 导致 LP5562 初始化时序问题
+  - MAVProxy 连接后触发 clock bits 并关闭连接
+
+========================================
+四、Windows 11 升级评估
+========================================
+
+系统: Dell Inspiron 3668
+CPU: Intel i5-7400 (7th gen)
+RAM: 8GB
+OS: Windows 10 Pro (Build 19045)
+
+评估结果:
+  ❌ 不满足 Windows 11 官方要求
+  - CPU: 7th gen 不支持 (需要 8th gen+)
+  - TPM: 可能不满足 2.0 要求
+  - BIOS: 2017 年版本, 可能不支持 Secure Boot
+
+可选方案:
+  1. 绕过检测强制安装 (有风险, 可能不稳定)
+  2. Hyper-V 虚拟 Windows 11 (推荐, 安全)
+  3. 保持 Windows 10, 用 WSL 内部方案 (已验证可行)
+
+========================================
+五、最终推荐方案
+========================================
+
+方案 A (推荐): 全部在 WSL 内部运行
+  步骤:
+  1. WSL 中启动 arduplane (默认 TCP 5760)
+  2. WSL 中运行 pymavlink 脚本
+  3. 连接地址: tcp:127.0.0.1:5760
+
+  优点: 最稳定, 已验证成功
+  缺点: 需要在 WSL 中配置 Python 环境
+
+方案 B: 使用 Mission Planner 内置 SITL
+  步骤:
+  1. Windows 上打开 Mission Planner
+  2. Simulation → Start SITL → Plane
+  3. MP 自动处理连接
+
+  优点: 完全绕过 WSL, 图形界面
+  缺点: 只支持稳定版本
+
+方案 C: 升级到 Windows 11
+  步骤:
+  1. Hyper-V 虚拟 Windows 11
+  2. 或绕过检测强制安装
+
+  优点: mirrored 模式解决所有网络问题
+  缺点: 需要额外资源或风险
+
+========================================
+六、保留的文件
+========================================
+
+- D:\oezcon\SITL_突破发现.txt (突破性发现)
+- D:\oezcon\SITL_最终总结_v2.txt (之前总结)
+- D:\oezcon\SITL_CONNECTION_FIX.md (连接分析)
+- D:\oezcon\ardupilot_docs\ (29页离线文档)
+- D:\oezcon\ai_mp\quick_forward.py (WSL转发器)
+- D:\oezcon\ai_mp\windows_test.py (Windows测试)

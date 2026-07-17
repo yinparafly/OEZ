@@ -1,0 +1,1301 @@
+[00:30:55] ============================================================
+[00:30:55] AI-MP Session Started: 2026-07-04 00:30:55
+[00:30:55] ============================================================
+[00:30:55] >>> ACTION: 建立 MAVLink 连接
+[00:30:55]     Detail: Port=COM16, Baud=115200
+[00:30:56]     Result [OK]: System=1
+[00:30:56]     Data: Vehicle Type = 13 (Unknown(13))
+[00:30:56]     Data: Flight Mode = STABILIZE
+[00:30:56] ------------------------------------------------------------
+[00:30:56] >>> ACTION: BALLOON DROP 完整测试
+[00:30:56]     Detail: 验证飞行任务配置
+[00:30:56] >>> ACTION: 获取飞行状态
+[00:30:56]     Detail: 读取所有传感器和状态数据
+[00:30:59]     Result [OK]: Mode=STABILIZE, Alt=0m, ASpd=0m/s
+[00:30:59]     STATUS: 当前模式: STABILIZE
+[00:30:59] >>> ACTION: 配置 Balloon Drop 参数
+[00:30:59]     Detail: 设置 Lua 脚本和传感器
+[00:30:59] >>> ACTION: 设置参数
+[00:30:59]     Detail: SCR_ENABLE = 1
+[00:31:00]     Result [OK]: 参数 SCR_ENABLE 已设为 1
+[00:31:00] >>> ACTION: 设置参数
+[00:31:00]     Detail: SCR_HEAP_SIZE = 8192
+[00:31:00]     Result [OK]: 参数 SCR_HEAP_SIZE 已设为 8192
+[00:31:00] >>> ACTION: 设置参数
+[00:31:00]     Detail: ARSPD_USE = 1
+[00:31:00]     Result [OK]: 参数 ARSPD_USE 已设为 1
+[00:31:00] >>> ACTION: 检查 Balloon Drop 配置
+[00:31:00]     Detail: 验证参数正确性
+[00:31:00] >>> ACTION: 读取参数
+[00:31:00]     Detail: 参数名: SCR_ENABLE
+[00:31:04]     Result [FAIL]: 未收到参数响应
+[00:31:04]     WARNING:   SCR_ENABLE 无法读取
+[00:31:04] >>> ACTION: 读取参数
+[00:31:04]     Detail: 参数名: SCR_HEAP_SIZE
+[00:31:08]     Result [FAIL]: 未收到参数响应
+[00:31:08]     WARNING:   SCR_HEAP_SIZE 无法读取
+[00:31:08] >>> ACTION: 读取参数
+[00:31:08]     Detail: 参数名: ARSPD_USE
+[00:31:12]     Result [FAIL]: 未收到参数响应
+[00:31:12]     WARNING:   ARSPD_USE 无法读取
+[00:31:12] >>> ACTION: 检查可用飞行模式
+[00:31:12]     Detail: 确认 FBWA/AUTO/LOITER 可用
+[00:31:12]     WARNING:   FBWA: 不可用
+[00:31:12]     WARNING:   FBWB: 不可用
+[00:31:12]     WARNING:   CRUISE: 不可用
+[00:31:12]     STATUS:   AUTO: 可用
+[00:31:12]     STATUS:   LOITER: 可用
+[00:31:12]     STATUS:   RTL: 可用
+[00:31:12] >>> ACTION: 心跳稳定性测试
+[00:31:12]     Detail: 检测 3 次心跳间隔
+[00:31:12]     STATUS:   心跳 #1: OK
+[00:31:13]     STATUS:   心跳 #2: OK
+[00:31:14]     STATUS:   心跳 #3: OK
+[00:31:14]     Data: 心跳间隔 = 1.00s
+[00:31:14] ------------------------------------------------------------
+[00:31:14] >>> ACTION: 测试汇总
+[00:31:14]     STATUS: 连接: OK
+[00:31:14]     STATUS: Lua 脚本支持: OK
+[00:31:14]     STATUS: 空速传感器: 已启用
+[00:31:14]     STATUS: 可用模式: 27 种
+[00:31:14]     STATUS: 心跳: OK
+[00:31:14]     WARNING: 部分参数未确认，建议重新检查
+[00:31:14] >>> ACTION: 关闭连接
+[00:31:14]     Detail: MAVLink 连接已关闭
+[00:31:14] 
+Session ended. Duration: 19.1s
+[00:31:14] ============================================================
+[00:33:00] ============================================================
+[00:33:00] AI-MP Session Started: 2026-07-04 00:33:00
+[00:33:00] ============================================================
+[00:33:00] >>> ACTION: 建立 MAVLink 连接
+[00:33:00]     Detail: Port=COM16, Baud=115200
+[00:33:00]     Result [OK]: System=1
+[00:33:00]     Data: Vehicle Type = 13 (Unknown(13))
+[00:33:00]     Data: Flight Mode = STABILIZE
+[00:33:00] ------------------------------------------------------------
+[00:33:00] >>> ACTION: BALLOON DROP 完整测试
+[00:33:00]     Detail: 验证飞行任务配置
+[00:33:00] >>> ACTION: 获取飞行状态
+[00:33:00]     Detail: 读取所有传感器和状态数据
+[00:33:01] >>> ACTION: 关闭连接
+[00:33:01]     Detail: MAVLink 连接已关闭
+[00:33:01] 
+Session ended. Duration: 1.6s
+[00:33:01] ============================================================
+[00:34:14] ============================================================
+[00:34:14] AI-MP Session Started: 2026-07-04 00:34:14
+[00:34:14] ============================================================
+[00:34:14] >>> ACTION: 建立 MAVLink 连接
+[00:34:14]     Detail: Port=COM16, Baud=115200
+[00:34:16]     Result [OK]: System=1
+[00:34:16]     Data: Vehicle Type = 13 (Unknown(13))
+[00:34:16]     Data: Flight Mode = STABILIZE
+[00:34:16] ------------------------------------------------------------
+[00:34:16] >>> ACTION: BALLOON DROP 完整测试
+[00:34:16]     Detail: 验证飞行任务配置
+[00:34:16] >>> ACTION: 获取飞行状态
+[00:34:16]     Detail: 读取所有传感器和状态数据
+[00:34:19]     Result [OK]: Mode=MANUAL, Alt=0m, ASpd=0m/s
+[00:34:19]     STATUS: 当前模式: MANUAL
+[00:34:19] >>> ACTION: 配置 Balloon Drop 参数
+[00:34:19]     Detail: 设置 Lua 脚本和传感器
+[00:34:19] >>> ACTION: 设置参数
+[00:34:19]     Detail: SCR_ENABLE = 1
+[00:34:19]     Result [OK]: 参数 SCR_ENABLE 已设为 1
+[00:34:19] >>> ACTION: 设置参数
+[00:34:19]     Detail: SCR_HEAP_SIZE = 8192
+[00:34:19]     Result [OK]: 参数 SCR_HEAP_SIZE 已设为 8192
+[00:34:19] >>> ACTION: 设置参数
+[00:34:19]     Detail: ARSPD_USE = 1
+[00:34:20]     Result [OK]: 参数 ARSPD_USE 已设为 1
+[00:34:20] >>> ACTION: 检查 Balloon Drop 配置
+[00:34:20]     Detail: 验证参数正确性
+[00:34:20] >>> ACTION: 读取参数
+[00:34:20]     Detail: 参数名: SCR_ENABLE
+[00:34:30]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[00:34:30]     WARNING:   SCR_ENABLE 无法读取
+[00:34:30] >>> ACTION: 读取参数
+[00:34:30]     Detail: 参数名: SCR_HEAP_SIZE
+[00:34:40]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[00:34:40]     WARNING:   SCR_HEAP_SIZE 无法读取
+[00:34:40] >>> ACTION: 读取参数
+[00:34:40]     Detail: 参数名: ARSPD_USE
+[00:34:50]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[00:34:50]     WARNING:   ARSPD_USE 无法读取
+[00:34:50] >>> ACTION: 检查可用飞行模式
+[00:34:50]     Detail: 确认 FBWA/AUTO/LOITER 可用
+[00:34:50]     STATUS:   FBWA: 可用 (id=5)
+[00:34:50]     STATUS:   FBWB: 可用 (id=8)
+[00:34:50]     STATUS:   CRUISE: 可用 (id=13)
+[00:34:50]     STATUS:   AUTO: 可用 (id=10)
+[00:34:50]     STATUS:   LOITER: 可用 (id=5)
+[00:34:50]     STATUS:   RTL: 可用 (id=3)
+[00:34:50] >>> ACTION: 心跳稳定性测试
+[00:34:50]     Detail: 检测 3 次心跳间隔
+[00:34:50]     STATUS:   心跳 #1: OK
+[00:34:51]     STATUS:   心跳 #2: OK
+[00:34:52]     STATUS:   心跳 #3: OK
+[00:34:52]     Data: 心跳间隔 = 1.00s
+[00:34:52] ------------------------------------------------------------
+[00:34:52] >>> ACTION: 测试汇总
+[00:34:52]     STATUS: 连接: OK
+[00:34:52]     STATUS: Lua 脚本支持: OK
+[00:34:52]     STATUS: 空速传感器: 已启用
+[00:34:52]     STATUS: 可用模式: 19 种
+[00:34:52]     STATUS: 心跳: OK
+[00:34:52]     WARNING: 部分参数未确认，建议重新检查
+[00:34:52] >>> ACTION: 关闭连接
+[00:34:52]     Detail: MAVLink 连接已关闭
+[00:34:52] 
+Session ended. Duration: 37.3s
+[00:34:52] ============================================================
+[12:54:15] ============================================================
+[12:54:15] AI-MP Session Started: 2026-07-04 12:54:15
+[12:54:15] ============================================================
+[12:54:15] >>> ACTION: 建立 MAVLink 连接
+[12:54:15]     Detail: Port=COM16, Baud=115200
+[12:54:17]     Result [OK]: System=1
+[12:54:17]     Data: Vehicle Type = 13 (Unknown(13))
+[12:54:17]     Data: Flight Mode = STABILIZE
+[12:54:17] >>> ACTION: 获取飞行状态
+[12:54:17]     Detail: 读取所有传感器和状态数据
+[12:54:20]     Result [OK]: Mode=MANUAL, Alt=0m, ASpd=0m/s
+[12:54:20] >>> ACTION: 关闭连接
+[12:54:20]     Detail: MAVLink 连接已关闭
+[12:54:20] 
+Session ended. Duration: 5.1s
+[12:54:20] ============================================================
+[12:54:32] ============================================================
+[12:54:32] AI-MP Session Started: 2026-07-04 12:54:32
+[12:54:32] ============================================================
+[12:54:32] >>> ACTION: 建立 MAVLink 连接
+[12:54:32]     Detail: Port=COM16, Baud=115200
+[12:54:32] ============================================================
+[12:54:32] AI-MP Session Started: 2026-07-04 12:54:32
+[12:54:32] ============================================================
+[12:54:32] >>> ACTION: 建立 MAVLink 连接
+[12:54:32]     Detail: Port=COM16, Baud=115200
+[12:54:32]     Result [FAIL]: could not open port 'COM16': PermissionError(13, '拒绝访问。', None, 5)
+[12:54:33] ============================================================
+[12:54:33] AI-MP Session Started: 2026-07-04 12:54:33
+[12:54:33] ============================================================
+[12:54:33] >>> ACTION: 建立 MAVLink 连接
+[12:54:33]     Detail: Port=COM16, Baud=115200
+[12:54:33]     Result [FAIL]: could not open port 'COM16': PermissionError(13, '拒绝访问。', None, 5)
+[12:54:33]     Result [OK]: System=1
+[12:54:33]     Data: Vehicle Type = 13 (Unknown(13))
+[12:54:33]     Data: Flight Mode = STABILIZE
+[12:54:33] >>> ACTION: 预飞检查
+[12:54:33]     Detail: 读取所有预飞检查项
+[12:54:38]     Result [OK]: 0 项检查
+[12:54:38] >>> ACTION: 关闭连接
+[12:54:38]     Detail: MAVLink 连接已关闭
+[12:54:38] 
+Session ended. Duration: 5.6s
+[12:54:38] ============================================================
+[12:54:47] ============================================================
+[12:54:47] AI-MP Session Started: 2026-07-04 12:54:47
+[12:54:47] ============================================================
+[12:54:47] >>> ACTION: 建立 MAVLink 连接
+[12:54:47]     Detail: Port=COM16, Baud=115200
+[12:54:48]     Result [OK]: System=1
+[12:54:48]     Data: Vehicle Type = 13 (Unknown(13))
+[12:54:48]     Data: Flight Mode = STABILIZE
+[12:54:48] >>> ACTION: EKF 状态
+[12:54:48]     Detail: 读取 EKF 和振动数据
+[12:54:52]     Result [OK]: EKF 数据: 0 项
+[12:54:52] >>> ACTION: 关闭连接
+[12:54:52]     Detail: MAVLink 连接已关闭
+[12:54:52] 
+Session ended. Duration: 4.3s
+[12:54:52] ============================================================
+[12:54:57] ============================================================
+[12:54:57] AI-MP Session Started: 2026-07-04 12:54:57
+[12:54:57] ============================================================
+[12:54:57] >>> ACTION: 建立 MAVLink 连接
+[12:54:57]     Detail: Port=COM16, Baud=115200
+[12:54:58]     Result [OK]: System=1
+[12:54:58]     Data: Vehicle Type = 13 (Unknown(13))
+[12:54:58]     Data: Flight Mode = STABILIZE
+[12:54:58] >>> ACTION: 失控保护配置
+[12:54:58]     Detail: 读取相关参数
+[12:54:58] >>> ACTION: 读取参数
+[12:54:58]     Detail: 参数名: FS_BATT_ENABLE
+[12:55:08]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[12:55:08] >>> ACTION: 读取参数
+[12:55:08]     Detail: 参数名: FS_BATT_VOLTAGE
+[12:55:18]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[12:55:18] >>> ACTION: 读取参数
+[12:55:18]     Detail: 参数名: FS_BATT_MAH
+[12:57:14] ============================================================
+[12:57:14] AI-MP Session Started: 2026-07-04 12:57:14
+[12:57:14] ============================================================
+[12:57:14] >>> ACTION: 建立 MAVLink 连接
+[12:57:14]     Detail: Port=COM16, Baud=115200
+[12:57:15]     Result [OK]: System=1
+[12:57:15]     Data: Vehicle Type = 13 (Unknown(13))
+[12:57:15]     Data: Flight Mode = STABILIZE
+[12:57:15] >>> ACTION: 导出参数 (MP格式)
+[12:57:15] >>> ACTION: 读取全部参数
+[12:57:15]     Detail: 请求参数列表
+[12:57:30]     Result [OK]: 读取 0 个参数
+[12:57:30]     Result [OK]: 已导出 0 个参数到 D:/oezcon/ai_mp/verify\params_20260704_125715.param
+[12:57:30]     STATUS: MP 可直接打开此文件进行对比
+[12:57:30] >>> ACTION: 关闭连接
+[12:57:30]     Detail: MAVLink 连接已关闭
+[12:57:30] 
+Session ended. Duration: 16.4s
+[12:57:30] ============================================================
+[12:57:59] ============================================================
+[12:57:59] AI-MP Session Started: 2026-07-04 12:57:59
+[12:57:59] ============================================================
+[12:57:59] >>> ACTION: 建立 MAVLink 连接
+[12:57:59]     Detail: Port=COM16, Baud=115200
+[12:57:59]     Result [OK]: System=1
+[12:57:59]     Data: Vehicle Type = 13 (Unknown(13))
+[12:57:59]     Data: Flight Mode = STABILIZE
+[12:57:59] >>> ACTION: 导出参数 (MP格式)
+[12:57:59] >>> ACTION: 读取全部参数
+[12:57:59]     Detail: 请求参数列表
+[12:58:19]     Result [OK]: 读取 0 个参数
+[12:58:19]     Result [OK]: 已导出 0 个参数到 D:/oezcon/ai_mp/verify\params_20260704_125759.param
+[12:58:19]     STATUS: MP 可直接打开此文件进行对比
+[12:58:19] >>> ACTION: 关闭连接
+[12:58:19]     Detail: MAVLink 连接已关闭
+[12:58:19] 
+Session ended. Duration: 20.7s
+[12:58:19] ============================================================
+[13:05:51] ============================================================
+[13:05:51] AI-MP Session Started: 2026-07-04 13:05:51
+[13:05:51] ============================================================
+[13:05:51] >>> ACTION: 建立 MAVLink 连接
+[13:05:51]     Detail: Port=COM16, Baud=115200
+[13:05:51]     Result [OK]: System=1
+[13:05:51]     Data: Vehicle Type = 13 (Unknown(13))
+[13:05:51]     Data: Flight Mode = STABILIZE
+[13:05:51] >>> ACTION: 设置参数
+[13:05:51]     Detail: SCR_ENABLE = 1
+[13:05:52]     Result [OK]: 参数 SCR_ENABLE 已设为 1
+[13:05:52]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:05:52] >>> ACTION: 关闭连接
+[13:05:52]     Detail: MAVLink 连接已关闭
+[13:05:52] 
+Session ended. Duration: 0.9s
+[13:05:52] ============================================================
+[13:06:40] ============================================================
+[13:06:40] AI-MP Session Started: 2026-07-04 13:06:40
+[13:06:40] ============================================================
+[13:06:40] >>> ACTION: 建立 MAVLink 连接
+[13:06:40]     Detail: Port=COM16, Baud=115200
+[13:06:40]     Result [OK]: System=1
+[13:06:40]     Data: Vehicle Type = 13 (Unknown(13))
+[13:06:40]     Data: Flight Mode = STABILIZE
+[13:06:40] >>> ACTION: 设置参数
+[13:06:40]     Detail: SCR_ENABLE = 1
+[13:06:40]     Result [OK]: 参数 SCR_ENABLE 已设为 1
+[13:06:40]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:06:40] >>> ACTION: 关闭连接
+[13:06:40]     Detail: MAVLink 连接已关闭
+[13:06:40] 
+Session ended. Duration: 0.9s
+[13:06:40] ============================================================
+[13:06:46] ============================================================
+[13:06:46] AI-MP Session Started: 2026-07-04 13:06:46
+[13:06:46] ============================================================
+[13:06:46] >>> ACTION: 建立 MAVLink 连接
+[13:06:46]     Detail: Port=COM16, Baud=115200
+[13:06:46]     STATUS:   已加载 1 个参数, 0 个航点记录
+[13:06:46]     Result [OK]: System=1
+[13:06:46]     Data: Vehicle Type = 13 (Unknown(13))
+[13:06:46]     Data: Flight Mode = STABILIZE
+[13:06:46] >>> ACTION: 设置参数
+[13:06:46]     Detail: SCR_HEAP_SIZE = 8192
+[13:06:47]     Result [OK]: 参数 SCR_HEAP_SIZE 已设为 8192
+[13:06:47]     STATUS:   记录参数: SCR_HEAP_SIZE = 8192
+[13:06:47] >>> ACTION: 关闭连接
+[13:06:47]     Detail: MAVLink 连接已关闭
+[13:06:47] 
+Session ended. Duration: 0.9s
+[13:06:47] ============================================================
+[13:06:52] ============================================================
+[13:06:52] AI-MP Session Started: 2026-07-04 13:06:52
+[13:06:52] ============================================================
+[13:06:52] >>> ACTION: 建立 MAVLink 连接
+[13:06:52]     Detail: Port=COM16, Baud=115200
+[13:06:53]     STATUS:   已加载 2 个参数, 0 个航点记录
+[13:06:53]     Result [OK]: System=1
+[13:06:53]     Data: Vehicle Type = 13 (Unknown(13))
+[13:06:53]     Data: Flight Mode = STABILIZE
+[13:06:53] >>> ACTION: 导出参数 (MP格式)
+[13:06:53]     Detail: 2 个参数
+[13:06:53]     Result [OK]: 已导出 2 个参数到 D:/oezcon/ai_mp/verify\params_20260704_130653.param
+[13:06:53]     STATUS: 用 MP 打开: Config > Full Parameter List > File > Open
+[13:06:53] >>> ACTION: 关闭连接
+[13:06:53]     Detail: MAVLink 连接已关闭
+[13:06:53] 
+Session ended. Duration: 0.6s
+[13:06:53] ============================================================
+[13:15:46] ============================================================
+[13:15:46] AI-MP Session Started: 2026-07-04 13:15:46
+[13:15:46] ============================================================
+[13:15:46] >>> ACTION: 建立 MAVLink 连接
+[13:15:46]     Detail: Port=COM16, Baud=115200
+[13:15:47]     STATUS:   已加载 2 个参数, 0 个航点记录
+[13:15:47]     Result [OK]: System=1
+[13:15:47]     Data: Vehicle Type = 13 (Unknown(13))
+[13:15:47]     Data: Flight Mode = STABILIZE
+[13:15:52] >>> ACTION: 设置参数
+[13:15:52]     Detail: SCR_ENABLE = 1
+[13:15:52]     Result [OK]: 参数 SCR_ENABLE 已设为 1
+[13:15:52]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:15:52] >>> ACTION: 读取参数
+[13:15:52]     Detail: 参数名: SCR_ENABLE
+[13:16:02]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:16:02] >>> ACTION: 设置参数
+[13:16:02]     Detail: SCR_HEAP_SIZE = 8192
+[13:16:03]     Result [OK]: 参数 SCR_HEAP_SIZE 已设为 8192
+[13:16:03]     STATUS:   记录参数: SCR_HEAP_SIZE = 8192
+[13:16:03] >>> ACTION: 读取参数
+[13:16:03]     Detail: 参数名: SCR_HEAP_SIZE
+[13:16:13]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:16:13] >>> ACTION: 设置参数
+[13:16:13]     Detail: ARSPD_USE = 1
+[13:16:14]     Result [OK]: 参数 ARSPD_USE 已设为 1
+[13:16:14]     STATUS:   记录参数: ARSPD_USE = 1
+[13:16:14] >>> ACTION: 读取参数
+[13:16:14]     Detail: 参数名: ARSPD_USE
+[13:16:24]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:16:24] >>> ACTION: 设置参数
+[13:16:24]     Detail: ARMING_CHECK = 1
+[13:16:24]     Result [OK]: 参数 ARMING_CHECK 已设为 1
+[13:16:24]     STATUS:   记录参数: ARMING_CHECK = 1
+[13:16:25] >>> ACTION: 读取参数
+[13:16:25]     Detail: 参数名: ARMING_CHECK
+[13:16:35]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:16:35]     STATUS:   已加载 4 个参数, 0 个航点记录
+[13:16:35]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:16:35]     STATUS:   记录参数: SCR_HEAP_SIZE = 8192
+[13:16:35]     STATUS:   记录参数: ARSPD_USE = 1
+[13:16:35]     STATUS:   记录参数: ARMING_CHECK = 1
+[13:16:35] >>> ACTION: 导出参数 (MP格式)
+[13:16:35]     Detail: 4 个参数
+[13:16:35]     Result [OK]: 已导出 4 个参数到 D:/oezcon/ai_mp/verify/test\test_params.param
+[13:16:35]     STATUS: 用 MP 打开: Config > Full Parameter List > File > Open
+[13:16:35]     STATUS: 任务已清空
+[13:16:35]     STATUS: Added WP#1: TAKEOFF Lat=39.9042 Lon=116.4074 Alt=100m
+[13:16:35]     STATUS: Added WP#2: WAYPOINT Lat=39.905 Lon=116.408 Alt=100m
+[13:16:35]     STATUS: Added WP#3: WAYPOINT Lat=39.906 Lon=116.409 Alt=80m
+[13:16:35]     STATUS: Added WP#4: LOITER_TIME Lat=39.9055 Lon=116.4085 Alt=90m
+[13:16:35]     STATUS: Added WP#5: RTL Lat=0 Lon=0 Alt=0m
+[13:16:35] >>> ACTION: 上传任务到飞控
+[13:16:35]     Detail: 5 个航点
+[13:16:36]     STATUS:   Uploaded WP#1: TAKEOFF
+[13:16:36]     STATUS:   Uploaded WP#2: WAYPOINT
+[13:16:36]     STATUS:   Uploaded WP#3: WAYPOINT
+[13:16:36]     STATUS:   Uploaded WP#4: LOITER_TIME
+[13:16:37]     STATUS:   Uploaded WP#5: RTL
+[13:16:37]     Result [OK]: 上传完成: 5 个航点
+[13:16:38] >>> ACTION: 从飞控下载任务
+[13:16:43]     ERROR: 未收到任务计数
+[13:16:43]     STATUS:   记录 5 个航点
+[13:16:43]     Result [OK]: 已导出 5 个航点到 D:/oezcon/ai_mp/verify/test\test_mission.waypoints
+[13:16:43]     STATUS: 用 MP 打开: Flight Plan > File > Open
+[13:16:43] >>> ACTION: 获取飞行状态
+[13:16:43]     Detail: 读取所有传感器和状态数据
+[13:16:46]     Result [OK]: Mode=MANUAL, Alt=0m, ASpd=0m/s
+[13:16:46] >>> ACTION: 设置飞行模式
+[13:16:46]     Detail: 目标模式: MANUAL
+[13:16:46]     Result [OK]: 模式已设为 MANUAL (id=0)
+[13:16:47] >>> ACTION: 获取飞行状态
+[13:16:47]     Detail: 读取所有传感器和状态数据
+[13:16:50]     Result [OK]: Mode=MANUAL, Alt=0m, ASpd=0m/s
+[13:16:50] >>> ACTION: 设置飞行模式
+[13:16:50]     Detail: 目标模式: FBWA
+[13:16:50]     Result [OK]: 模式已设为 FBWA (id=5)
+[13:16:51] >>> ACTION: 获取飞行状态
+[13:16:51]     Detail: 读取所有传感器和状态数据
+[13:16:54]     Result [OK]: Mode=MANUAL, Alt=0m, ASpd=0m/s
+[13:16:54] >>> ACTION: 设置飞行模式
+[13:16:54]     Detail: 目标模式: CRUISE
+[13:16:54]     Result [OK]: 模式已设为 CRUISE (id=13)
+[13:16:55] >>> ACTION: 获取飞行状态
+[13:16:55]     Detail: 读取所有传感器和状态数据
+[13:16:58]     Result [OK]: Mode=MANUAL, Alt=0m, ASpd=0m/s
+[13:16:58] >>> ACTION: 设置飞行模式
+[13:16:58]     Detail: 目标模式: MANUAL
+[13:16:58]     Result [OK]: 模式已设为 MANUAL (id=0)
+[13:16:58] >>> ACTION: 传感器状态
+[13:16:58]     Detail: 检查所有传感器
+[13:17:03]     Result [OK]: 0 个传感器
+[13:17:03] >>> ACTION: EKF 状态
+[13:17:03]     Detail: 读取 EKF 和振动数据
+[13:17:06]     Result [OK]: EKF 数据: 0 项
+[13:17:06] >>> ACTION: 读取 RC 通道
+[13:17:06]     Detail: 获取遥控器输入
+[13:17:09]     Result [FAIL]: 未收到 RC 数据
+[13:17:09] >>> ACTION: 预飞检查
+[13:17:09]     Detail: 读取所有预飞检查项
+[13:17:14]     Result [OK]: 0 项检查
+[13:17:14] >>> ACTION: 列出日志文件
+[13:17:14]     Detail: 读取 SD 卡 LOGS 目录
+[13:17:16]     Result [FAIL]: 未找到日志文件
+[13:17:16] >>> ACTION: 失控保护配置
+[13:17:16]     Detail: 读取相关参数
+[13:17:16] >>> ACTION: 读取参数
+[13:17:16]     Detail: 参数名: FS_BATT_ENABLE
+[13:17:26]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:17:26] >>> ACTION: 读取参数
+[13:17:26]     Detail: 参数名: FS_BATT_VOLTAGE
+[13:17:36]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:17:36] >>> ACTION: 读取参数
+[13:17:36]     Detail: 参数名: FS_BATT_MAH
+[13:21:58] ============================================================
+[13:21:58] AI-MP Session Started: 2026-07-04 13:21:58
+[13:21:58] ============================================================
+[13:21:58] >>> ACTION: 建立 MAVLink 连接
+[13:21:58]     Detail: Port=COM15, Baud=115200
+[13:21:59]     STATUS:   已加载 4 个参数, 5 个航点记录
+[13:21:59]     Result [OK]: System=1
+[13:21:59]     Data: Vehicle Type = 13 (Unknown(13))
+[13:21:59]     Data: Flight Mode = STABILIZE
+[13:21:59] >>> ACTION: 读取参数
+[13:21:59]     Detail: 参数名: SCR_ENABLE
+[13:21:59]     Result [OK]: SCR_ENABLE = 0.0
+[13:21:59] >>> ACTION: 获取飞行状态
+[13:21:59]     Detail: 读取所有传感器和状态数据
+[13:22:02]     Result [OK]: Mode=MANUAL, Alt=0.0m, ASpd=0.0m/s
+[13:22:02] >>> ACTION: 关闭连接
+[13:22:02]     Detail: MAVLink 连接已关闭
+[13:22:02] 
+Session ended. Duration: 4.6s
+[13:22:02] ============================================================
+[13:22:40] ============================================================
+[13:22:40] AI-MP Session Started: 2026-07-04 13:22:40
+[13:22:40] ============================================================
+[13:22:40] >>> ACTION: 建立 MAVLink 连接
+[13:22:40]     Detail: Port=COM15, Baud=115200
+[13:22:41]     STATUS:   已加载 4 个参数, 5 个航点记录
+[13:22:41]     Result [OK]: System=1
+[13:22:41]     Data: Vehicle Type = 13 (Unknown(13))
+[13:22:41]     Data: Flight Mode = STABILIZE
+[13:22:46] >>> ACTION: 设置参数
+[13:22:46]     Detail: SCR_ENABLE = 1
+[13:22:46]     Result [OK]: 参数 SCR_ENABLE 已设为 1
+[13:22:46]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:22:47] >>> ACTION: 读取参数
+[13:22:47]     Detail: 参数名: SCR_ENABLE
+[13:22:47]     Result [OK]: SCR_ENABLE = 1.0
+[13:22:47] >>> ACTION: 设置参数
+[13:22:47]     Detail: SCR_HEAP_SIZE = 8192
+[13:22:47]     Result [OK]: 参数 SCR_HEAP_SIZE 已设为 8192
+[13:22:47]     STATUS:   记录参数: SCR_HEAP_SIZE = 8192
+[13:22:48] >>> ACTION: 读取参数
+[13:22:48]     Detail: 参数名: SCR_HEAP_SIZE
+[13:22:48]     Result [OK]: SCR_HEAP_SIZE = 8192.0
+[13:22:48] >>> ACTION: 设置参数
+[13:22:48]     Detail: ARSPD_USE = 1
+[13:22:48]     Result [OK]: 参数 ARSPD_USE 已设为 1
+[13:22:48]     STATUS:   记录参数: ARSPD_USE = 1
+[13:22:48] >>> ACTION: 读取参数
+[13:22:48]     Detail: 参数名: ARSPD_USE
+[13:22:48]     Result [OK]: ARSPD_USE = 1.0
+[13:22:48] >>> ACTION: 设置参数
+[13:22:48]     Detail: ARMING_CHECK = 1
+[13:22:49]     Result [OK]: 参数 ARMING_CHECK 已设为 1
+[13:22:49]     STATUS:   记录参数: ARMING_CHECK = 1
+[13:22:49] >>> ACTION: 读取参数
+[13:22:49]     Detail: 参数名: ARMING_CHECK
+[13:22:49]     Result [OK]: ARMING_CHECK = 1.0
+[13:22:49]     STATUS:   已加载 4 个参数, 5 个航点记录
+[13:22:49]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:22:49]     STATUS:   记录参数: SCR_HEAP_SIZE = 8192
+[13:22:49]     STATUS:   记录参数: ARSPD_USE = 1
+[13:22:49]     STATUS:   记录参数: ARMING_CHECK = 1
+[13:22:49] >>> ACTION: 导出参数 (MP格式)
+[13:22:49]     Detail: 4 个参数
+[13:22:49]     Result [OK]: 已导出 4 个参数到 D:/oezcon/ai_mp/verify/test\test_params.param
+[13:22:49]     STATUS: 用 MP 打开: Config > Full Parameter List > File > Open
+[13:22:49]     STATUS: 任务已清空
+[13:22:49]     STATUS: Added WP#1: TAKEOFF Lat=39.9042 Lon=116.4074 Alt=100m
+[13:22:49]     STATUS: Added WP#2: WAYPOINT Lat=39.905 Lon=116.408 Alt=100m
+[13:22:49]     STATUS: Added WP#3: WAYPOINT Lat=39.906 Lon=116.409 Alt=80m
+[13:22:49]     STATUS: Added WP#4: LOITER_TIME Lat=39.9055 Lon=116.4085 Alt=90m
+[13:22:49]     STATUS: Added WP#5: RTL Lat=0 Lon=0 Alt=0m
+[13:22:49] >>> ACTION: 上传任务到飞控
+[13:22:49]     Detail: 5 个航点
+[13:22:50]     STATUS:   Uploaded WP#1: TAKEOFF
+[13:22:51]     STATUS:   Uploaded WP#2: WAYPOINT
+[13:22:51]     STATUS:   Uploaded WP#3: WAYPOINT
+[13:22:51]     STATUS:   Uploaded WP#4: LOITER_TIME
+[13:22:51]     STATUS:   Uploaded WP#5: RTL
+[13:22:51]     Result [OK]: 上传完成: 5 个航点
+[13:22:52] >>> ACTION: 从飞控下载任务
+[13:22:57]     ERROR: 未收到任务计数
+[13:22:57]     STATUS:   记录 5 个航点
+[13:22:57]     Result [OK]: 已导出 5 个航点到 D:/oezcon/ai_mp/verify/test\test_mission.waypoints
+[13:22:57]     STATUS: 用 MP 打开: Flight Plan > File > Open
+[13:22:57] >>> ACTION: 获取飞行状态
+[13:22:57]     Detail: 读取所有传感器和状态数据
+[13:23:00]     Result [OK]: Mode=MANUAL, Alt=0.0m, ASpd=0.0m/s
+[13:23:00] >>> ACTION: 设置飞行模式
+[13:23:00]     Detail: 目标模式: MANUAL
+[13:23:00]     Result [OK]: 模式已设为 MANUAL (id=0)
+[13:23:01] >>> ACTION: 获取飞行状态
+[13:23:01]     Detail: 读取所有传感器和状态数据
+[13:23:04]     Result [OK]: Mode=MANUAL, Alt=0.0m, ASpd=0.0m/s
+[13:23:04] >>> ACTION: 设置飞行模式
+[13:23:04]     Detail: 目标模式: FBWA
+[13:23:04]     Result [OK]: 模式已设为 FBWA (id=5)
+[13:23:05] >>> ACTION: 获取飞行状态
+[13:23:05]     Detail: 读取所有传感器和状态数据
+[13:23:08]     Result [OK]: Mode=TRAINING, Alt=0.0m, ASpd=0.0m/s
+[13:23:08] >>> ACTION: 设置飞行模式
+[13:23:08]     Detail: 目标模式: CRUISE
+[13:23:08]     Result [OK]: 模式已设为 CRUISE (id=13)
+[13:23:09] >>> ACTION: 获取飞行状态
+[13:23:09]     Detail: 读取所有传感器和状态数据
+[13:23:12]     Result [OK]: Mode=TRAINING, Alt=0.0m, ASpd=0.0m/s
+[13:23:12] >>> ACTION: 设置飞行模式
+[13:23:12]     Detail: 目标模式: MANUAL
+[13:23:12]     Result [OK]: 模式已设为 MANUAL (id=0)
+[13:23:12] >>> ACTION: 传感器状态
+[13:23:12]     Detail: 检查所有传感器
+[13:23:12]     Result [OK]: 15 个传感器
+[13:23:12] >>> ACTION: EKF 状态
+[13:23:12]     Detail: 读取 EKF 和振动数据
+[13:24:13] ============================================================
+[13:24:13] AI-MP Session Started: 2026-07-04 13:24:13
+[13:24:13] ============================================================
+[13:24:13] >>> ACTION: 建立 MAVLink 连接
+[13:24:13]     Detail: Port=COM15, Baud=115200
+[13:24:14]     STATUS:   已加载 4 个参数, 5 个航点记录
+[13:24:14]     Result [OK]: System=1
+[13:24:14]     Data: Vehicle Type = 13 (Unknown(13))
+[13:24:14]     Data: Flight Mode = STABILIZE
+[13:24:19] >>> ACTION: 设置参数
+[13:24:19]     Detail: SCR_ENABLE = 1
+[13:24:20]     Result [OK]: 参数 SCR_ENABLE 已设为 1
+[13:24:20]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:24:20] >>> ACTION: 读取参数
+[13:24:20]     Detail: 参数名: SCR_ENABLE
+[13:24:20]     Result [OK]: SCR_ENABLE = 1.0
+[13:24:20] >>> ACTION: 设置参数
+[13:24:20]     Detail: SCR_HEAP_SIZE = 8192
+[13:24:20]     Result [OK]: 参数 SCR_HEAP_SIZE 已设为 8192
+[13:24:20]     STATUS:   记录参数: SCR_HEAP_SIZE = 8192
+[13:24:21] >>> ACTION: 读取参数
+[13:24:21]     Detail: 参数名: SCR_HEAP_SIZE
+[13:24:21]     Result [OK]: SCR_HEAP_SIZE = 8192.0
+[13:24:21] >>> ACTION: 设置参数
+[13:24:21]     Detail: ARSPD_USE = 1
+[13:24:21]     Result [OK]: 参数 ARSPD_USE 已设为 1
+[13:24:21]     STATUS:   记录参数: ARSPD_USE = 1
+[13:24:22] >>> ACTION: 读取参数
+[13:24:22]     Detail: 参数名: ARSPD_USE
+[13:24:22]     Result [OK]: ARSPD_USE = 1.0
+[13:24:22] >>> ACTION: 设置参数
+[13:24:22]     Detail: ARMING_CHECK = 1
+[13:24:22]     Result [OK]: 参数 ARMING_CHECK 已设为 1
+[13:24:22]     STATUS:   记录参数: ARMING_CHECK = 1
+[13:24:23] >>> ACTION: 读取参数
+[13:24:23]     Detail: 参数名: ARMING_CHECK
+[13:24:23]     Result [OK]: ARMING_CHECK = 1.0
+[13:24:23]     STATUS:   已加载 4 个参数, 5 个航点记录
+[13:24:23]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:24:23]     STATUS:   记录参数: SCR_HEAP_SIZE = 8192
+[13:24:23]     STATUS:   记录参数: ARSPD_USE = 1
+[13:24:23]     STATUS:   记录参数: ARMING_CHECK = 1
+[13:24:23] >>> ACTION: 导出参数 (MP格式)
+[13:24:23]     Detail: 4 个参数
+[13:24:23]     Result [OK]: 已导出 4 个参数到 D:/oezcon/ai_mp/verify/test\test_params.param
+[13:24:23]     STATUS: 用 MP 打开: Config > Full Parameter List > File > Open
+[13:24:23]     STATUS: 任务已清空
+[13:24:23]     STATUS: Added WP#1: TAKEOFF Lat=39.9042 Lon=116.4074 Alt=100m
+[13:24:23]     STATUS: Added WP#2: WAYPOINT Lat=39.905 Lon=116.408 Alt=100m
+[13:24:23]     STATUS: Added WP#3: WAYPOINT Lat=39.906 Lon=116.409 Alt=80m
+[13:24:23]     STATUS: Added WP#4: LOITER_TIME Lat=39.9055 Lon=116.4085 Alt=90m
+[13:24:23]     STATUS: Added WP#5: RTL Lat=0 Lon=0 Alt=0m
+[13:24:23] >>> ACTION: 上传任务到飞控
+[13:24:23]     Detail: 5 个航点
+[13:24:24]     STATUS:   Uploaded WP#1: TAKEOFF
+[13:24:24]     STATUS:   Uploaded WP#2: WAYPOINT
+[13:24:24]     STATUS:   Uploaded WP#3: WAYPOINT
+[13:24:24]     STATUS:   Uploaded WP#4: LOITER_TIME
+[13:24:24]     STATUS:   Uploaded WP#5: RTL
+[13:24:24]     Result [OK]: 上传完成: 5 个航点
+[13:24:25] >>> ACTION: 从飞控下载任务
+[13:24:31]     Data: 飞控任务数 = 0
+[13:24:31]     STATUS: 飞控中无任务
+[13:24:31]     STATUS:   记录 0 个航点
+[13:24:31]     WARNING: 无航点写入记录
+[13:24:31] >>> ACTION: 获取飞行状态
+[13:24:31]     Detail: 读取所有传感器和状态数据
+[13:24:34]     Result [OK]: Mode=MANUAL, Alt=0.0m, ASpd=0.0m/s
+[13:24:34] >>> ACTION: 设置飞行模式
+[13:24:34]     Detail: 目标模式: MANUAL
+[13:24:34]     Result [OK]: 模式已设为 MANUAL (id=0)
+[13:24:35] >>> ACTION: 获取飞行状态
+[13:24:35]     Detail: 读取所有传感器和状态数据
+[13:24:38]     Result [OK]: Mode=MANUAL, Alt=0.0m, ASpd=0.0m/s
+[13:24:38] >>> ACTION: 设置飞行模式
+[13:24:38]     Detail: 目标模式: FBWA
+[13:24:38]     Result [OK]: 模式已设为 FBWA (id=7)
+[13:24:39] >>> ACTION: 获取飞行状态
+[13:24:39]     Detail: 读取所有传感器和状态数据
+[13:24:42]     Result [OK]: Mode=FBWA, Alt=0.0m, ASpd=0.0m/s
+[13:24:42] >>> ACTION: 设置飞行模式
+[13:24:42]     Detail: 目标模式: CRUISE
+[13:24:42]     Result [OK]: 模式已设为 CRUISE (id=13)
+[13:24:43] >>> ACTION: 获取飞行状态
+[13:24:43]     Detail: 读取所有传感器和状态数据
+[13:24:46]     Result [OK]: Mode=FBWA, Alt=0.0m, ASpd=0.0m/s
+[13:24:46] >>> ACTION: 设置飞行模式
+[13:24:46]     Detail: 目标模式: MANUAL
+[13:24:46]     Result [OK]: 模式已设为 MANUAL (id=0)
+[13:24:46] >>> ACTION: 传感器状态
+[13:24:46]     Detail: 检查所有传感器
+[13:24:46]     Result [OK]: 15 个传感器
+[13:24:46] >>> ACTION: EKF 状态
+[13:24:46]     Detail: 读取 EKF 和振动数据
+[13:24:49]     Result [OK]: EKF 数据: 10 项
+[13:24:49] >>> ACTION: 读取 RC 通道
+[13:24:49]     Detail: 获取遥控器输入
+[13:24:49]     Result [OK]: RC 通道: {}
+[13:24:49] >>> ACTION: 预飞检查
+[13:24:49]     Detail: 读取所有预飞检查项
+[13:24:52]     Data: 传感器健康 = 0x45509c2f
+[13:24:52]     Result [OK]: 0 项检查
+[13:24:52] >>> ACTION: 列出日志文件
+[13:24:52]     Detail: 读取 SD 卡 LOGS 目录
+[13:24:54]     Result [OK]: 21 个日志文件
+[13:24:54] >>> ACTION: 失控保护配置
+[13:24:54]     Detail: 读取相关参数
+[13:24:54] >>> ACTION: 读取参数
+[13:24:54]     Detail: 参数名: FS_BATT_ENABLE
+[13:25:05]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:25:05] >>> ACTION: 读取参数
+[13:25:05]     Detail: 参数名: FS_BATT_VOLTAGE
+[13:25:13]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:25:13] >>> ACTION: 读取参数
+[13:25:13]     Detail: 参数名: FS_BATT_MAH
+[13:25:23]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:25:23] >>> ACTION: 读取参数
+[13:25:23]     Detail: 参数名: FS_THR_ENABLE
+[13:25:24]     Result [OK]: FS_THR_ENABLE = 1.0
+[13:25:24] >>> ACTION: 读取参数
+[13:25:24]     Detail: 参数名: FS_THR_VALUE
+[13:25:24]     Result [OK]: FS_THR_VALUE = 975.0
+[13:25:24] >>> ACTION: 读取参数
+[13:25:24]     Detail: 参数名: FS_GCS_ENABLE
+[13:25:25]     Result [OK]: FS_GCS_ENABLE = 0.0
+[13:25:25] >>> ACTION: 读取参数
+[13:25:25]     Detail: 参数名: FS_GCS_TIMEOUT
+[13:25:25]     Result [OK]: FS_GCS_TIMEOUT = 5.0
+[13:25:25] >>> ACTION: 读取参数
+[13:25:25]     Detail: 参数名: THR_FAILSAFE
+[13:25:35]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:25:35] >>> ACTION: 读取参数
+[13:25:35]     Detail: 参数名: THR_FS_VALUE
+[13:25:44]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:25:44] >>> ACTION: 读取参数
+[13:25:44]     Detail: 参数名: FENCE_ENABLE
+[13:25:45]     Result [OK]: FENCE_ENABLE = 0.0
+[13:25:45] >>> ACTION: 读取参数
+[13:25:45]     Detail: 参数名: FENCE_ACTION
+[13:25:45]     Result [OK]: FENCE_ACTION = 1.0
+[13:25:45] >>> ACTION: 读取参数
+[13:25:45]     Detail: 参数名: EK3_FS_GYRO
+[13:25:55]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:25:55]     Result [OK]: 6 项配置
+[13:25:55] >>> ACTION: 添加圆形围栏
+[13:25:55]     Detail: Center=(39.9042,116.4074) Radius=500m
+[13:33:59] ============================================================
+[13:33:59] AI-MP Session Started: 2026-07-04 13:33:59
+[13:33:59] ============================================================
+[13:33:59] >>> ACTION: 建立 MAVLink 连接
+[13:33:59]     Detail: Port=COM15, Baud=115200
+[13:34:01]     STATUS:   已加载 4 个参数, 0 个航点记录
+[13:34:01]     Result [OK]: System=1
+[13:34:01]     Data: Vehicle Type = 13 (Unknown(13))
+[13:34:01]     Data: Flight Mode = STABILIZE
+[13:34:01]     STATUS: 任务已清空
+[13:34:01]     STATUS: Added WP#1: TAKEOFF Lat=39.9042 Lon=116.4074 Alt=100m
+[13:34:01]     STATUS: Added WP#2: WAYPOINT Lat=39.905 Lon=116.408 Alt=100m
+[13:34:01]     STATUS: Added WP#3: WAYPOINT Lat=39.906 Lon=116.409 Alt=80m
+[13:34:01]     STATUS: Added WP#4: LOITER_TIME Lat=39.9055 Lon=116.4085 Alt=90m
+[13:34:01]     STATUS: Added WP#5: RTL Lat=0 Lon=0 Alt=0m
+[13:34:01] >>> ACTION: 上传任务到飞控
+[13:34:01]     Detail: 5 个航点
+[13:34:02]     STATUS:   Uploaded WP#1: TAKEOFF
+[13:34:02]     STATUS:   Uploaded WP#2: WAYPOINT
+[13:34:02]     STATUS:   Uploaded WP#3: WAYPOINT
+[13:34:02]     STATUS:   Uploaded WP#4: LOITER_TIME
+[13:34:02]     STATUS:   Uploaded WP#5: RTL
+[13:34:03]     Result [OK]: 上传完成: 5 个航点
+[13:34:05] >>> ACTION: 从飞控下载任务
+[13:34:11]     Data: 飞控任务数 = 0
+[13:34:11]     STATUS: 飞控中无任务
+[13:34:11] >>> ACTION: 关闭连接
+[13:34:11]     Detail: MAVLink 连接已关闭
+[13:34:11] 
+Session ended. Duration: 12.0s
+[13:34:11] ============================================================
+[13:34:42] ============================================================
+[13:34:42] AI-MP Session Started: 2026-07-04 13:34:42
+[13:34:42] ============================================================
+[13:34:42] >>> ACTION: 建立 MAVLink 连接
+[13:34:42]     Detail: Port=COM15, Baud=115200
+[13:34:43]     STATUS:   已加载 4 个参数, 0 个航点记录
+[13:34:43]     Result [OK]: System=1
+[13:34:43]     Data: Vehicle Type = 13 (Unknown(13))
+[13:34:43]     Data: Flight Mode = STABILIZE
+[13:34:43]     STATUS: 任务已清空
+[13:34:43]     STATUS: Added WP#1: TAKEOFF Lat=39.9042 Lon=116.4074 Alt=100m
+[13:34:43]     STATUS: Added WP#2: WAYPOINT Lat=39.905 Lon=116.408 Alt=100m
+[13:34:43]     STATUS: Added WP#3: WAYPOINT Lat=39.906 Lon=116.409 Alt=80m
+[13:34:43]     STATUS: Added WP#4: LOITER_TIME Lat=39.9055 Lon=116.4085 Alt=90m
+[13:34:43]     STATUS: Added WP#5: RTL Lat=0 Lon=0 Alt=0m
+[13:34:43] >>> ACTION: 上传任务到飞控
+[13:34:43]     Detail: 5 个航点
+[13:34:53]     WARNING: 未收到航点请求，尝试直接发送...
+[13:34:56]     STATUS:   Uploaded WP#1: TAKEOFF (no request)
+[13:34:59]     STATUS:   Uploaded WP#2: WAYPOINT (no request)
+[13:35:02]     STATUS:   Uploaded WP#3: WAYPOINT (no request)
+[13:35:05]     STATUS:   Uploaded WP#4: LOITER_TIME (no request)
+[13:35:08]     STATUS:   Uploaded WP#5: RTL (no request)
+[13:35:08]     Result [OK]: 上传完成: 5 个航点
+[13:35:10] >>> ACTION: 从飞控下载任务
+[13:35:58] ============================================================
+[13:35:58] AI-MP Session Started: 2026-07-04 13:35:58
+[13:35:58] ============================================================
+[13:35:58] >>> ACTION: 建立 MAVLink 连接
+[13:35:58]     Detail: Port=COM15, Baud=115200
+[13:35:59]     STATUS:   已加载 4 个参数, 0 个航点记录
+[13:35:59]     Result [OK]: System=1
+[13:35:59]     Data: Vehicle Type = 13 (Unknown(13))
+[13:35:59]     Data: Flight Mode = STABILIZE
+[13:36:00]     STATUS: 任务已清空
+[13:36:00]     STATUS: Added WP#1: TAKEOFF Lat=39.9042 Lon=116.4074 Alt=100m
+[13:36:00]     STATUS: Added WP#2: WAYPOINT Lat=39.905 Lon=116.408 Alt=100m
+[13:36:00]     STATUS: Added WP#3: WAYPOINT Lat=39.906 Lon=116.409 Alt=80m
+[13:36:00]     STATUS: Added WP#4: LOITER_TIME Lat=39.9055 Lon=116.4085 Alt=90m
+[13:36:00]     STATUS: Added WP#5: RTL Lat=0 Lon=0 Alt=0m
+[13:36:00] >>> ACTION: 上传任务到飞控
+[13:36:00]     Detail: 5 个航点
+[13:36:01]     STATUS:   Uploaded WP#1: TAKEOFF ACK=0
+[13:36:01]     STATUS:   Uploaded WP#2: WAYPOINT ACK=1
+[13:36:01]     STATUS:   Uploaded WP#3: WAYPOINT ACK=1
+[13:36:01]     STATUS:   Uploaded WP#4: LOITER_TIME ACK=1
+[13:36:01]     STATUS:   Uploaded WP#5: RTL ACK=1
+[13:36:01]     Result [OK]: 上传完成: 5 个航点
+[13:36:03] >>> ACTION: 从飞控下载任务
+[13:36:14]     ERROR: 未收到任务计数
+[13:36:14] >>> ACTION: 关闭连接
+[13:36:14]     Detail: MAVLink 连接已关闭
+[13:36:14] 
+Session ended. Duration: 16.2s
+[13:36:14] ============================================================
+[13:36:30] ============================================================
+[13:36:30] AI-MP Session Started: 2026-07-04 13:36:30
+[13:36:30] ============================================================
+[13:36:30] >>> ACTION: 建立 MAVLink 连接
+[13:36:30]     Detail: Port=COM15, Baud=115200
+[13:36:31]     STATUS:   已加载 4 个参数, 0 个航点记录
+[13:36:31]     Result [OK]: System=1
+[13:36:31]     Data: Vehicle Type = 13 (Unknown(13))
+[13:36:31]     Data: Flight Mode = STABILIZE
+[13:36:37] >>> ACTION: 设置参数
+[13:36:37]     Detail: SCR_ENABLE = 1
+[13:36:37]     Result [OK]: 参数 SCR_ENABLE 已设为 1
+[13:36:37]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:36:37] >>> ACTION: 读取参数
+[13:36:37]     Detail: 参数名: SCR_ENABLE
+[13:36:37]     Result [OK]: SCR_ENABLE = 1.0
+[13:36:37] >>> ACTION: 设置参数
+[13:36:37]     Detail: SCR_HEAP_SIZE = 8192
+[13:36:38]     Result [OK]: 参数 SCR_HEAP_SIZE 已设为 8192
+[13:36:38]     STATUS:   记录参数: SCR_HEAP_SIZE = 8192
+[13:36:38] >>> ACTION: 读取参数
+[13:36:38]     Detail: 参数名: SCR_HEAP_SIZE
+[13:36:38]     Result [OK]: SCR_HEAP_SIZE = 8192.0
+[13:36:38] >>> ACTION: 设置参数
+[13:36:38]     Detail: ARSPD_USE = 1
+[13:36:39]     Result [OK]: 参数 ARSPD_USE 已设为 1
+[13:36:39]     STATUS:   记录参数: ARSPD_USE = 1
+[13:36:39] >>> ACTION: 读取参数
+[13:36:39]     Detail: 参数名: ARSPD_USE
+[13:36:39]     Result [OK]: ARSPD_USE = 1.0
+[13:36:39] >>> ACTION: 设置参数
+[13:36:39]     Detail: ARMING_CHECK = 1
+[13:36:39]     Result [OK]: 参数 ARMING_CHECK 已设为 1
+[13:36:39]     STATUS:   记录参数: ARMING_CHECK = 1
+[13:36:40] >>> ACTION: 读取参数
+[13:36:40]     Detail: 参数名: ARMING_CHECK
+[13:36:40]     Result [OK]: ARMING_CHECK = 1.0
+[13:36:40]     STATUS:   已加载 4 个参数, 0 个航点记录
+[13:36:40]     STATUS:   记录参数: SCR_ENABLE = 1
+[13:36:40]     STATUS:   记录参数: SCR_HEAP_SIZE = 8192
+[13:36:40]     STATUS:   记录参数: ARSPD_USE = 1
+[13:36:40]     STATUS:   记录参数: ARMING_CHECK = 1
+[13:36:40] >>> ACTION: 导出参数 (MP格式)
+[13:36:40]     Detail: 4 个参数
+[13:36:40]     Result [OK]: 已导出 4 个参数到 D:/oezcon/ai_mp/verify/test\test_params.param
+[13:36:40]     STATUS: 用 MP 打开: Config > Full Parameter List > File > Open
+[13:36:40]     STATUS: 任务已清空
+[13:36:40]     STATUS: Added WP#1: TAKEOFF Lat=39.9042 Lon=116.4074 Alt=100m
+[13:36:40]     STATUS: Added WP#2: WAYPOINT Lat=39.905 Lon=116.408 Alt=100m
+[13:36:40]     STATUS: Added WP#3: WAYPOINT Lat=39.906 Lon=116.409 Alt=80m
+[13:36:40]     STATUS: Added WP#4: LOITER_TIME Lat=39.9055 Lon=116.4085 Alt=90m
+[13:36:40]     STATUS: Added WP#5: RTL Lat=0 Lon=0 Alt=0m
+[13:36:40] >>> ACTION: 上传任务到飞控
+[13:36:40]     Detail: 5 个航点
+[13:36:41]     STATUS:   Uploaded WP#1: TAKEOFF ACK=0
+[13:36:41]     STATUS:   Uploaded WP#2: WAYPOINT ACK=1
+[13:36:41]     STATUS:   Uploaded WP#3: WAYPOINT ACK=1
+[13:36:41]     STATUS:   Uploaded WP#4: LOITER_TIME ACK=1
+[13:36:41]     STATUS:   Uploaded WP#5: RTL ACK=1
+[13:36:41]     Result [OK]: 上传完成: 5 个航点
+[13:36:42] >>> ACTION: 从飞控下载任务
+[13:36:43]     Data: 飞控任务数 = 0
+[13:36:43]     STATUS: 飞控中无任务
+[13:36:43]     STATUS:   记录 0 个航点
+[13:36:43]     WARNING: 无航点写入记录
+[13:36:43] >>> ACTION: 获取飞行状态
+[13:36:43]     Detail: 读取所有传感器和状态数据
+[13:36:46]     Result [OK]: Mode=MANUAL, Alt=0.0m, ASpd=0.0m/s
+[13:36:46] >>> ACTION: 设置飞行模式
+[13:36:46]     Detail: 目标模式: MANUAL
+[13:36:46]     Result [OK]: 模式已设为 MANUAL (id=0)
+[13:36:47] >>> ACTION: 获取飞行状态
+[13:36:47]     Detail: 读取所有传感器和状态数据
+[13:36:50]     Result [OK]: Mode=MANUAL, Alt=0.0m, ASpd=0.0m/s
+[13:36:50] >>> ACTION: 设置飞行模式
+[13:36:50]     Detail: 目标模式: FBWA
+[13:36:50]     Result [OK]: 模式已设为 FBWA (id=7)
+[13:36:51] >>> ACTION: 获取飞行状态
+[13:36:51]     Detail: 读取所有传感器和状态数据
+[13:36:54]     Result [OK]: Mode=FBWA, Alt=0.0m, ASpd=0.0m/s
+[13:36:54] >>> ACTION: 设置飞行模式
+[13:36:54]     Detail: 目标模式: CRUISE
+[13:36:54]     Result [OK]: 模式已设为 CRUISE (id=13)
+[13:36:55] >>> ACTION: 获取飞行状态
+[13:36:55]     Detail: 读取所有传感器和状态数据
+[13:36:58]     Result [OK]: Mode=FBWA, Alt=0.0m, ASpd=0.0m/s
+[13:36:58] >>> ACTION: 设置飞行模式
+[13:36:58]     Detail: 目标模式: MANUAL
+[13:36:58]     Result [OK]: 模式已设为 MANUAL (id=0)
+[13:36:58] >>> ACTION: 传感器状态
+[13:36:58]     Detail: 检查所有传感器
+[13:36:58]     Result [OK]: 15 个传感器
+[13:36:58] >>> ACTION: EKF 状态
+[13:36:58]     Detail: 读取 EKF 和振动数据
+[13:37:01]     Result [OK]: EKF 数据: 10 项
+[13:37:01] >>> ACTION: 读取 RC 通道
+[13:37:01]     Detail: 获取遥控器输入
+[13:37:01]     Result [OK]: RC 通道: {}
+[13:37:01] >>> ACTION: 预飞检查
+[13:37:01]     Detail: 读取所有预飞检查项
+[13:37:04]     Data: 传感器健康 = 0x45509c2f
+[13:37:04]     Result [OK]: 0 项检查
+[13:37:04] >>> ACTION: 列出日志文件
+[13:37:04]     Detail: 读取 SD 卡 LOGS 目录
+[13:37:06]     Result [OK]: 21 个日志文件
+[13:37:06] >>> ACTION: 失控保护配置
+[13:37:06]     Detail: 读取相关参数
+[13:37:06] >>> ACTION: 读取参数
+[13:37:06]     Detail: 参数名: FS_BATT_ENABLE
+[13:37:17]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:37:17] >>> ACTION: 读取参数
+[13:37:17]     Detail: 参数名: FS_BATT_VOLTAGE
+[13:37:27]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:37:27] >>> ACTION: 读取参数
+[13:37:27]     Detail: 参数名: FS_BATT_MAH
+[13:37:36]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:37:36] >>> ACTION: 读取参数
+[13:37:36]     Detail: 参数名: FS_THR_ENABLE
+[13:37:37]     Result [OK]: FS_THR_ENABLE = 1.0
+[13:37:37] >>> ACTION: 读取参数
+[13:37:37]     Detail: 参数名: FS_THR_VALUE
+[13:37:37]     Result [OK]: FS_THR_VALUE = 975.0
+[13:37:37] >>> ACTION: 读取参数
+[13:37:37]     Detail: 参数名: FS_GCS_ENABLE
+[13:37:38]     Result [OK]: FS_GCS_ENABLE = 0.0
+[13:37:38] >>> ACTION: 读取参数
+[13:37:38]     Detail: 参数名: FS_GCS_TIMEOUT
+[13:37:38]     Result [OK]: FS_GCS_TIMEOUT = 5.0
+[13:37:38] >>> ACTION: 读取参数
+[13:37:38]     Detail: 参数名: THR_FAILSAFE
+[13:37:48]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:37:48] >>> ACTION: 读取参数
+[13:37:48]     Detail: 参数名: THR_FS_VALUE
+[13:37:59]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:37:59] >>> ACTION: 读取参数
+[13:37:59]     Detail: 参数名: FENCE_ENABLE
+[13:37:59]     Result [OK]: FENCE_ENABLE = 0.0
+[13:37:59] >>> ACTION: 读取参数
+[13:37:59]     Detail: 参数名: FENCE_ACTION
+[13:38:00]     Result [OK]: FENCE_ACTION = 1.0
+[13:38:00] >>> ACTION: 读取参数
+[13:38:00]     Detail: 参数名: EK3_FS_GYRO
+[13:38:09]     Result [FAIL]: 未收到参数响应（可能需要重启飞控后生效）
+[13:38:09]     Result [OK]: 6 项配置
+[13:38:09] >>> ACTION: 添加圆形围栏
+[13:38:09]     Detail: Center=(39.9042,116.4074) Radius=500m
+[13:38:09]     Result [OK]: 圆形围栏已添加
+[13:38:09] >>> ACTION: 下载围栏
+[13:38:09]     Detail: 从飞控读取围栏数据
+[13:38:11]     Result [OK]: 0 个围栏点
+[13:38:11]     STATUS:   记录 0 个围栏点
+[13:38:11]     WARNING: 无围栏写入记录
+[13:38:11] >>> ACTION: 添加 Rally 点
+[13:38:11]     Detail: Lat=39.91 Lon=116.41 Alt=100m
+[13:38:11]     Result [OK]: Rally 点已添加
+[13:38:11] >>> ACTION: 显示 Rally 点
+[13:38:11]     STATUS: 无 Rally 点
+[13:38:11]     STATUS:   记录 0 个 Rally 点
+[13:38:11]     WARNING: 无 Rally 写入记录
+[13:38:11] >>> ACTION: 导出参数
+[13:38:11]     Detail: D:/oezcon/ai_mp/verify/test\full_params.txt
+[13:38:11] >>> ACTION: 读取全部参数
+[13:38:11]     Detail: 请求参数列表
+[13:38:12]     STATUS:   已读取 50 个参数...
+[13:38:12]     STATUS:   已读取 100 个参数...
+[13:38:12]     STATUS:   已读取 150 个参数...
+[13:38:12]     STATUS:   已读取 200 个参数...
+[13:38:12]     STATUS:   已读取 250 个参数...
+[13:38:13]     STATUS:   已读取 300 个参数...
+[13:38:13]     STATUS:   已读取 350 个参数...
+[13:38:13]     STATUS:   已读取 400 个参数...
+[13:38:13]     STATUS:   已读取 450 个参数...
+[13:38:13]     STATUS:   已读取 500 个参数...
+[13:38:13]     STATUS:   已读取 550 个参数...
+[13:38:14]     STATUS:   已读取 600 个参数...
+[13:38:14]     STATUS:   已读取 650 个参数...
+[13:38:14]     STATUS:   已读取 700 个参数...
+[13:38:14]     STATUS:   已读取 750 个参数...
+[13:38:14]     STATUS:   已读取 800 个参数...
+[13:38:15]     STATUS:   已读取 850 个参数...
+[13:38:16]     STATUS:   已读取 900 个参数...
+[13:38:16]     STATUS:   已读取 950 个参数...
+[13:38:17]     STATUS:   已读取 1000 个参数...
+[16:22:16] ============================================================
+[16:22:16] AI-MP Session Started: 2026-07-04 16:22:16
+[16:22:16] ============================================================
+[16:22:16] >>> ACTION: 建立 MAVLink 连接
+[16:22:16]     Detail: Port=COM16, Baud=115200
+[16:22:16]     STATUS:   已加载 4 个参数, 0 个航点记录
+[16:22:16]     Result [OK]: System=1
+[16:22:16]     Data: Vehicle Type = 1 (FixedWing)
+[16:22:16]     Data: Flight Mode = MANUAL
+[16:22:16] >>> ACTION: 获取飞行状态
+[16:22:16]     Detail: 读取所有传感器和状态数据
+[16:22:19]     Result [OK]: Mode=MANUAL, Alt=0.5m, ASpd=0.0m/s
+[16:22:19] >>> ACTION: 关闭连接
+[16:22:19]     Detail: MAVLink 连接已关闭
+[16:22:19] 
+Session ended. Duration: 3.7s
+[16:22:19] ============================================================
+[17:10:14] ============================================================
+[17:10:14] AI-MP Session Started: 2026-07-04 17:10:14
+[17:10:14] ============================================================
+[17:10:14] >>> ACTION: 建立 MAVLink 连接
+[17:10:14]     Detail: Port=COM16, Baud=115200
+[17:10:15]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:10:15]     Result [OK]: System=1
+[17:10:15]     Data: Vehicle Type = 1 (FixedWing)
+[17:10:15]     Data: Flight Mode = MANUAL
+[17:10:15] >>> ACTION: 关闭连接
+[17:10:15]     Detail: MAVLink 连接已关闭
+[17:10:15] 
+Session ended. Duration: 0.6s
+[17:10:15] ============================================================
+[17:10:51] ============================================================
+[17:10:51] AI-MP Session Started: 2026-07-04 17:10:51
+[17:10:51] ============================================================
+[17:10:51] >>> ACTION: 建立 MAVLink 连接
+[17:10:51]     Detail: Port=COM16, Baud=115200
+[17:10:51]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:10:52]     Result [OK]: System=1
+[17:10:52]     Data: Vehicle Type = 1 (FixedWing)
+[17:10:52]     Data: Flight Mode = MANUAL
+[17:10:52] >>> ACTION: 关闭连接
+[17:10:52]     Detail: MAVLink 连接已关闭
+[17:10:52] 
+Session ended. Duration: 0.6s
+[17:10:52] ============================================================
+[17:30:16] ============================================================
+[17:30:16] AI-MP Session Started: 2026-07-04 17:30:16
+[17:30:16] ============================================================
+[17:30:16] >>> ACTION: 建立 MAVLink 连接
+[17:30:16]     Detail: Port=COM15, Baud=115200
+[17:30:17]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:30:17]     Result [OK]: System=1
+[17:30:17]     Data: Vehicle Type = 1 (FixedWing)
+[17:30:17]     Data: Flight Mode = MANUAL
+[17:30:17] >>> ACTION: 获取飞行状态
+[17:30:17]     Detail: 读取所有传感器和状态数据
+[17:30:20]     Result [OK]: Mode=MANUAL, Alt=3.8m, ASpd=0.0m/s
+[17:30:20] >>> ACTION: 关闭连接
+[17:30:20]     Detail: MAVLink 连接已关闭
+[17:30:20] 
+Session ended. Duration: 3.7s
+[17:30:20] ============================================================
+[17:30:48] ============================================================
+[17:30:48] AI-MP Session Started: 2026-07-04 17:30:48
+[17:30:48] ============================================================
+[17:30:48] >>> ACTION: 建立 MAVLink 连接
+[17:30:48]     Detail: Port=COM16, Baud=115200
+[17:30:49]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:30:49]     Result [OK]: System=1
+[17:30:49]     Data: Vehicle Type = 1 (FixedWing)
+[17:30:49]     Data: Flight Mode = MANUAL
+[17:30:49] >>> ACTION: 读取参数
+[17:30:49]     Detail: 参数名: SCR_ENABLE
+[17:30:49]     Result [OK]: SCR_ENABLE = 1.0
+[17:30:49] >>> ACTION: 关闭连接
+[17:30:49]     Detail: MAVLink 连接已关闭
+[17:30:49] 
+Session ended. Duration: 1.1s
+[17:30:49] ============================================================
+[17:31:42] ============================================================
+[17:31:42] AI-MP Session Started: 2026-07-04 17:31:42
+[17:31:42] ============================================================
+[17:31:42] >>> ACTION: 建立 MAVLink 连接
+[17:31:42]     Detail: Port=COM15, Baud=115200
+[17:31:42]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:31:42]     Result [OK]: System=1
+[17:31:42]     Data: Vehicle Type = 1 (FixedWing)
+[17:31:42]     Data: Flight Mode = MANUAL
+[17:31:42] >>> ACTION: 传感器状态
+[17:31:42]     Detail: 检查所有传感器
+[17:31:42]     Result [OK]: 15 个传感器
+[17:31:42] >>> ACTION: 关闭连接
+[17:31:42]     Detail: MAVLink 连接已关闭
+[17:31:42] 
+Session ended. Duration: 0.6s
+[17:31:42] ============================================================
+[17:32:07] ============================================================
+[17:32:07] AI-MP Session Started: 2026-07-04 17:32:07
+[17:32:07] ============================================================
+[17:32:07] >>> ACTION: 建立 MAVLink 连接
+[17:32:07]     Detail: Port=COM15, Baud=115200
+[17:32:07]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:32:07]     Result [OK]: System=1
+[17:32:07]     Data: Vehicle Type = 1 (FixedWing)
+[17:32:07]     Data: Flight Mode = MANUAL
+[17:32:07] >>> ACTION: EKF 状态
+[17:32:07]     Detail: 读取 EKF 和振动数据
+[17:32:10]     Result [OK]: EKF 数据: 10 项
+[17:32:10] >>> ACTION: 关闭连接
+[17:32:10]     Detail: MAVLink 连接已关闭
+[17:32:10] 
+Session ended. Duration: 3.7s
+[17:32:10] ============================================================
+[17:32:38] ============================================================
+[17:32:38] AI-MP Session Started: 2026-07-04 17:32:38
+[17:32:38] ============================================================
+[17:32:38] >>> ACTION: 建立 MAVLink 连接
+[17:32:38]     Detail: Port=COM15, Baud=115200
+[17:32:38]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:32:38]     Result [OK]: System=1
+[17:32:38]     Data: Vehicle Type = 1 (FixedWing)
+[17:32:38]     Data: Flight Mode = MANUAL
+[17:32:38] >>> ACTION: 设置参数
+[17:32:38]     Detail: SCR_ENABLE = 1
+[17:32:39]     Result [OK]: 参数 SCR_ENABLE 已设为 1
+[17:32:39]     STATUS:   记录参数: SCR_ENABLE = 1
+[17:32:39] >>> ACTION: 关闭连接
+[17:32:39]     Detail: MAVLink 连接已关闭
+[17:32:39] 
+Session ended. Duration: 0.9s
+[17:32:39] ============================================================
+[17:33:05] ============================================================
+[17:33:05] AI-MP Session Started: 2026-07-04 17:33:05
+[17:33:05] ============================================================
+[17:33:05] >>> ACTION: 建立 MAVLink 连接
+[17:33:05]     Detail: Port=COM15, Baud=115200
+[17:33:06]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:33:06]     Result [OK]: System=1
+[17:33:06]     Data: Vehicle Type = 1 (FixedWing)
+[17:33:06]     Data: Flight Mode = MANUAL
+[17:33:06] >>> ACTION: 读取参数
+[17:33:06]     Detail: 参数名: SCR_ENABLE
+[17:33:06]     Result [OK]: SCR_ENABLE = 1.0
+[17:33:06] >>> ACTION: 关闭连接
+[17:33:06]     Detail: MAVLink 连接已关闭
+[17:33:06] 
+Session ended. Duration: 1.1s
+[17:33:06] ============================================================
+[17:33:35] ============================================================
+[17:33:35] AI-MP Session Started: 2026-07-04 17:33:35
+[17:33:35] ============================================================
+[17:33:35] >>> ACTION: 建立 MAVLink 连接
+[17:33:35]     Detail: Port=COM15, Baud=115200
+[17:33:36]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:33:36]     Result [OK]: System=1
+[17:33:36]     Data: Vehicle Type = 1 (FixedWing)
+[17:33:36]     Data: Flight Mode = MANUAL
+[17:33:36]     STATUS: Added WP#1: TAKEOFF Lat=37.5 Lon=127.0 Alt=100.0m
+[17:33:36] >>> ACTION: 关闭连接
+[17:33:36]     Detail: MAVLink 连接已关闭
+[17:33:36] 
+Session ended. Duration: 0.6s
+[17:33:36] ============================================================
+[17:34:09] ============================================================
+[17:34:09] AI-MP Session Started: 2026-07-04 17:34:09
+[17:34:09] ============================================================
+[17:34:09] >>> ACTION: 建立 MAVLink 连接
+[17:34:09]     Detail: Port=COM15, Baud=115200
+[17:34:09]     STATUS:   已加载 4 个参数, 0 个航点记录
+[17:34:09]     Result [OK]: System=1
+[17:34:09]     Data: Vehicle Type = 1 (FixedWing)
+[17:34:09]     Data: Flight Mode = MANUAL
+[17:34:09] >>> ACTION: 加载任务文件
+[17:34:09]     Detail: D:\oezcon\ai_mp\balloon_drop_template.txt
+[17:34:09]     Result [OK]: 加载 6 个航点 (简化格式)
+[17:34:09] >>> ACTION: 当前任务
+[17:34:09]     Detail: 6 个航点
+[17:34:09] >>> ACTION: 上传任务到飞控
+[17:34:09]     Detail: 6 个航点
+[17:34:11]     STATUS:   Uploaded WP#1: TAKEOFF ACK=0
+[17:34:11]     STATUS:   Uploaded WP#2: WAYPOINT ACK=10
+[17:34:11]     STATUS:   Uploaded WP#3: WAYPOINT ACK=1
+[17:34:11]     STATUS:   Uploaded WP#4: LOITER_TIME ACK=1
+[17:34:11]     STATUS:   Uploaded WP#5: DO_CHANGE_SPEED ACK=1
+[17:34:11]     STATUS:   Uploaded WP#6: WAYPOINT ACK=1
+[17:34:11]     Result [OK]: 上传完成: 6 个航点
+[17:34:11] >>> ACTION: 关闭连接
+[17:34:11]     Detail: MAVLink 连接已关闭
+[17:34:11] 
+Session ended. Duration: 2.1s
+[17:34:11] ============================================================
+[21:06:56] ============================================================
+[21:06:56] AI-MP Session Started: 2026-07-04 21:06:56
+[21:06:56] ============================================================
+[21:06:56] >>> ACTION: 建立 MAVLink 连接
+[21:06:56]     Detail: Port=COM15, Baud=115200
+[21:06:57]     STATUS:   已加载 4 个参数, 0 个航点记录
+[21:06:57]     Result [OK]: System=1
+[21:06:57]     Data: Vehicle Type = 1 (FixedWing)
+[21:06:57]     Data: Flight Mode = MANUAL
+[21:06:57] >>> ACTION: 关闭连接
+[21:06:57]     Detail: MAVLink 连接已关闭
+[21:06:57] 
+Session ended. Duration: 0.9s
+[21:06:57] ============================================================
+[21:07:17] ============================================================
+[21:07:17] AI-MP Session Started: 2026-07-04 21:07:17
+[21:07:17] ============================================================
+[21:07:17] >>> ACTION: 建立 MAVLink 连接
+[21:07:17]     Detail: Port=COM15, Baud=115200
+[21:07:17]     STATUS:   已加载 4 个参数, 0 个航点记录
+[21:07:17]     Result [OK]: System=1
+[21:07:17]     Data: Vehicle Type = 1 (FixedWing)
+[21:07:17]     Data: Flight Mode = MANUAL
+[21:07:27] >>> ACTION: 关闭连接
+[21:07:27]     Detail: MAVLink 连接已关闭
+[21:07:27] 
+Session ended. Duration: 9.5s
+[21:07:27] ============================================================
+[21:19:38] ============================================================
+[21:19:38] AI-MP Session Started: 2026-07-04 21:19:38
+[21:19:38] ============================================================
+[21:19:38] >>> ACTION: 建立 MAVLink 连接
+[21:19:38]     Detail: Port=tcp:127.0.0.1:5760, Baud=115200
+[21:19:53]     STATUS:   已加载 4 个参数, 0 个航点记录
+[21:19:53]     Result [OK]: System=0
+[21:19:53]     Data: Vehicle Type = 1 (FixedWing)
+[21:19:53]     Data: Flight Mode = UNKNOWN
+[21:19:53] >>> ACTION: 获取飞行状态
+[21:19:53]     Detail: 读取所有传感器和状态数据
+[21:19:53] >>> ACTION: 关闭连接
+[21:19:53]     Detail: MAVLink 连接已关闭
+[21:19:53] 
+Session ended. Duration: 15.1s
+[21:19:53] ============================================================
+[22:03:57] ============================================================
+[22:03:57] AI-MP Session Started: 2026-07-04 22:03:57
+[22:03:57] ============================================================
+[22:03:58] >>> ACTION: 建立 MAVLink 连接
+[22:03:58]     Detail: Port=tcp:127.0.0.1:5760, Baud=115200
+[22:04:06]     Result [FAIL]: [WinError 10061] 由于目标计算机积极拒绝，无法连接。
+[22:06:16] ============================================================
+[22:06:16] AI-MP Session Started: 2026-07-04 22:06:16
+[22:06:16] ============================================================
+[22:06:16] >>> ACTION: 建立 MAVLink 连接
+[22:06:16]     Detail: Port=tcp:127.0.0.1:5760, Baud=115200
+[22:06:24]     Result [FAIL]: [WinError 10061] 由于目标计算机积极拒绝，无法连接。
+[22:08:05] ============================================================
+[22:08:05] AI-MP Session Started: 2026-07-04 22:08:05
+[22:08:05] ============================================================
+[22:08:05] >>> ACTION: 建立 MAVLink 连接
+[22:08:05]     Detail: Port=tcp:127.0.0.1:5760, Baud=115200
+[22:08:13]     Result [FAIL]: [WinError 10061] 由于目标计算机积极拒绝，无法连接。
+[22:10:07] ============================================================
+[22:10:07] AI-MP Session Started: 2026-07-04 22:10:07
+[22:10:07] ============================================================
+[22:10:07] >>> ACTION: 建立 MAVLink 连接
+[22:10:07]     Detail: Port=tcp:127.0.0.1:5760, Baud=115200
+[22:10:07]     STATUS:   已加载 4 个参数, 0 个航点记录
+[22:10:07]     Result [OK]: System=1
+[22:10:07]     Data: Vehicle Type = 1 (FixedWing)
+[22:10:07]     Data: Flight Mode = MANUAL
+[22:10:07] >>> ACTION: 开始实时监控
+[22:10:07]     Detail: 每秒输出飞行状态 (Ctrl+C 停止)
+[22:10:07] >>> ACTION: 获取飞行状态
+[22:10:07]     Detail: 读取所有传感器和状态数据
+[22:10:10]     Result [OK]: Mode=MANUAL, Alt=584.3m, ASpd=0.8m/s
+[22:10:11] >>> ACTION: 获取飞行状态
+[22:10:11]     Detail: 读取所有传感器和状态数据
+[22:10:14]     Result [OK]: Mode=MANUAL, Alt=584.1m, ASpd=0.5m/s
+[22:10:15] >>> ACTION: 获取飞行状态
+[22:10:15]     Detail: 读取所有传感器和状态数据
+[22:10:19]     Result [OK]: Mode=MANUAL, Alt=584.0m, ASpd=0.3m/s
+[22:10:20] >>> ACTION: 获取飞行状态
+[22:10:20]     Detail: 读取所有传感器和状态数据
+[22:25:40] ============================================================
+[22:25:41] AI-MP Session Started: 2026-07-04 22:25:41
+[22:25:41] ============================================================
+[22:25:41] >>> ACTION: 建立 MAVLink 连接
+[22:25:41]     Detail: Port=COM15, Baud=115200
+[22:25:41]     STATUS:   已加载 4 个参数, 0 个航点记录
+[22:25:41]     Result [OK]: System=1
+[22:25:41]     Data: Vehicle Type = 1 (FixedWing)
+[22:25:41]     Data: Flight Mode = MANUAL
+[22:25:46] >>> ACTION: 关闭连接
+[22:25:46]     Detail: MAVLink 连接已关闭
+[22:25:46] 
+Session ended. Duration: 5.5s
+[22:25:46] ============================================================
+[22:26:13] ============================================================
+[22:26:13] AI-MP Session Started: 2026-07-04 22:26:13
+[22:26:13] ============================================================
+[22:26:13] >>> ACTION: 建立 MAVLink 连接
+[22:26:13]     Detail: Port=COM15, Baud=115200
+[22:26:14]     STATUS:   已加载 4 个参数, 0 个航点记录
+[22:26:14]     Result [OK]: System=1
+[22:26:14]     Data: Vehicle Type = 1 (FixedWing)
+[22:26:14]     Data: Flight Mode = MANUAL
+[22:26:21] >>> ACTION: 关闭连接
+[22:26:21]     Detail: MAVLink 连接已关闭
+[22:26:21] 
+Session ended. Duration: 7.9s
+[22:26:21] ============================================================
+[22:26:32] ============================================================
+[22:26:32] AI-MP Session Started: 2026-07-04 22:26:32
+[22:26:32] ============================================================
+[22:26:32] >>> ACTION: 建立 MAVLink 连接
+[22:26:32]     Detail: Port=udp:127.0.0.1:5760, Baud=115200
+[22:26:47]     STATUS:   已加载 4 个参数, 0 个航点记录
+[22:26:47]     Result [OK]: System=0
+[22:26:47]     Data: Vehicle Type = 1 (FixedWing)
+[22:26:47]     Data: Flight Mode = UNKNOWN
+[22:26:47] >>> ACTION: 获取飞行状态
+[22:26:47]     Detail: 读取所有传感器和状态数据
+[22:26:50]     Result [OK]: Mode=None, Alt=0m, ASpd=0m/s
+[22:26:50] >>> ACTION: 关闭连接
+[22:26:50]     Detail: MAVLink 连接已关闭
+[22:26:50] 
+Session ended. Duration: 18.0s
+[22:26:50] ============================================================

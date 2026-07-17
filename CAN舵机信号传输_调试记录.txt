@@ -1,0 +1,260 @@
+================================================================================
+        CUAV Nora CAN舵机信号传输到ESP32-S3 — 调试记录与技术分析
+                          2026-07-15
+================================================================================
+
+★ 重要更正 (2026-07-17, 源码核对后) ★
+--------------------------------------------------------------------------------
+本文档第三节"Nora固件没有CAN_D1_SRVOBM参数 → 必须重新编译固件"的结论有误,
+方案B(重编译)是不必要的弯路。核对 ardupilot_src 源码后确认:
+
+1) 参数名找错了。DroneCAN 这组参数挂在 CAN_ + D1_ + UC_ 子组下,
+   真实参数名是带 UC_ 前缀的:
+       CAN_D1_SRVOBM   ->  CAN_D1_UC_SRV_BM   (舵机通道位掩码, 默认0)
+       CAN_D1_ESCBM    ->  CAN_D1_UC_ESC_BM
+       CAN_D1_OPTION   ->  CAN_D1_UC_OPTION   (bit4=SendServoAsPWM)
+       CAN_D1_NODE     ->  CAN_D1_UC_NODE     (默认10)
+       (另: 波特率是 CAN_P1_BITRATE, 不是 CAN_D1_BITRATE)
+   证据: AP_CANManager_CANDriver_Params.cpp:39
+         AP_SUBGROUPPTR(_uavcan, "UC_", 2, ..., AP_DroneCAN)
+   => 标准固件一直都有这些参数, 无需重新编译, 直接在 Mission Planner 里设置即可。
+
+2) 除了 SRV_BM=0 之外, 还有第二个必要条件: 安全开关(safety switch)。
+   AP_DroneCAN.cpp:939-950: 安全开关处于"生效(未解除)"状态时,
+   servo_armed_mask &= BRD_SAFETY_MASK, 默认不含目标通道 => 一帧都不发。
+   台架测试需: 按下安全开关使其熄灭(解除), 或 BRD_SAFETY_ENABLE=0,
+   或把通道加入 BRD_SAFETY_MASK。
+
+3) 舵机数据被广播的三个必要条件(须全部满足):
+   a. CAN_D1_UC_SRV_BM 对应位=1
+   b. 该通道 SERVOx_FUNCTION 有效且输出PWM非零 (注意: FUNCTION=0 是 Disabled)
+   c. 安全开关已解除 (见第2点)
+
+正确做法: 用 Mission Planner 加载 nora_dronecan.param, 或运行(已修正的)
+nora_can_config.py, 重启飞控, 解除安全开关即可。
+--------------------------------------------------------------------------------
+
+一、项目目标
+----------
+将CUAV Nora飞控(ArduPilot)的舵机PWM输出信号，通过CAN1接口经TJA1050模块
+传递给ESP32-S3(GPIO11/12)，实现飞控舵机信号的远端读取。
+
+硬件连接:
+  Nora CAN1 CANH → TJA1050 CANH
+  Nora CAN1 CANL → TJA1050 CANL
+  TJA1050 TXD    → ESP32 GPIO11
+  TJA1050 RXD    → ESP32 GPIO12
+  TJA1050 VCC    → 5V
+  TJA1050 GND    → GND
+
+端口信息:
+  COM15: ArduPilot MAVLink
+  COM16: ArduPilot SLCAN
+  COM17: ESP32-S3 (CH343)
+
+
+二、ArduPilot DroneCAN源码分析 (核心发现)
+------------------------------------------
+源码位置: ardupilot_src/libraries/AP_DroneCAN/AP_DroneCAN.cpp
+
+2.1 关键参数
+  参数名            默认值   说明
+  ─────────────────────────────────────────────────────
+  CAN_D1_SRVOBM     0       哪些舵机通道通过DroneCAN发送(位掩码)
+  CAN_D1_ESCBM      0       哪些ESC通道通过DroneCAN发送(位掩码)
+  CAN_D1_OPTION     0       选项(bit4=SendServoAsPWM)
+  CAN_D1_PROTOCOL   -       CAN协议(1=DroneCAN)
+  CAN_P1_DRIVER     -       物理CAN口映射到逻辑驱动
+  CAN_P1_BITRATE    -       CAN波特率
+
+2.2 Servo输出发送机制 (确认是广播,非请求-响应)
+  代码流程:
+  
+  SRV_push_servos():
+    servo_armed_mask = _servo_bm & non_zero_channels;
+    _SRV_armed_mask = servo_armed_mask;
+    
+  update() 主循环:
+    if (_SRV_armed_mask != 0) {       // <-- 如果_servo_bm=0,这里永远跳过
+        SRV_send_actuator();           // 广播 ArrayCommand (非请求响应)
+    }
+    
+  SRV_send_actuator():
+    msg.commands.data[i] = cmd;
+    act_out_array.broadcast(msg);      // <-- 这是broadcast广播
+
+  关键结论:
+  ✗ 错误假设: "DroneCAN需要ESC节点请求才发送servo数据"
+  ✓ 实际机制: ArduPilot主动广播servo数据,但需要CAN_D1_SRVOBM非零
+  ✓ 默认值=0意味着: 不配置任何通道的CAN输出
+
+2.3 两个关键修改 (已应用到源码)
+  修改1: _servo_bm 默认值 0 → 15 (启用通道1-4)
+    AP_GROUPINFO("SRV_BM", 2, AP_DroneCAN, _servo_bm, 15),
+  
+  修改2: _options 默认值 0 → 16 (启用SendServoAsPWM便于ESP32解析)
+    AP_GROUPINFO("OPTION", 5, AP_DroneCAN, _options, 16),
+
+
+三、Nora固件问题分析
+---------------------
+3.1 当前固件参数检查结果
+  通过MAVLink读取的参数 (约474个):
+  - CAN_D1_PROTOCOL = 1    ✓ 存在
+  - CAN_P1_DRIVER = 1      ✓ 存在
+  - CAN_P1_BITRATE = 1000000 ✓ 存在
+  - CAN_D1_SRVOBM           ✗ 不存在!
+  - CAN_D1_OPTION           ✗ 不存在!
+  - CAN_D1_NODE             ✗ 不存在!
+
+  结论: Nora当前固件编译时没有包含完整的DroneCAN舵机输出功能,
+        CAN_D1_SRVOBM参数未暴露,导致servo数据永远不通过CAN发送。
+
+3.2 CAN1口硬件分析 (hwdef.dat)
+  PI9  → CAN1_RX (仅CAN功能,无UART alternate)
+  PH13 → CAN1_TX (仅CAN功能,无UART alternate)
+  PH2  → CAN1_SILENT (静默控制GPIO)
+  
+  结论: CAN1口硬件上只能做CAN通信,不能复用为UART做SBUS。
+
+
+四、ESP32 CAN接收测试结果
+--------------------------
+ESP32固件已成功上传并运行,确认CAN物理层正常:
+
+4.1 CAN总线数据
+  收到4种CAN帧,共约4000+帧/5秒,0错误:
+  
+  CAN ID          SubjectID  来源     频率      说明
+  ─────────────────────────────────────────────────────
+  0x1F01550A      341        node 1   ~1Hz     NodeStatus(Nora飞控)
+  0x184E270A      20007      node 78  ~76Hz    未知设备(可能CAN GPS)
+  0x18044C0A      1100       node 4   ~3.8Hz   未知设备
+  0x184E200A      20000      node 78  ~3.8Hz   未知设备
+
+4.2 关键发现
+  ✓ CAN物理层正常 (TJA1050模块工作正常)
+  ✓ Nora DroneCAN协议在运行 (发送NodeStatus)
+  ✗ 没有RawCommand (servo输出)帧
+  ✗ 没有ArrayCommand帧
+  ✗ node 78和node 4可能是CAN总线上的其他设备(如CAN GPS)
+
+
+五、已实施方案及结果
+---------------------
+
+5.1 方案A: 配置CAN参数 (失败)
+  操作: 设置CAN_D1_SRVOBM=15, CAN_D1_OPTION=16
+  结果: 参数写入成功但未持久化(固件重启后丢失,因为参数不存在)
+  
+5.2 方案B: 编译自定义固件 (进行中,遇到障碍)
+  已完成:
+  - 下载ArduPilot源码 (D:\oezcon\ardupilot_src)
+  - 下载ARM工具链 (D:\arm-official)
+  - 修改源码默认值 (_servo_bm=15, _options=16)
+  - 初始化关键子模块 (ChibiOS, DroneCAN, lwip, waf等)
+  - WSL Ubuntu 22.04中configure成功
+  
+  遇到的编译障碍:
+  - Windows直接编译: waf构建系统有多个Windows兼容性问题
+    * /dev/null 不存在 → 已修复
+    * BUILDDIR内联赋值语法不兼容 → 已设置环境变量
+    * touch命令不存在 → 已创建wrapper
+  - WSL编译: ChibiOS库构建失败
+    * "No rule to make target 'CrashCatcher_armv7m.S'"
+    * 已初始化CrashDebug子模块但问题仍存在
+    * 可能需要完整的ChibiOS git子模块递归初始化
+
+
+六、可能的解决方案
+------------------
+
+6.1 [推荐] 完成WSL编译环境修复
+  问题: ChibiOS库构建缺少CrashCatcher文件
+  方案: 递归初始化所有ChibiOS相关子模块
+  命令: wsl -d Ubuntu-22.04 -- bash -c "cd /mnt/d/oezcon/ardupilot_src && \
+         git submodule update --init --recursive --depth 1 modules/ChibiOS"
+  优先级: ★★★★★
+
+6.2 刷写标准ArduPilot固件 + MAVLink设置参数
+  前提: 标准固件必须包含CAN_D1_SRVOBM参数
+  操作: 下载QGroundControl → 刷标准固件 → MAVLink设置SRVOBM=15
+  风险: 标准固件的SRVOBM默认值可能也是0,需要验证
+  优先级: ★★★★☆
+
+6.3 使用Docker编译
+  方案: 使用官方ArduPilot Docker镜像编译
+  命令: docker run -v /d/oezcon/ardupilot_src:/ardupilot \
+         ardupilot/ardupilot-dev ./waf configure --board CUAV-Nora && \
+         ./waf plane
+  前提: 需要安装Docker Desktop
+  优先级: ★★★☆☆
+
+6.4 使用GitHub Actions自动编译
+  方案: 将修改后的源码推送到GitHub,用CI编译
+  优点: 不需要本地安装编译环境
+  缺点: 需要GitHub账号和仓库
+  优先级: ★★★☆☆
+
+
+七、待验证内容
+--------------
+
+7.1 编译环境验证
+  □ WSL中ChibiOS子模块递归初始化后能否编译通过
+  □ 编译产物 (arduplane_with_bl.bin) 是否包含CAN_D1_SRVOBM参数
+  □ 编译产物的参数表中是否能看到SRVOBM和OPTION
+
+7.2 标准固件验证
+  □ firmware.ardupilot.org的标准Nora固件是否包含CAN_D1_SRVOBM参数
+  □ 如果包含,默认值是多少,是否需要设置
+  □ 标准固件是否可以直接刷入Nora
+
+7.3 CAN通信验证 (固件就绪后)
+  □ ESP32能否正确解析ArrayCommand消息 (DroneCAN servo输出格式)
+  □ Servo PWM值是否正确 (与SERVO_OUTPUT_RAW对比)
+  □ 未解锁时是否发送中位信号(1500us)
+  □ 解锁后舵机控制时值是否实时变化
+  □ CAN总线上的其他设备(node 78, node 4)是否干扰
+
+7.4 物理连接验证
+  □ TJA1050模块终端电阻是否需要(120Ω)
+  □ CANH/CANL线序是否正确
+  □ ESP32 GPIO11/12的TWAI配置是否正确(1Mbps)
+
+
+八、文件清单
+------------
+  D:\oezcon\ardupilot_src\          ArduPilot源码(已修改)
+  D:\oezcon\oez\esp32_can_servo\    ESP32固件+工具脚本
+  D:\arm-official\                  ARM交叉编译工具链
+  D:\arm-gcc\                       xPack ARM工具链(不完整)
+  D:\oezcon\arduplane_nora.hex      标准Nora固件(5MB)
+  
+  ESP32固件文件:
+  esp32_can_servo.ino                主固件
+  check_serial.py                   串口参数检查
+  analyze_can.py                    CAN帧分析
+  slcan_analyze.py                  SLCAN分析
+  gui_monitor.py                    GUI监控界面
+
+
+九、同行交流要点
+----------------
+
+1. CUAV Nora的CAN1口只能做CAN,不能做UART/SBUS (PI9/PH13无UART功能)
+
+2. ArduPilot DroneCAN servo输出需要设置CAN_D1_SRVOBM参数为非零值
+   但某些Nora固件版本可能不暴露此参数
+
+3. DroneCAN servo输出使用uavcan::equipment::actuator::ArrayCommand消息
+   (不是RawCommand, RawCommand是给ESC的)
+
+4. 编译ArduPilot固件在WSL中比Windows更可靠,但ChibiOS子模块需要完整初始化
+
+5. CAN_D1_OPTION bit4 (SendServoAsPWM=16) 可以让servo值以PWM格式发送
+   而不是unitless格式(-1到+1),便于ESP32解析
+
+================================================================================
+                           文档结束
+================================================================================

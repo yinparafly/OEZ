@@ -1,0 +1,410 @@
+=====================================================
+          Arduino CLI 命令速查手册 (ESP32 专用)
+=====================================================
+版本：v1.0
+日期：2026-07-10
+适用平台：YD-ESP32-S3
+工作目录：D:\servotest\
+
+=====================================================
+一、基础命令
+=====================================================
+
+1.1 设置环境变量（必须）
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+```
+
+1.2 CLI 帮助
+
+```powershell
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" --help
+```
+
+1.3 命令帮助
+
+```powershell
+# 查看 compile 命令帮助
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --help
+
+# 查看 upload 命令帮助
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" upload --help
+```
+
+=====================================================
+二、编译命令详解
+=====================================================
+
+2.1 基本编译
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  compile `
+  --fqbn esp32:esp32:yd_esp32s3_n8r2 `
+  "D:\servotest\YourProject" `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+2.2 参数说明
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| --fqbn | 指定开发板型号（必需） | esp32:esp32:yd_esp32s3_n8r2 |
+| --config-file | 指定配置文件路径 | C:\Users\tt\.arduinoIDE\arduino-cli.yaml |
+| -v / --verbose | 详细输出编译过程 | -v |
+| --warnings | 警告级别 | --warnings all |
+| --build-cache-path | 编译缓存路径 | --build-cache-path D:\servotest\cache |
+
+2.3 常用 FQBN
+
+```powershell
+# YD-ESP32-S3-N8R2 (8MB Flash, 2MB PSRAM)
+--fqbn esp32:esp32:yd_esp32s3_n8r2
+
+# YD-ESP32-S3-N8R8 (8MB Flash, 8MB PSRAM)
+--fqbn esp32:esp32:yd_esp32s3_n8r8
+
+# YD-ESP32-S3-N16R8 (16MB Flash, 8MB PSRAM)
+--fqbn esp32:esp32:yd_esp32s3_n16r8
+```
+
+=====================================================
+三、上传命令详解
+=====================================================
+
+3.1 基本上传
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  upload `
+  --fqbn esp32:esp32:yd_esp32s3_n8r2 `
+  "D:\servotest\YourProject" `
+  --port COM17 `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+3.2 参数说明
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| --fqbn | 指定开发板型号（必需） | esp32:esp32:yd_esp32s3_n8r2 |
+| --port | 指定串口端口（必需） | --port COM17 |
+| --config-file | 指定配置文件路径 | C:\Users\tt\.arduinoIDE\arduino-cli.yaml |
+| -v / --verbose | 详细输出上传过程 | -v |
+| --verify | 上传后验证 | --verify |
+
+3.3 上传前必须先编译
+
+```powershell
+# 编译
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  compile --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\YourProject"
+
+# 上传（CLI 会自动找到编译产物）
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  upload --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\YourProject" --port COM17
+```
+
+**注意**：不要使用 --build-path 参数，否则上传时找不到编译产物！
+
+=====================================================
+四、开发板管理命令
+=====================================================
+
+4.1 列出已连接的开发板
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  board list `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+输出示例：
+```
+Port  Protocol Type              Board Name FQBN Core
+COM1  serial   Serial Port       Unknown
+COM17 serial   Serial Port (USB) Unknown
+```
+
+4.2 列出所有可用板型
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  board listall esp32:esp32 `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+4.3 查看板型详细信息
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  board details --fqbn esp32:esp32:yd_esp32s3_n8r2 `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+=====================================================
+五、核心管理命令
+=====================================================
+
+5.1 安装 ESP32 核心
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  core install esp32:esp32@3.3.10 `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+5.2 列出已安装的核心
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  core list `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+5.3 更新 ESP32 核心
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  core update-index `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  core upgrade esp32:esp32 `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+5.4 删除 ESP32 核心
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  core uninstall esp32:esp32 `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+=====================================================
+六、库管理命令
+=====================================================
+
+6.1 安装库
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  lib install "Adafruit NeoPixel" `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+6.2 安装指定版本
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  lib install "Adafruit NeoPixel@1.15.5" `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+6.3 列出已安装的库
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  lib list `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+6.4 更新库索引
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  lib update-index `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+6.5 搜索库
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  lib search "NeoPixel" `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+6.6 删除库
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  lib uninstall "Adafruit NeoPixel" `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+=====================================================
+七、配置文件命令
+=====================================================
+
+7.1 查看当前配置
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  config dump `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+7.2 初始化配置文件
+
+```powershell
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  config init `
+  --config-file "D:\servotest\arduino-cli.yaml"
+```
+
+=====================================================
+八、完整操作流程示例
+=====================================================
+
+8.1 新建项目并上传
+
+```powershell
+# 1. 设置环境变量
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+
+# 2. 创建项目目录
+New-Item -ItemType Directory -Path "D:\servotest\MyProject" -Force
+
+# 3. 创建 .ino 文件
+@'
+void setup() {
+  pinMode(48, OUTPUT);
+}
+
+void loop() {
+  digitalWrite(48, HIGH);
+  delay(500);
+  digitalWrite(48, LOW);
+  delay(500);
+}
+'@ | Out-File -FilePath "D:\servotest\MyProject\MyProject.ino" -Encoding utf8
+
+# 4. 编译
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  compile --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\MyProject" `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+
+# 5. 上传
+if ($LASTEXITCODE -eq 0) {
+    "D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+      upload --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\MyProject" `
+      --port COM17 `
+      --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+}
+```
+
+8.2 检查端口并上传
+
+```powershell
+$env:ARDUINO_DATA_DIR = "D:\Arduino\Arduino15"
+
+# 列出端口
+$ports = & "D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  board list --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+
+# 查找 ESP32 端口
+$esp32Port = $ports | ForEach-Object {
+    if ($_ -match 'serial.*USB') { $_.Split()[0] }
+}
+
+Write-Host "Found ESP32 on port: $esp32Port"
+
+# 上传
+"D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
+  upload --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\MyProject" `
+  --port $esp32Port `
+  --config-file "C:\Users\tt\.arduinoIDE\arduino-cli.yaml"
+```
+
+=====================================================
+九、常见错误处理
+=====================================================
+
+9.1 编译错误：undefined reference to setup()
+
+```powershell
+# 原因：文件结构错误
+# 正确结构：
+# D:\servotest\MyProject\
+#   └── MyProject.ino
+
+# 检查文件结构
+Get-ChildItem "D:\servotest\MyProject"
+```
+
+9.2 上传错误：Could not open port
+
+```powershell
+# 原因：端口被占用或未连接
+# 解决：关闭串口工具，重新插拔 USB
+arduino-cli board list
+```
+
+9.3 上传错误：No such file or directory: partitions.bin
+
+```powershell
+# 原因：使用了 --build-path 参数
+# 解决：移除 --build-path，使用默认编译路径
+arduino-cli compile --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\MyProject"
+arduino-cli upload --fqbn esp32:esp32:yd_esp32s3_n8r2 "D:\servotest\MyProject" --port COM17
+```
+
+9.4 编译错误：library not found
+
+```powershell
+# 原因：缺少依赖库
+# 解决：安装所需库
+arduino-cli lib install "Adafruit NeoPixel"
+```
+
+=====================================================
+十、CLI 路径汇总
+=====================================================
+
+| 路径 | 说明 |
+|------|------|
+| D:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe | IDE 内置 CLI |
+| D:\servotest\arduino-cli\arduino-cli.exe | 独立 CLI |
+| D:\Arduino\Arduino15 | 数据目录 |
+| C:\Users\tt\.arduinoIDE\arduino-cli.yaml | IDE 配置文件 |
+| D:\servotest\arduino-cli.yaml | 独立配置文件 |
+
+=====================================================
+十一、快捷键速查
+=====================================================
+
+| 操作 | 命令 |
+|------|------|
+| 编译 | arduino-cli compile --fqbn esp32:esp32:yd_esp32s3_n8r2 "项目路径" |
+| 上传 | arduino-cli upload --fqbn esp32:esp32:yd_esp32s3_n8r2 "项目路径" --port COM17 |
+| 查看端口 | arduino-cli board list |
+| 查看核心 | arduino-cli core list |
+| 查看库 | arduino-cli lib list |
+| 安装库 | arduino-cli lib install "库名" |
+
+=====================================================
+十二、参考文档
+=====================================================
+
+- D:\servotest\Arduino_CLI_ESP32_Skill_Guide.txt (智能体操作指南)
+- D:\servotest\arduino_env_doc.md (环境配置说明)
+- D:\servotest\问题解决记录.txt (问题解决记录)

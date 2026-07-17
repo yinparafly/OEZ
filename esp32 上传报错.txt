@@ -1,0 +1,116 @@
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:31:9: error: redefinition of 'uint8_t rx_buf [25]'
+   31 | uint8_t rx_buf[SBUS_FRAME_LEN];
+      |         ^~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:20:9: note: 'uint8_t rx_buf [25]' previously declared here
+   20 | uint8_t rx_buf[SBUS_FRAME_LEN];
+      |         ^~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:32:5: error: redefinition of 'int rx_pos'
+   32 | int rx_pos = 0;
+      |     ^~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:21:5: note: 'int rx_pos' previously defined here
+   21 | int rx_pos = 0;
+      |     ^~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:33:10: error: redefinition of 'uint32_t rx_frame_count'
+   33 | uint32_t rx_frame_count = 0;
+      |          ^~~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:22:10: note: 'uint32_t rx_frame_count' previously defined here
+   22 | uint32_t rx_frame_count = 0;
+      |          ^~~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:35:10: error: redefinition of 'uint16_t rx_channels [16]'
+   35 | uint16_t rx_channels[16];
+      |          ^~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:23:10: note: 'uint16_t rx_channels [16]' previously declared here
+   23 | uint16_t rx_channels[16];
+      |          ^~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino: In member function 'virtual void MyCallbacks::onWrite(BLECharacteristic*)':
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:95:44: error: conversion from 'String' to non-scalar type 'std::string' {aka 'std::__cxx11::basic_string<char>'} requested
+   95 |         std::string value = pChar->getValue();
+      |                             ~~~~~~~~~~~~~~~^~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino: At global scope:
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:102:6: error: redefinition of 'void setup()'
+  102 | void setup() {
+      |      ^~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:73:6: note: 'void setup()' previously defined here
+   73 | void setup() {
+      |      ^~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:151:6: error: redefinition of 'void loop()'
+  151 | void loop() {
+      |      ^~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:90:6: note: 'void loop()' previously defined here
+   90 | void loop() {
+      |      ^~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:27:9: error: redefinition of 'uint8_t rx_buf [25]'
+   27 | uint8_t rx_buf[SBUS_FRAME_LEN];
+      |         ^~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:20:9: note: 'uint8_t rx_buf [25]' previously declared here
+   20 | uint8_t rx_buf[SBUS_FRAME_LEN];
+      |         ^~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:28:5: error: redefinition of 'int rx_pos'
+   28 | int rx_pos = 0;
+      |     ^~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:21:5: note: 'int rx_pos' previously defined here
+   21 | int rx_pos = 0;
+      |     ^~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:29:10: error: redefinition of 'uint32_t rx_frame_count'
+   29 | uint32_t rx_frame_count = 0;
+      |          ^~~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:22:10: note: 'uint32_t rx_frame_count' previously defined here
+   22 | uint32_t rx_frame_count = 0;
+      |          ^~~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:30:10: error: redefinition of 'uint32_t rx_error_count'
+   30 | uint32_t rx_error_count = 0;
+      |          ^~~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:34:10: note: 'uint32_t rx_error_count' previously defined here
+   34 | uint32_t rx_error_count = 0;
+      |          ^~~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:31:10: error: redefinition of 'uint16_t rx_channels [16]'
+   31 | uint16_t rx_channels[16];
+      |          ^~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:23:10: note: 'uint16_t rx_channels [16]' previously declared here
+   23 | uint16_t rx_channels[16];
+      |          ^~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:32:6: error: redefinition of 'bool rx_failsafe'
+   32 | bool rx_failsafe = false;
+      |      ^~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:36:6: note: 'bool rx_failsafe' previously defined here
+   36 | bool rx_failsafe = false;
+      |      ^~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:33:6: error: redefinition of 'bool rx_lost_frame'
+   33 | bool rx_lost_frame = false;
+      |      ^~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:37:6: note: 'bool rx_lost_frame' previously defined here
+   37 | bool rx_lost_frame = false;
+      |      ^~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:34:10: error: redefinition of 'uint32_t last_frame_time'
+   34 | uint32_t last_frame_time = 0;
+      |          ^~~~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:38:10: note: 'uint32_t last_frame_time' previously defined here
+   38 | uint32_t last_frame_time = 0;
+      |          ^~~~~~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:36:7: error: redefinition of 'float avg_rate'
+   36 | float avg_rate = 0.0;
+      |       ^~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:39:7: note: 'float avg_rate' previously defined here
+   39 | float avg_rate = 0.0;
+      |       ^~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:38:6: error: redefinition of 'void decode_sbus(uint8_t*, uint16_t*, bool*, bool*)'
+   38 | void decode_sbus(uint8_t* buf, uint16_t ch[16], bool* failsafe, bool* lost_frame) {
+      |      ^~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_ble.ino:45:6: note: 'void decode_sbus(uint8_t*, uint16_t*, bool*, bool*)' previously defined here
+   45 | void decode_sbus(uint8_t* buf, uint16_t ch[16], bool* failsafe, bool* lost_frame) {
+      |      ^~~~~~~~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:60:6: error: redefinition of 'void setup()'
+   60 | void setup() {
+      |      ^~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:73:6: note: 'void setup()' previously defined here
+   73 | void setup() {
+      |      ^~~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus_receiver.ino:81:6: error: redefinition of 'void loop()'
+   81 | void loop() {
+      |      ^~~~
+D:\oezcon\oez\esp32_sbus\esp32_sbus.ino:90:6: note: 'void loop()' previously defined here
+   90 | void loop() {
+      |      ^~~~
+exit status 1
+
+Compilation error: redefinition of 'uint8_t rx_buf [25]'
