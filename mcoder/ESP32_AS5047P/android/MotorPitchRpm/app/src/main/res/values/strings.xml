@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Motor Pitch RPM</string>
+    <string name="start">开始测听</string>
+    <string name="stop">停止</string>
+    <string name="hint">把手机麦克风靠近电机（安静环境）。\nRPM ≈ 主频(Hz) × 60 ÷ 每转事件数。</string>
+</resources>

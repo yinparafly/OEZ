@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/app_name"
+            android:textColor="@color/text"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/hint"
+            android:textColor="@color/muted"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/rpmValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:gravity="center"
+            android:text="— RPM"
+            android:textColor="@color/accent"
+            android:textSize="48sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/rpmMax"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="峰值 — RPM"
+            android:textColor="@color/warn"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/freqValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:text="主频 — Hz"
+            android:textColor="@color/text"
+            android:textSize="18sp" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:gravity="center"
+            android:text="未开始"
+            android:textColor="@color/muted"
+            android:textSize="13sp" />
+
+        <com.oezcon.motorpitchrpm.SpectrumView
+            android:id="@+id/spectrum"
+            android:layout_width="match_parent"
+            android:layout_height="160dp"
+            android:layout_marginTop="16dp"
+            android:background="@color/card" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="每转声音事件数（桨叶数 / 磁极相关）"
+            android:textColor="@color/muted"
+            android:textSize="12sp" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/eventsSlider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:stepSize="1"
+            android:value="1"
+            android:valueFrom="1"
+            android:valueTo="12"
+            app:labelBehavior="withinBounds" />
+
+        <TextView
+            android:id="@+id/eventsLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="事件数 = 1  →  RPM = Hz × 60"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="测速上限 (RPM)"
+            android:textColor="@color/muted"
+            android:textSize="12sp" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/maxRpmSlider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:stepSize="1000"
+            android:value="20000"
+            android:valueFrom="3000"
+            android:valueTo="60000"
+            app:labelBehavior="withinBounds" />
+
+        <TextView
+            android:id="@+id/maxRpmLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="上限 20000 RPM（缩小范围可提高精度）"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnStart"
+                android:layout_width="0dp"
+                android:layout_height="56dp"
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1"
+                android:text="@string/start" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnStop"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="56dp"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:enabled="false"
+                android:text="@string/stop"
+                android:textColor="@color/text" />
+        </LinearLayout>
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnResetPeak"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="清除峰值"
+            android:textColor="@color/muted" />
+    </LinearLayout>
+</ScrollView>
