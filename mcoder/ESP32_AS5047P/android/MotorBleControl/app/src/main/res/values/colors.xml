@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#12151A</color>
+    <color name="panel">#1C222B</color>
+    <color name="text">#E8EEF4</color>
+    <color name="muted">#8A96A3</color>
+    <color name="accent">#2BB673</color>
+    <color name="accent_bright">#3DDB8A</color>
+    <color name="warn">#E07A3D</color>
+    <color name="danger">#D94B4B</color>
+    <!-- 设定/预定：高对比青绿，避免灰底像禁用 -->
+    <color name="btn">#1E8F5A</color>
+    <color name="btn_on">#FFFFFF</color>
+    <color name="chart_grid">#2A3440</color>
+</resources>

@@ -36,10 +36,23 @@ try:
 except ImportError:
     raise SystemExit("请先安装依赖: pip install -r requirements.txt")
 
+try:
+    from ble_link import BleLink, bleak_available, scan_oez_devices_sync
+except ImportError:
+    BleLink = None  # type: ignore[misc, assignment]
+
+    def bleak_available() -> bool:
+        return False
+
+    def scan_oez_devices_sync(_timeout_s: float = 5.0) -> list[tuple[str, str]]:
+        return []
+
 
 BAUD = 921600
 DEFAULT_PORT = "COM10"
 AUTO_CONNECT = True
+# 蓝牙：距离台架时用；USB 仍可用。命令行 --ble 启动后默认选蓝牙页
+PREFER_BLE = "--ble" in sys.argv
 # 启动后这段时间内不弹「请先连接串口」（等自动连接 / 用户点连接）
 CONNECT_WARN_GRACE_S = 2.0
 # 同类未连接提示最短间隔，避免多处 _send 连弹
@@ -145,14 +158,45 @@ def parse_meta_line(line: str) -> dict | None:
 
 
 def parse_line(line: str) -> tuple | None:
-    """t_ms,raw,deg,rad,rpm,ef,agc,magL,magH,pulse,target,mode,kp,ki,kd,profile,run"""
+    """完整或 BLE 瘦身行。
+
+    完整: t_ms,raw,deg,rad,rpm,ef,agc,magL,magH,pulse,target,mode,kp,ki,kd,profile,run
+    BLE:  B,t_ms,rpm,pulse,target,mode,run
+    """
     line = line.strip()
     if not line or line.startswith("#"):
         return None
     parts = line.split(",")
-    if len(parts) < 5:
-        return None
     try:
+        # BLE 瘦身
+        if len(parts) >= 7 and parts[0].strip().upper() == "B":
+            t_ms = float(parts[1])
+            rpm = float(parts[2])
+            pulse = int(float(parts[3]))
+            target = float(parts[4])
+            mode = int(float(parts[5]))
+            run = int(float(parts[6]))
+            return (
+                t_ms,
+                0,
+                0.0,
+                0.0,
+                rpm,
+                0,
+                -1,
+                0,
+                0,
+                pulse,
+                target,
+                mode,
+                0.0,
+                0.0,
+                0.0,
+                0,
+                run,
+            )
+        if len(parts) < 5:
+            return None
         t_ms = float(parts[0])
         raw = int(float(parts[1]))
         deg = float(parts[2])
@@ -337,7 +381,7 @@ class SpeedDial(tk.Canvas):
 class EncoderMonitorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("AS5047P + 电调转速控制")
+        root.title("电机+磁编码器台架（AS5047P/电调）— USB/BLE")
         # 先按屏幕算初始大小，避免开到接近全屏后「只能拖、拖不大」
         root.update_idletasks()
         sw = max(root.winfo_screenwidth(), 1024)
@@ -351,7 +395,9 @@ class EncoderMonitorApp:
 
         self.q: queue.Queue = queue.Queue()
         self.stop_evt = threading.Event()
-        self.link: SerialLink | None = None
+        self.link: SerialLink | BleLink | None = None
+        self._transport = "BLE" if PREFER_BLE else "USB"
+        self._ble_devices: list[tuple[str, str]] = []
 
         self.recording = False
         self.rec_t0_ms: float | None = None
@@ -510,10 +556,23 @@ class EncoderMonitorApp:
         top = ttk.Frame(self.root, padding=8)
         top.grid(row=0, column=0, sticky="ew")
 
-        ttk.Label(top, text="串口").pack(side=tk.LEFT)
+        ttk.Label(top, text="链路").pack(side=tk.LEFT)
+        self.transport_var = tk.StringVar(value=self._transport)
+        self.transport_cb = ttk.Combobox(
+            top,
+            textvariable=self.transport_var,
+            values=("USB", "BLE"),
+            width=5,
+            state="readonly",
+        )
+        self.transport_cb.pack(side=tk.LEFT, padx=4)
+        self.transport_cb.bind("<<ComboboxSelected>>", self._on_transport_change)
+
+        self.port_label = ttk.Label(top, text="串口")
+        self.port_label.pack(side=tk.LEFT)
         self.port_var = tk.StringVar()
         self.port_cb = ttk.Combobox(
-            top, textvariable=self.port_var, width=14, state="readonly"
+            top, textvariable=self.port_var, width=22, state="readonly"
         )
         self.port_cb.pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="刷新", command=self._refresh_ports).pack(side=tk.LEFT)
@@ -522,11 +581,26 @@ class EncoderMonitorApp:
         ttk.Button(top, text="自动测试", command=self._open_auto_test_win).pack(
             side=tk.LEFT, padx=(8, 0)
         )
+
+        ble_box = ttk.Frame(top)
+        ble_box.pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(ble_box, text="BLEHz").pack(side=tk.LEFT)
+        self.ble_hz_var = tk.StringVar(value="20")
+        ttk.Entry(ble_box, textvariable=self.ble_hz_var, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ble_box, text="应用", width=4, command=self._apply_ble_rate).pack(
+            side=tk.LEFT
+        )
+        self.ble_lite_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ble_box, text="瘦身", variable=self.ble_lite_var, command=self._apply_ble_lite
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
         self.status_var = tk.StringVar(value="未连接")
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.LEFT, padx=12)
         ttk.Label(
             top, textvariable=self.atest_banner_var, foreground="#0a5a9c"
         ).pack(side=tk.LEFT, padx=(8, 0))
+        self._sync_transport_ui()
 
         body = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         body.grid(row=1, column=0, sticky="nsew")
@@ -680,7 +754,12 @@ class EncoderMonitorApp:
         self.root.after_idle(self._unlock_window_resize)
 
         self._refresh_ports(prefer_default=True)
-        if AUTO_CONNECT and self.port_var.get().upper() == DEFAULT_PORT.upper():
+        if (
+            AUTO_CONNECT
+            and not PREFER_BLE
+            and self.transport_var.get() == "USB"
+            and self.port_var.get().upper() == DEFAULT_PORT.upper()
+        ):
             self.root.after(AUTO_CONNECT_DELAY_MS, self._connect)
             if AUTO_S1_ON_START:
                 self.root.after(AUTO_S1_DELAY_MS, lambda: self._atest_start_s1(skip_confirm=True))
@@ -3072,7 +3151,65 @@ class EncoderMonitorApp:
             return
         self._send("ADAPT ON" if self.adapt_var.get() else "ADAPT OFF")
 
+    def _on_transport_change(self, _evt=None) -> None:
+        self._transport = self.transport_var.get().strip() or "USB"
+        self._sync_transport_ui()
+        self._refresh_ports(prefer_default=True)
+
+    def _sync_transport_ui(self) -> None:
+        if self._transport == "BLE":
+            self.port_label.configure(text="蓝牙")
+        else:
+            self.port_label.configure(text="串口")
+
+    def _apply_ble_rate(self) -> None:
+        try:
+            hz = int(float(self.ble_hz_var.get().strip()))
+        except ValueError:
+            self._dlg_warning("提示", "BLEHz 请填 5~50")
+            return
+        hz = max(5, min(50, hz))
+        self.ble_hz_var.set(str(hz))
+        self._send(f"BLE RATE {hz}")
+
+    def _apply_ble_lite(self) -> None:
+        self._send("BLE LITE ON" if self.ble_lite_var.get() else "BLE LITE OFF")
+
     def _refresh_ports(self, prefer_default: bool = False) -> None:
+        if self.transport_var.get() == "BLE":
+            if not bleak_available():
+                self.port_cb["values"] = []
+                self.port_var.set("")
+                self.status_var.set("未安装 bleak：pip install bleak")
+                return
+            self.status_var.set("正在扫描 OEZ-RPM …")
+            self.root.update_idletasks()
+
+            def _scan() -> None:
+                try:
+                    found = scan_oez_devices_sync(5.0)
+                except Exception as exc:  # noqa: BLE001
+                    self.root.after(
+                        0, lambda: self.status_var.set(f"BLE 扫描失败: {exc}")
+                    )
+                    return
+
+                def _apply() -> None:
+                    self._ble_devices = found
+                    labels = [f"{n} [{a}]" for a, n in found]
+                    self.port_cb["values"] = labels
+                    if labels:
+                        self.port_var.set(labels[0])
+                        self.status_var.set(f"扫描到 {len(labels)} 台 BLE")
+                    else:
+                        self.port_var.set("")
+                        self.status_var.set("未发现 OEZ-RPM（请上电并靠近）")
+
+                self.root.after(0, _apply)
+
+            threading.Thread(target=_scan, daemon=True).start()
+            return
+
         ports = list_serial_ports()
         self.port_cb["values"] = ports
         if not ports:
@@ -3094,57 +3231,104 @@ class EncoderMonitorApp:
         else:
             self._connect()
 
+    def _selected_ble_address(self) -> str | None:
+        label = self.port_var.get().strip()
+        if not label:
+            return None
+        for addr, name in self._ble_devices:
+            if label == f"{name} [{addr}]" or label == addr:
+                return addr
+        # 允许直接粘贴 MAC
+        if ":" in label and len(label) >= 12:
+            return label.split()[-1].strip("[]")
+        return None
+
     def _connect(self) -> None:
-        port = self.port_var.get().strip()
-        if not port:
-            self._dlg_warning("提示", "请选择串口")
-            return
+        use_ble = self.transport_var.get() == "BLE"
+        if use_ble:
+            if not bleak_available() or BleLink is None:
+                self._dlg_warning("提示", "请先: pip install bleak")
+                return
+            addr = self._selected_ble_address()
+            if not addr:
+                self._dlg_warning("提示", "请先刷新并选择蓝牙设备 OEZ-RPM")
+                return
+        else:
+            port = self.port_var.get().strip()
+            if not port:
+                self._dlg_warning("提示", "请选择串口")
+                return
+
         self._cancel_boot_cmds()
         self.stop_evt.clear()
-        self.link = SerialLink(port, self.q, self.stop_evt)
+        if use_ble:
+            assert BleLink is not None
+            self.link = BleLink(
+                addr,
+                self.q,
+                self.stop_evt,
+                on_status=lambda m: self.root.after(0, lambda: self.status_var.set(m)),
+            )
+            self.status_var.set(f"正在连接 BLE {addr} …")
+        else:
+            port = self.port_var.get().strip()
+            self.link = SerialLink(port, self.q, self.stop_evt)
+            self.status_var.set(f"正在打开 {port} @ {BAUD}…")
         self.link.start()
         self.btn_connect.configure(text="断开")
         self.btn_rec.configure(state=tk.NORMAL)
-        self.status_var.set(f"正在打开 {port} @ {BAUD}…")
         self.prev_deg = None
         self.prev_t_ms = None
         self._rx_count = 0
         self._rx_t0 = time.time()
         self._quiet_cmd_until = time.time() + 3.0
-        # 再给 2s 宽限：串口线程打开端口期间，控件误触发不弹窗
         self._connect_warn_until = time.time() + CONNECT_WARN_GRACE_S
-        # 等串口真正打开后再下发；失败则由 __error__ 断开并取消
-        self._schedule_boot_cmd(600, "SOFT ON" if self.soft_var.get() else "SOFT OFF")
+        # BLE 连接较慢，boot 稍晚
+        boot0 = 1200 if use_ble else 600
+        self._schedule_boot_cmd(boot0, "SOFT ON" if self.soft_var.get() else "SOFT OFF")
         try:
             up = float(self.soft_rate_up_var.get())
             down = float(self.soft_rate_down_var.get())
         except (ValueError, AttributeError):
             up, down = 800.0, 300.0
-        self._schedule_boot_cmd(650, f"SOFT RATE UP {up:.1f}")
-        self._schedule_boot_cmd(680, f"SOFT RATE DOWN {down:.1f}")
-        self._schedule_boot_cmd(700, "FREQ 50")
-        self._schedule_boot_cmd(800, f"RPM {self._setpoint:.1f}")
-        self._schedule_boot_cmd(900, "PHASE?")
+        self._schedule_boot_cmd(boot0 + 50, f"SOFT RATE UP {up:.1f}")
+        self._schedule_boot_cmd(boot0 + 80, f"SOFT RATE DOWN {down:.1f}")
+        self._schedule_boot_cmd(boot0 + 100, "FREQ 400" if use_ble else "FREQ 50")
+        self._schedule_boot_cmd(boot0 + 200, f"RPM {self._setpoint:.1f}")
+        self._schedule_boot_cmd(boot0 + 300, "PHASE?")
         try:
             rpmmax = float(self.rpm_limit_var.get() or 6000)
         except ValueError:
             rpmmax = 6000.0
-        self._schedule_boot_cmd(1000, f"RPMMAX {rpmmax:.0f}")
-        self._schedule_boot_cmd(1100, "LEARN MAXUS 2000")
+        self._schedule_boot_cmd(boot0 + 400, f"RPMMAX {rpmmax:.0f}")
+        self._schedule_boot_cmd(boot0 + 500, "LEARN MAXUS 2000")
+        if use_ble:
+            try:
+                hz = int(float(self.ble_hz_var.get().strip()))
+            except ValueError:
+                hz = 20
+            hz = max(5, min(50, hz))
+            self._schedule_boot_cmd(boot0 + 550, f"BLE RATE {hz}")
+            self._schedule_boot_cmd(
+                boot0 + 580,
+                "BLE LITE ON" if self.ble_lite_var.get() else "BLE LITE OFF",
+            )
+            self._schedule_boot_cmd(boot0 + 600, "BLE?")
         self.root.after(400, self._check_link_opened)
 
     def _check_link_opened(self) -> None:
         if self.link is None:
             return
         if self.link.is_open:
-            port = self.port_var.get().strip()
-            self.status_var.set(f"已连接 {port} @ {BAUD}")
+            if self.transport_var.get() == "BLE":
+                self.status_var.set(f"已连接 BLE {self.port_var.get().strip()}")
+            else:
+                port = self.port_var.get().strip()
+                self.status_var.set(f"已连接 {port} @ {BAUD}")
             return
         if self.link.is_alive():
-            # 仍在打开中，稍后再看
             self.root.after(200, self._check_link_opened)
             return
-        # 线程已退出且未打开：错误会走队列；这里只取消静默下发
         self._cancel_boot_cmds()
 
     def _disconnect(self) -> None:
@@ -3240,9 +3424,21 @@ class EncoderMonitorApp:
                 item = self.q.get_nowait()
                 budget -= 1
                 if isinstance(item, tuple) and item and item[0] == "__error__":
-                    self._dlg_error("串口错误", item[1])
+                    self._dlg_error("链路错误", item[1])
                     self._disconnect()
                     break
+                if isinstance(item, tuple) and item and item[0] == "__raw__":
+                    line = item[1] if len(item) > 1 else ""
+                    if isinstance(line, str) and line.startswith("#"):
+                        item = ("__meta__", parse_meta_line(line) or {"raw": line})
+                    elif isinstance(line, str):
+                        parsed = parse_line(line)
+                        if parsed is not None:
+                            item = parsed
+                        else:
+                            continue
+                    else:
+                        continue
                 if isinstance(item, tuple) and item and item[0] == "__meta__":
                     meta = item[1] if len(item) > 1 else {}
                     if isinstance(meta, dict):
@@ -3260,6 +3456,7 @@ class EncoderMonitorApp:
                                 k in raw
                                 for k in (
                                     "ACK",
+                                    "BLE",
                                     "ESCCAL",
                                     "LEARN",
                                     "MEASURE",
@@ -3306,10 +3503,12 @@ class EncoderMonitorApp:
                                             self.kd_var.set(parts[2])
                                     except (IndexError, ValueError):
                                         pass
-                        port = self.port_var.get().strip()
-                        self.status_var.set(
-                            f"已连接 {port} @ {BAUD} | ctrl {self.ctrl_hz}Hz"
-                        )
+                        # 勿用串口文案覆盖 BLE 状态（会误以为“连上却无数据”）
+                        if self.transport_var.get() != "BLE":
+                            port = self.port_var.get().strip()
+                            self.status_var.set(
+                                f"已连接 {port} @ {BAUD} | ctrl {self.ctrl_hz}Hz"
+                            )
                     continue
                 self._on_sample(item)
                 self._ui_dirty = True
