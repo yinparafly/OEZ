@@ -23,6 +23,7 @@ except ImportError:
     raise SystemExit("需要 pyserial: pip install pyserial")
 
 from analyze_learn_log import analyze
+from com_port_guard import acquire
 
 BAUD = 921600
 DEFAULT_PORT = "COM10"
@@ -224,6 +225,11 @@ def main() -> int:
     args = ap.parse_args()
 
     print(f"打开 {args.port} @ {BAUD} …")
+    try:
+        acquire("auto_learn_test")
+    except SystemExit as exc:
+        print(exc)
+        return 1
     try:
         ser = open_port(args.port)
     except Exception as exc:  # noqa: BLE001

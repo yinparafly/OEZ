@@ -2,26 +2,32 @@
  * ESP32-S3：AS5047P + 航模电调转速控制
  *
  * 电调：GPIO9，默认 50Hz，脉宽 1000~2000us（上电先最低油门）
- *   FREQ <50..400> 可改刷新率（测完请回 50）
+ *   FREQ <50..600> 可改刷新率（测完请回 50；>500Hz 周期<2000μs，高油门夹断）
  * 策略：台阶辨识前馈图 f_inv + PI；profile: noload / flap
  *
  * 指令（行末 \n）：
  *   START | STOP | ESTOP | PING
  *   RPM <0..6000> | RPMMAX <rpm> | SOFT ON|OFF | SOFT RATE <rpm/s>
+ *   SOFT RATE UP|DOWN <rpm/s> | SOFT?     （升/降斜坡可不同，见惯量备忘 S1）
+ *   KA <us/(rpm/s)> | KA?                 （加速度前馈，备忘 S2）
+ *   ADG ON|OFF|? | ADG KI_SCALE|KP_SCALE|ILIM | ADG DUAL|ACCEL|DECEL|SAVE  （S3）
  *   MODE OPEN|CLOSED|LEARN|SAFE
  *   PROFILE noload|flap
- *   LEARN START | LEARN ABORT | LEARN MAXUS <us>
+ *   LEARN START | LEARN RAMP | LEARN ABORT | LEARN MAXUS <us>
+ *   MEASURE AUTO | MEASURE RAMP （同 LEARN START / LEARN RAMP）
  *   PID <kp> <ki> <kd> | PID? | PID SAVE
+ *   GAIN ON|OFF | GAIN? | GAIN SAVE   （转速分区 PID 表，插值替代全局 PID）
  *   PHASE ZERO | PHASE? | MOVE CW|CCW <deg> [rpm]
  *   STOPAT <deg>|OFF | GOTO <deg> [CW|CCW|AUTO] [rpm]
  *   ADAPT ON|OFF | PWM <1000..2000>
+ *   PROTO PWM|DSHOT|? | DSHOTRATE 150|300|600|? | DSHOT <0..2047>
  ************************************************/
 #include <SPI.h>
 #include <Preferences.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include "esc_dshot.h"
 // ---- 引脚 ----
 static const int PIN_CS   = 10;
 static const int PIN_SCLK = 12;
@@ -36,14 +42,19 @@ static const uint32_t CTRL_HZ = 250;
 static const uint32_t CTRL_MS = 1000 / CTRL_HZ;
 static const uint32_t HOST_TIMEOUT_MS = 1500;
 
-// ---- 电调 PWM（默认 50Hz，可用 FREQ 命令改到 400）----
+// ---- 电调 PWM（默认 50Hz，可用 FREQ 改到 600；高刷新时脉宽不得超过周期）----
 static const uint32_t ESC_PWM_HZ_DEFAULT = 50;
+static const uint32_t ESC_PWM_HZ_MAX = 600;
 static const uint16_t ESC_PULSE_MIN_US = 1000;
 static const uint16_t ESC_PULSE_MAX_US = 2000;
 static const uint8_t  ESC_PWM_RES_BITS = 14;
 // 电机允许最大转速（对应 6S）；目标/超速/学习截止均按此约束。当前 3S 调试达不到 6000，属预期。
 static const float    MOTOR_RPM_ABS_MAX = 6000.0f;
 static const float    TARGET_RPM_MAX_DEFAULT = 6000.0f;
+
+enum EscProto : uint8_t { ESC_PROTO_PWM = 0, ESC_PROTO_DSHOT = 1 };
+EscProto esc_proto = ESC_PROTO_PWM;
+EscDshot g_dshot;
 
 uint32_t esc_pwm_hz = ESC_PWM_HZ_DEFAULT;
 uint32_t esc_period_us = 1000000UL / ESC_PWM_HZ_DEFAULT;
@@ -56,6 +67,10 @@ static const uint16_t LEARN_MAX_US_DEFAULT = ESC_PULSE_MAX_US;
 static const uint32_t LEARN_SETTLE_MS = 2000;  // 每台阶停留，再升下一档
 static const int      MAP_MAX_POINTS = 32;
 static const float    LEARN_RPM_STOP_RATIO = 0.98f;  // 达电机最大转速的 98% 才因转速停
+// LEARN RAMP：开环斜坡辨识（脉宽连续上升，比台阶更快）
+static const float    RAMP_US_PER_S = 80.0f;         // 斜坡速率：80us/s
+static const uint32_t RAMP_SAMPLE_MS = 100;           // 每 ~100ms 采样一次
+static const uint16_t RAMP_SAMPLE_PULSE_STEP = 25;    // 脉宽增量达此值才记入图
 
 static const uint16_t ENC_CPR = 16384;  // AS5047P 14bit：一圈 16384 点
 static const float    ENC_DEG_PER_COUNT = 360.0f / (float)ENC_CPR;
@@ -90,6 +105,17 @@ struct ThrottleMap {
   bool valid;
 };
 
+// 转速分区 PID 表：按 rpm 插值 kp/ki/kd，类似 EFI 点火/喷油 MAP
+static const int GAIN_MAX_POINTS = 12;
+struct GainMap {
+  int n;
+  float rpm[GAIN_MAX_POINTS];
+  float kp[GAIN_MAX_POINTS];
+  float ki[GAIN_MAX_POINTS];
+  float kd[GAIN_MAX_POINTS];
+  bool valid;
+};
+
 SPIClass* spi = &SPI;
 Preferences prefs;
 
@@ -107,7 +133,25 @@ uint16_t esc_pulse_us = ESC_PULSE_MIN_US;
 float target_cmd = 0.0f;      // 用户设定
 float target_ramped = 0.0f;   // 缓启动后
 bool soft_enable = true;
+float soft_rate_up_rpm_s = 600.0f;    // 指令上升斜率（加速）
+float soft_rate_down_rpm_s = 600.0f;  // 指令下降斜率（减速，空载可设更慢）
+// 兼容旧名：部分代码/日志仍读写 soft_rate_rpm_s，始终与 up 同步含义见 SOFT RATE 命令
 float soft_rate_rpm_s = 600.0f;
+// 指令斜坡瞬时加速度 [rpm/s]：由 updateSoftRamp 写入，供 S2 加速度前馈使用
+float soft_cmd_accel_rpm_s = 0.0f;
+// S2：脉宽域加速度前馈 Δpulse = ka * soft_cmd_accel_rpm_s；单位 us/(rpm/s)
+float ka_us_per_rpms = 0.0f;
+// S3：加减速增益 / 减速积分限制（指令加速度 soft_cmd_accel 判别）
+bool adg_on = false;
+bool adg_dual = false;           // false=缩放当前 GainMap/全局 PID；true=用 ACCEL/DECEL 绝对值
+float adg_ki_decel_scale = 0.35f;
+float adg_kp_decel_scale = 1.0f;
+float adg_i_lim_decel = 250.0f;
+float adg_i_lim_accel = 800.0f;
+float adg_kp_accel = 0.08f;
+float adg_ki_accel = 0.25f;
+float adg_kp_decel = 0.06f;
+float adg_ki_decel = 0.08f;
 
 CtrlMode ctrl_mode = MODE_OPEN;
 RunState run_state = RUN_IDLE;
@@ -121,14 +165,22 @@ float pid_prev_err = 0.0f;
 bool adapt_on = false;
 
 ThrottleMap maps[2];
+GainMap gains[2];               // 与 maps[2] 并行：每个 profile 一张分区 PID 表
+bool gain_schedule_on = true;   // 关闭时闭环用全局 kp/ki/kd
 uint16_t learn_max_us = LEARN_MAX_US_DEFAULT;
 uint16_t learn_pulse = ESC_PULSE_MIN_US;
 uint32_t learn_step_t0 = 0;
 int learn_idx = 0;
 bool learn_active = false;
+bool learn_mode_ramp = false;         // true=LEARN RAMP（斜坡），false=LEARN START（台阶）
+float learn_ramp_pulse_f = (float)ESC_PULSE_MIN_US;  // 亚微秒累积，避免整数截断卡步
+uint32_t learn_ramp_last_sample_ms = 0;
+uint16_t learn_ramp_last_pulse = ESC_PULSE_MIN_US;
 
 uint16_t measure_pulse = ESC_PULSE_MIN_US;
 bool measure_active = false;
+// OPEN 下 PWM 指令锁存：否则 controlTick 会按 target_ramped 覆盖开环探点
+bool open_pwm_hold = false;
 bool esccal_high = false;
 
 // 相位零点 / 相对转动 / 停机相位（deg：用户坐标系，CW=编码器角度增加）
@@ -280,7 +332,7 @@ float phaseRelFromAbs(float abs_deg) {
   return wrap360(abs_deg - phase_zero_deg);
 }
 
-// ---------------- ESC PWM ----------------
+// ---------------- ESC PWM / DShot ----------------
 uint32_t pulseUsToDuty(uint16_t pulse_us) {
   const uint32_t max_duty = (1u << ESC_PWM_RES_BITS) - 1u;
   uint32_t period = esc_period_us;
@@ -292,13 +344,67 @@ uint32_t pulseUsToDuty(uint16_t pulse_us) {
 void applyEscPulse(uint16_t pulse_us) {
   if (pulse_us < ESC_PULSE_MIN_US) pulse_us = ESC_PULSE_MIN_US;
   if (pulse_us > ESC_PULSE_MAX_US) pulse_us = ESC_PULSE_MAX_US;
+  // 高频 PWM：周期可能 <2000μs（如 600Hz≈1667μs），必须夹断到周期内，否则占空比饱和
+  if (esc_proto == ESC_PROTO_PWM && esc_period_us > 0) {
+    uint16_t max_hi = ESC_PULSE_MAX_US;
+    if (esc_period_us <= 50) {
+      max_hi = (uint16_t)esc_period_us;
+    } else if (esc_period_us < (uint32_t)ESC_PULSE_MAX_US + 50u) {
+      max_hi = (uint16_t)(esc_period_us - 50u);  // 留一点低电平间隙
+    }
+    if (pulse_us > max_hi) pulse_us = max_hi;
+  }
   esc_pulse_us = pulse_us;
-  ledcWrite(PIN_ESC_PWM, pulseUsToDuty(pulse_us));
+  if (esc_proto == ESC_PROTO_DSHOT) {
+    uint16_t thr = pulseUsToDshot(pulse_us, ESC_PULSE_MIN_US, ESC_PULSE_MAX_US);
+    dshotSetThrottle(g_dshot, thr, false);
+  } else {
+    ledcWrite(PIN_ESC_PWM, pulseUsToDuty(pulse_us));
+  }
+}
+
+bool setEscProtoPwm() {
+  // 先停转再切
+  if (esc_proto == ESC_PROTO_DSHOT) {
+    dshotSetThrottle(g_dshot, 0, false);
+    delay(20);
+    dshotEnd(g_dshot);
+  }
+  esc_proto = ESC_PROTO_PWM;
+  pinMode(PIN_ESC_PWM, OUTPUT);
+  digitalWrite(PIN_ESC_PWM, LOW);
+  esc_pwm_hz = ESC_PWM_HZ_DEFAULT;
+  esc_period_us = 1000000UL / esc_pwm_hz;
+  if (!ledcAttach(PIN_ESC_PWM, esc_pwm_hz, ESC_PWM_RES_BITS)) {
+    return false;
+  }
+  applyEscPulse(ESC_PULSE_MIN_US);
+  return true;
+}
+
+bool setEscProtoDshot(DshotRate rate) {
+  // 卸 LEDC，上 RMT DShot
+  applyEscPulse(ESC_PULSE_MIN_US);
+  ledcDetach(PIN_ESC_PWM);
+  pinMode(PIN_ESC_PWM, OUTPUT);
+  digitalWrite(PIN_ESC_PWM, LOW);
+  if (!dshotBegin(g_dshot, PIN_ESC_PWM, rate)) {
+    // 失败回 PWM
+    setEscProtoPwm();
+    return false;
+  }
+  esc_proto = ESC_PROTO_DSHOT;
+  dshotSetThrottle(g_dshot, 0, false);
+  esc_pulse_us = ESC_PULSE_MIN_US;
+  return true;
 }
 
 bool setEscPwmFreq(uint32_t hz) {
+  if (esc_proto != ESC_PROTO_PWM) {
+    return false;
+  }
   if (hz < 50) hz = 50;
-  if (hz > 400) hz = 400;
+  if (hz > ESC_PWM_HZ_MAX) hz = ESC_PWM_HZ_MAX;
   // 先拉最低油门再改频，避免改频瞬间毛刺
   applyEscPulse(ESC_PULSE_MIN_US);
   ledcDetach(PIN_ESC_PWM);
@@ -317,6 +423,7 @@ bool setEscPwmFreq(uint32_t hz) {
 }
 
 void setupEscPwmMinFirst() {
+  esc_proto = ESC_PROTO_PWM;
   pinMode(PIN_ESC_PWM, OUTPUT);
   digitalWrite(PIN_ESC_PWM, LOW);
   esc_pwm_hz = ESC_PWM_HZ_DEFAULT;
@@ -413,9 +520,96 @@ void loadMapsFromNvs() {
   kp = prefs.getFloat("kp", kp);
   ki = prefs.getFloat("ki", ki);
   kd = prefs.getFloat("kd", kd);
+  ka_us_per_rpms = prefs.getFloat("ka", 0.0f);
+  if (ka_us_per_rpms < 0.0f) ka_us_per_rpms = 0.0f;
+  if (ka_us_per_rpms > 2.0f) ka_us_per_rpms = 2.0f;
+  adg_on = prefs.getBool("adg_on", false);
+  adg_dual = prefs.getBool("adg_dual", false);
+  adg_ki_decel_scale = prefs.getFloat("adg_kis", 0.35f);
+  adg_kp_decel_scale = prefs.getFloat("adg_kps", 1.0f);
+  adg_i_lim_decel = prefs.getFloat("adg_ild", 250.0f);
+  adg_i_lim_accel = prefs.getFloat("adg_ila", 800.0f);
+  adg_kp_accel = prefs.getFloat("adg_kpa", adg_kp_accel);
+  adg_ki_accel = prefs.getFloat("adg_kia", adg_ki_accel);
+  adg_kp_decel = prefs.getFloat("adg_kpd", adg_kp_decel);
+  adg_ki_decel = prefs.getFloat("adg_kid", adg_ki_decel);
   phase_zero_deg = prefs.getFloat("ph0", 0.0f);
   esc_sense = prefs.getInt("esense", 1);
   if (esc_sense != 1 && esc_sense != -1) esc_sense = 1;
+}
+
+// ---------------- 分区 PID（GainMap） ----------------
+void gainMapClear(GainMap& g) {
+  g.n = 0;
+  g.valid = false;
+}
+
+GainMap& activeGainMap() { return gains[profile_id]; }
+
+/** 按 |rpm| 线性插值分区 kp/ki/kd；无有效表时返回 false（调用者应回退全局 PID）。 */
+bool interpGain(float rpm, float* kp_out, float* ki_out, float* kd_out) {
+  GainMap& g = activeGainMap();
+  if (!g.valid || g.n < 1) return false;
+  float r = fabsf(rpm);
+  if (g.n == 1 || r <= g.rpm[0]) {
+    *kp_out = g.kp[0];
+    *ki_out = g.ki[0];
+    *kd_out = g.kd[0];
+    return true;
+  }
+  if (r >= g.rpm[g.n - 1]) {
+    *kp_out = g.kp[g.n - 1];
+    *ki_out = g.ki[g.n - 1];
+    *kd_out = g.kd[g.n - 1];
+    return true;
+  }
+  for (int i = 0; i < g.n - 1; i++) {
+    if (r >= g.rpm[i] && r <= g.rpm[i + 1]) {
+      float den = g.rpm[i + 1] - g.rpm[i];
+      float t = (den > 1e-3f) ? ((r - g.rpm[i]) / den) : 0.0f;
+      *kp_out = g.kp[i] + t * (g.kp[i + 1] - g.kp[i]);
+      *ki_out = g.ki[i] + t * (g.ki[i + 1] - g.ki[i]);
+      *kd_out = g.kd[i] + t * (g.kd[i + 1] - g.kd[i]);
+      return true;
+    }
+  }
+  *kp_out = g.kp[g.n - 1];
+  *ki_out = g.ki[g.n - 1];
+  *kd_out = g.kd[g.n - 1];
+  return true;
+}
+
+void saveGainMapToNvs(ProfileId id) {
+  char key[16];
+  snprintf(key, sizeof(key), "gmap%d", (int)id);
+  prefs.putBytes(key, &gains[id], sizeof(GainMap));
+}
+
+void loadGainMapsFromNvs() {
+  gainMapClear(gains[PROF_NOLOAD]);
+  gainMapClear(gains[PROF_FLAP]);
+  for (int id = 0; id < 2; id++) {
+    char key[16];
+    snprintf(key, sizeof(key), "gmap%d", id);
+    GainMap tmp;
+    size_t n = prefs.getBytes(key, &tmp, sizeof(tmp));
+    if (n == sizeof(tmp) && tmp.n >= 1 && tmp.n <= GAIN_MAX_POINTS) {
+      gains[id] = tmp;
+      gains[id].valid = true;
+    }
+  }
+  gain_schedule_on = prefs.getBool("gainon", true);
+}
+
+void dumpGainMap() {
+  GainMap& g = activeGainMap();
+  Serial.printf("# GAIN BEGIN profile=%s points=%d valid=%d schedule=%s\n",
+                profileName(), g.n, g.valid ? 1 : 0, gain_schedule_on ? "ON" : "OFF");
+  for (int i = 0; i < g.n; ++i) {
+    Serial.printf("# GAIN point rpm=%.0f kp=%.4f ki=%.4f kd=%.4f\n",
+                  (double)g.rpm[i], (double)g.kp[i], (double)g.ki[i], (double)g.kd[i]);
+  }
+  Serial.println("# GAIN END");
 }
 
 void savePhaseZeroToNvs() {
@@ -445,6 +639,7 @@ void doEstop(const char* reason) {
   clearPid();
   learn_active = false;
   measure_active = false;
+  open_pwm_hold = false;
   move_active = false;
   sense_learn = false;
   esccal_high = false;
@@ -462,9 +657,11 @@ void doStop(bool immediate) {
   clearPid();
   run_state = RUN_IDLE;
   learn_active = false;
+  measure_active = false;
+  open_pwm_hold = false;
   move_active = false;
   sense_learn = false;
-  if (ctrl_mode == MODE_LEARN) ctrl_mode = MODE_OPEN;
+  if (ctrl_mode == MODE_LEARN || ctrl_mode == MODE_MEASURE) ctrl_mode = MODE_OPEN;
   Serial.printf("# ACK STOP soft=%d pulse=%u\n", soft_enable && !immediate, (unsigned)esc_pulse_us);
 }
 
@@ -492,13 +689,23 @@ void doStart() {
 void updateSoftRamp(float dt) {
   if (!soft_enable) {
     target_ramped = target_cmd;
+    soft_cmd_accel_rpm_s = 0.0f;
     return;
   }
-  float max_step = soft_rate_rpm_s * dt;
   float err = target_cmd - target_ramped;
-  if (err > max_step) target_ramped += max_step;
-  else if (err < -max_step) target_ramped -= max_step;
-  else target_ramped = target_cmd;
+  // 升/降用不同斜率：空载惯量下减速常需更慢的指令斜坡（备忘 S1）
+  float rate = (err >= 0.0f) ? soft_rate_up_rpm_s : soft_rate_down_rpm_s;
+  float max_step = rate * dt;
+  if (err > max_step) {
+    target_ramped += max_step;
+    soft_cmd_accel_rpm_s = rate;  // 正在加速
+  } else if (err < -max_step) {
+    target_ramped -= max_step;
+    soft_cmd_accel_rpm_s = -rate;  // 正在减速（负加速度）
+  } else {
+    target_ramped = target_cmd;
+    soft_cmd_accel_rpm_s = 0.0f;
+  }
 }
 
 void adaptStep(float err, float dt) {
@@ -528,14 +735,53 @@ uint16_t computePulseClosed(float rpm_tgt, float rpm_meas, float dt) {
   float meas = fabsf(rpm_meas);
   float err = rpm_tgt - meas;
   adaptStep(err, dt);
+
+  // 分区 PID：按目标转速插值 kp/ki/kd；关闭或无有效表时回退全局 kp/ki/kd
+  float kp_use = kp, ki_use = ki, kd_use = kd;
+  if (gain_schedule_on && activeGainMap().valid) {
+    float gkp, gki, gkd;
+    if (interpGain(rpm_tgt, &gkp, &gki, &gkd)) {
+      kp_use = gkp;
+      ki_use = gki;
+      kd_use = gkd;
+    }
+  }
+
+  // S3：按指令加/减速调整增益与积分限幅（用 soft_cmd_accel，非噪声实测 α）
+  float i_lim = adg_i_lim_accel;
+  const bool decelerating = (soft_cmd_accel_rpm_s < -1.0f);
+  const bool accelerating = (soft_cmd_accel_rpm_s > 1.0f);
+  if (adg_on) {
+    if (adg_dual) {
+      if (decelerating) {
+        kp_use = adg_kp_decel;
+        ki_use = adg_ki_decel;
+        i_lim = adg_i_lim_decel;
+      } else if (accelerating) {
+        kp_use = adg_kp_accel;
+        ki_use = adg_ki_accel;
+        i_lim = adg_i_lim_accel;
+      }
+    } else if (decelerating) {
+      kp_use *= adg_kp_decel_scale;
+      ki_use *= adg_ki_decel_scale;
+      i_lim = adg_i_lim_decel;
+    }
+  } else {
+    i_lim = 800.0f;
+  }
+  if (i_lim < 50.0f) i_lim = 50.0f;
+  if (i_lim > 800.0f) i_lim = 800.0f;
+
   pid_i += err * dt;
-  // 积分抗饱和
-  if (pid_i > 800.0f) pid_i = 800.0f;
-  if (pid_i < -800.0f) pid_i = -800.0f;
+  if (pid_i > i_lim) pid_i = i_lim;
+  if (pid_i < -i_lim) pid_i = -i_lim;
   float derr = (dt > 1e-4f) ? ((err - pid_prev_err) / dt) : 0.0f;
   pid_prev_err = err;
-  float u = kp * err + ki * pid_i + kd * derr;
-  long pulse = (long)ff + (long)(u + (u >= 0 ? 0.5f : -0.5f));
+  float u = kp_use * err + ki_use * pid_i + kd_use * derr;
+  // S2 加速度前馈：用指令斜坡加速度（非实测 α），单位 ka=us/(rpm/s)
+  float uff = ka_us_per_rpms * soft_cmd_accel_rpm_s;
+  long pulse = (long)ff + (long)(u + uff + ((u + uff) >= 0 ? 0.5f : -0.5f));
   if (pulse < ESC_PULSE_MIN_US) pulse = ESC_PULSE_MIN_US;
   if (pulse > ESC_PULSE_MAX_US) pulse = ESC_PULSE_MAX_US;
   return (uint16_t)pulse;
@@ -554,6 +800,7 @@ void learnBegin() {
   run_state = RUN_IDLE;
   ctrl_mode = MODE_LEARN;
   learn_active = true;
+  learn_mode_ramp = false;
   learn_pulse = ESC_PULSE_MIN_US;
   learn_idx = 0;
   learn_step_t0 = millis();
@@ -572,8 +819,44 @@ void learnBegin() {
                 (unsigned long)millis(), (unsigned)learn_pulse);
 }
 
+/** LEARN RAMP：开环脉宽连续斜坡上升（非台阶），比 LEARN START 更快扫完全程。 */
+void learnBeginRamp() {
+  if (run_state == RUN_RUNNING) {
+    Serial.println("# ERR STOP before LEARN");
+    return;
+  }
+  learn_max_us = ESC_PULSE_MAX_US;
+  target_cmd = 0.0f;
+  target_ramped = 0.0f;
+  clearPid();
+  run_state = RUN_IDLE;
+  ctrl_mode = MODE_LEARN;
+  learn_active = true;
+  learn_mode_ramp = true;
+  learn_pulse = ESC_PULSE_MIN_US;
+  learn_ramp_pulse_f = (float)ESC_PULSE_MIN_US;
+  learn_ramp_last_sample_ms = millis();
+  learn_ramp_last_pulse = ESC_PULSE_MIN_US;
+  learn_idx = 0;
+  learn_step_t0 = millis();
+  mapClear(activeMap());
+  activeMap().pulse[0] = ESC_PULSE_MIN_US;
+  activeMap().rpm[0] = 0.0f;
+  activeMap().n = 1;
+  applyEscPulse(ESC_PULSE_MIN_US);
+  float rpm_stop = target_rpm_max * LEARN_RPM_STOP_RATIO;
+  Serial.printf(
+      "# ACK LEARN RAMP profile=%s max_us=%u rpm_stop=%.0f rpm_limit=%.0f rate=%.0fus/s\n",
+      profileName(), (unsigned)learn_max_us, (double)rpm_stop, (double)target_rpm_max,
+      (double)RAMP_US_PER_S);
+  Serial.println("# Learn stops only when: RPM>=rpm_stop OR pulse>=2000 OR map full");
+  Serial.printf("# LEARN LOG begin t_ms=%lu pulse=%u\n",
+                (unsigned long)millis(), (unsigned)learn_pulse);
+}
+
 void learnAbort() {
   learn_active = false;
+  learn_mode_ramp = false;
   ctrl_mode = MODE_OPEN;
   applyEscPulse(ESC_PULSE_MIN_US);
   target_cmd = 0;
@@ -612,6 +895,62 @@ void suggestPidFromMap() {
   Serial.printf("# HINT apply: PID %.4f %.4f 0\n", (double)kp_s, (double)ki_s);
 }
 
+/**
+ * 由前馈图逐段局部斜率生成分区 PID 表（GainMap），类似 EFI 分区 MAP。
+ * 每段 Δpulse>0 且 Δrpm>0 时：gain=drpm/dpulse，kp=clamp(0.35/gain,0.02,0.4)，
+ * ki=clamp(kp*2.5,0.05,1.5)，断点=段中点转速。另加 rpm=0 柔和增益作首点。
+ */
+void suggestPidZonesFromMap() {
+  ThrottleMap& m = activeMap();
+  GainMap& g = activeGainMap();
+  if (!m.valid || m.n < 2) {
+    Serial.println("# SUGGEST GAINMAP need >=2 map points");
+    return;
+  }
+  gainMapClear(g);
+  g.rpm[0] = 0.0f;
+  g.kp[0] = 0.05f;
+  g.ki[0] = 0.10f;
+  g.kd[0] = 0.0f;
+  g.n = 1;
+
+  for (int i = 0; i < m.n - 1 && g.n < GAIN_MAX_POINTS; ++i) {
+    float dpulse = (float)(m.pulse[i + 1] - m.pulse[i]);
+    float drpm = m.rpm[i + 1] - m.rpm[i];
+    if (dpulse <= 0.0f || drpm <= 1.0f) continue;  // 跳过无效/倒退段
+    float gain = drpm / dpulse;
+    if (gain < 0.05f) gain = 0.05f;
+    float kp_s = 0.35f / gain;
+    float ki_s = kp_s * 2.5f;
+    if (kp_s < 0.02f) kp_s = 0.02f;
+    if (kp_s > 0.4f) kp_s = 0.4f;
+    if (ki_s < 0.05f) ki_s = 0.05f;
+    if (ki_s > 1.5f) ki_s = 1.5f;
+    float rpm_bp = 0.5f * (m.rpm[i] + m.rpm[i + 1]);  // 断点=段中点转速
+    int idx = g.n++;
+    g.rpm[idx] = rpm_bp;
+    g.kp[idx] = kp_s;
+    g.ki[idx] = ki_s;
+    g.kd[idx] = 0.0f;
+  }
+
+  if (g.n < 2) {
+    Serial.println("# SUGGEST GAINMAP no valid rising segments in map");
+    gainMapClear(g);
+    return;
+  }
+  g.valid = true;
+  saveGainMapToNvs(profile_id);
+  gain_schedule_on = true;
+  prefs.putBool("gainon", true);
+  Serial.printf("# SUGGEST GAINMAP n=%d profile=%s\n", g.n, profileName());
+  for (int i = 0; i < g.n; ++i) {
+    Serial.printf("# GAIN point rpm=%.0f kp=%.4f ki=%.4f kd=0\n",
+                  (double)g.rpm[i], (double)g.kp[i], (double)g.ki[i]);
+  }
+  Serial.println("# HINT apply: GAIN ON (auto-enabled)");
+}
+
 void dumpActiveMap() {
   ThrottleMap& m = activeMap();
   Serial.printf("# MAP BEGIN profile=%s points=%d valid=%d\n",
@@ -644,6 +983,7 @@ void measureBegin() {
 void measureAbort() {
   measure_active = false;
   learn_active = false;
+  open_pwm_hold = false;
   ctrl_mode = MODE_OPEN;
   measure_pulse = ESC_PULSE_MIN_US;
   applyEscPulse(ESC_PULSE_MIN_US);
@@ -749,8 +1089,60 @@ void escCalDone() {
   Serial.printf("# ACK ESCCAL DONE pulse=%u mode=OPEN\n", (unsigned)esc_pulse_us);
 }
 
-void learnTick(float rpm_meas) {
-  if (!learn_active) return;
+/** LEARN START（台阶）与 LEARN RAMP（斜坡）结束时共用：存图/建议 PID/建议分区 PID/回 CLOSED。 */
+void finishLearn(const char* stop_reason) {
+  activeMap().valid = (activeMap().n >= 2);
+  saveMapToNvs(profile_id);
+  dumpActiveMap();
+  suggestPidFromMap();
+  suggestPidZonesFromMap();
+  learn_active = false;
+  learn_mode_ramp = false;
+  applyEscPulse(ESC_PULSE_MIN_US);
+  target_cmd = 0;
+  target_ramped = 0;
+  run_state = RUN_IDLE;
+  ctrl_mode = MODE_CLOSED;
+  clearPid();
+  float rpm_hi = 0.0f;
+  uint16_t pulse_hi = learn_pulse;
+  for (int i = 0; i < activeMap().n; ++i) {
+    if (activeMap().rpm[i] > rpm_hi) rpm_hi = activeMap().rpm[i];
+    if (activeMap().pulse[i] > pulse_hi) pulse_hi = activeMap().pulse[i];
+  }
+  float cover = (target_rpm_max > 1.0f) ? (100.0f * rpm_hi / target_rpm_max) : 0.0f;
+  int at_full_throttle = (pulse_hi >= ESC_PULSE_MAX_US) ? 1 : 0;
+  int can_raise = (strcmp(stop_reason, "rpm_cap") != 0 && pulse_hi < ESC_PULSE_MAX_US) ? 1 : 0;
+  // 记录本次学习在最高油门下的实测转速
+  prefs.putFloat("lrpm", rpm_hi);
+  prefs.putUInt("lpus", (uint32_t)pulse_hi);
+  prefs.putFloat("llim", target_rpm_max);
+  Serial.printf(
+      "# ACK LEARN DONE profile=%s points=%d rpm_max=%.1f pulse_max=%u "
+      "rpm_limit=%.0f cover=%.1f%% reason=%s full_throttle=%d can_raise=%d -> MODE CLOSED\n",
+      profileName(), activeMap().n, (double)rpm_hi, (unsigned)pulse_hi,
+      (double)target_rpm_max, (double)cover, stop_reason, at_full_throttle, can_raise);
+  Serial.printf(
+      "# LEARN RESULT rpm_peak=%.1f pulse_peak=%u rpm_limit=%.0f reason=%s\n",
+      (double)rpm_hi, (unsigned)pulse_hi, (double)target_rpm_max, stop_reason);
+  if (at_full_throttle) {
+    Serial.printf(
+        "# EVAL: ESC full throttle %uus → measured peak RPM=%.1f (limit=%.0f, cover=%.1f%%)\n",
+        (unsigned)ESC_PULSE_MAX_US, (double)rpm_hi, (double)target_rpm_max, (double)cover);
+  } else if (strcmp(stop_reason, "rpm_cap") == 0) {
+    Serial.printf(
+        "# EVAL: reached rpm_limit~%.0f at pulse=%u — do not raise throttle further\n",
+        (double)target_rpm_max, (unsigned)pulse_hi);
+  } else if (can_raise) {
+    Serial.printf(
+        "# EVAL: rpm_peak=%.0f < limit=%.0f and pulse<%u — unexpected early stop\n",
+        (double)rpm_hi, (double)target_rpm_max, (unsigned)ESC_PULSE_MAX_US);
+  }
+  Serial.println("# NEXT: apply PID, low RPM closed-loop test, then raise setpoint gradually");
+}
+
+/** LEARN START 的台阶学习节拍：升脉宽→停留→记点→判停。 */
+void learnTickStep(float rpm_meas) {
   uint32_t now = millis();
   applyEscPulse(learn_pulse);
 
@@ -794,52 +1186,7 @@ void learnTick(float rpm_meas) {
   }
 
   if (stop_reason != nullptr) {
-    activeMap().valid = (activeMap().n >= 2);
-    saveMapToNvs(profile_id);
-    dumpActiveMap();
-    suggestPidFromMap();
-    learn_active = false;
-    applyEscPulse(ESC_PULSE_MIN_US);
-    target_cmd = 0;
-    target_ramped = 0;
-    run_state = RUN_IDLE;
-    ctrl_mode = MODE_CLOSED;
-    clearPid();
-    float rpm_hi = 0.0f;
-    uint16_t pulse_hi = learn_pulse;
-    for (int i = 0; i < activeMap().n; ++i) {
-      if (activeMap().rpm[i] > rpm_hi) rpm_hi = activeMap().rpm[i];
-      if (activeMap().pulse[i] > pulse_hi) pulse_hi = activeMap().pulse[i];
-    }
-    float cover = (target_rpm_max > 1.0f) ? (100.0f * rpm_hi / target_rpm_max) : 0.0f;
-    int at_full_throttle = (pulse_hi >= ESC_PULSE_MAX_US) ? 1 : 0;
-    int can_raise = (strcmp(stop_reason, "rpm_cap") != 0 && pulse_hi < ESC_PULSE_MAX_US) ? 1 : 0;
-    // 记录本次学习在最高油门下的实测转速
-    prefs.putFloat("lrpm", rpm_hi);
-    prefs.putUInt("lpus", (uint32_t)pulse_hi);
-    prefs.putFloat("llim", target_rpm_max);
-    Serial.printf(
-        "# ACK LEARN DONE profile=%s points=%d rpm_max=%.1f pulse_max=%u "
-        "rpm_limit=%.0f cover=%.1f%% reason=%s full_throttle=%d can_raise=%d -> MODE CLOSED\n",
-        profileName(), activeMap().n, (double)rpm_hi, (unsigned)pulse_hi,
-        (double)target_rpm_max, (double)cover, stop_reason, at_full_throttle, can_raise);
-    Serial.printf(
-        "# LEARN RESULT rpm_peak=%.1f pulse_peak=%u rpm_limit=%.0f reason=%s\n",
-        (double)rpm_hi, (unsigned)pulse_hi, (double)target_rpm_max, stop_reason);
-    if (at_full_throttle) {
-      Serial.printf(
-          "# EVAL: ESC full throttle %uus → measured peak RPM=%.1f (limit=%.0f, cover=%.1f%%)\n",
-          (unsigned)ESC_PULSE_MAX_US, (double)rpm_hi, (double)target_rpm_max, (double)cover);
-    } else if (strcmp(stop_reason, "rpm_cap") == 0) {
-      Serial.printf(
-          "# EVAL: reached rpm_limit~%.0f at pulse=%u — do not raise throttle further\n",
-          (double)target_rpm_max, (unsigned)pulse_hi);
-    } else if (can_raise) {
-      Serial.printf(
-          "# EVAL: rpm_peak=%.0f < limit=%.0f and pulse<%u — unexpected early stop\n",
-          (double)rpm_hi, (double)target_rpm_max, (unsigned)ESC_PULSE_MAX_US);
-    }
-    Serial.println("# NEXT: apply PID, low RPM closed-loop test, then raise setpoint gradually");
+    finishLearn(stop_reason);
     return;
   }
 
@@ -848,6 +1195,69 @@ void learnTick(float rpm_meas) {
   learn_idx++;
   learn_step_t0 = now;
   Serial.printf("# LEARN next pulse=%u\n", (unsigned)learn_pulse);
+}
+
+/**
+ * LEARN RAMP 的斜坡学习节拍：脉宽按 RAMP_US_PER_S 连续爬升（无台阶停留），
+ * 每 ~100ms 采一次样，脉宽较上次记录点增量够大才存入前馈图（防止点数超限）。
+ */
+void learnTickRamp(float rpm_meas, float dt) {
+  uint32_t now = millis();
+
+  learn_ramp_pulse_f += RAMP_US_PER_S * dt;
+  long new_pulse = (long)learn_ramp_pulse_f;
+  if (new_pulse < ESC_PULSE_MIN_US) new_pulse = ESC_PULSE_MIN_US;
+  if (new_pulse > ESC_PULSE_MAX_US) new_pulse = ESC_PULSE_MAX_US;
+  learn_pulse = (uint16_t)new_pulse;
+  applyEscPulse(learn_pulse);
+
+  float rpm_abs = fabsf(rpm_meas);
+
+  // 心跳回报，避免 UI 以为卡住
+  static uint32_t last_hb = 0;
+  if ((now - last_hb) >= 500) {
+    last_hb = now;
+    Serial.printf("# LEARN RAMP settle pulse=%u rpm=%.1f n=%d\n",
+                  (unsigned)learn_pulse, (double)rpm_abs, activeMap().n);
+  }
+
+  if ((now - learn_ramp_last_sample_ms) >= RAMP_SAMPLE_MS) {
+    learn_ramp_last_sample_ms = now;
+    ThrottleMap& m = activeMap();
+    if (m.n < MAP_MAX_POINTS &&
+        learn_pulse >= (uint16_t)(learn_ramp_last_pulse + RAMP_SAMPLE_PULSE_STEP)) {
+      int i = m.n;
+      m.pulse[i] = learn_pulse;
+      m.rpm[i] = rpm_abs;
+      m.n++;
+      learn_ramp_last_pulse = learn_pulse;
+      Serial.printf("# LEARN RAMP sample pulse=%u rpm=%.1f n=%d\n",
+                    (unsigned)learn_pulse, (double)rpm_abs, m.n);
+    }
+  }
+
+  float rpm_stop = target_rpm_max * LEARN_RPM_STOP_RATIO;
+  const char* stop_reason = nullptr;
+  if (rpm_abs >= rpm_stop) {
+    stop_reason = "rpm_cap";
+  } else if (learn_pulse >= ESC_PULSE_MAX_US) {
+    stop_reason = "pulse_cap";
+  } else if (activeMap().n >= MAP_MAX_POINTS) {
+    stop_reason = "map_full";
+  }
+
+  if (stop_reason != nullptr) {
+    finishLearn(stop_reason);
+  }
+}
+
+void learnTick(float rpm_meas, float dt) {
+  if (!learn_active) return;
+  if (learn_mode_ramp) {
+    learnTickRamp(rpm_meas, dt);
+  } else {
+    learnTickStep(rpm_meas);
+  }
 }
 
 void phaseMoveFinish(const char* why) {
@@ -1083,7 +1493,7 @@ void controlTick(float rpm_meas, float dt) {
   // 学习标志优先于 mode：防止 MODE/杂讯把 mode 改掉后油门被 IDLE 路径拉低
   if (learn_active) {
     if (ctrl_mode != MODE_LEARN) ctrl_mode = MODE_LEARN;
-    learnTick(rpm_meas);
+    learnTick(rpm_meas, dt);
     return;
   }
 
@@ -1127,6 +1537,9 @@ void controlTick(float rpm_meas, float dt) {
   uint16_t pulse;
   if (ctrl_mode == MODE_CLOSED) {
     pulse = computePulseClosed(target_ramped, rpm_meas, dt);
+  } else if (open_pwm_hold) {
+    // 主机 PWM 探点：保持 esc_pulse_us，不被 target_ramped 覆盖
+    pulse = esc_pulse_us;
   } else {
     pulse = computePulseOpen(target_ramped);
   }
@@ -1191,16 +1604,158 @@ void handleCommandLine(char* line) {
     float rpm = strtof(p, nullptr);
     if (rpm < 0) rpm = 0;
     if (rpm > target_rpm_max) rpm = target_rpm_max;
+    open_pwm_hold = false;
     target_cmd = rpm;
     Serial.printf("# ACK RPM=%.1f (max=%.0f)\n", (double)target_cmd, (double)target_rpm_max);
+    return;
+  }
+  if (strcasecmp(line, "SOFT?") == 0) {
+    Serial.printf("# SOFT %s up=%.1f down=%.1f rpm/s ramped=%.1f cmd=%.1f accel=%.1f ka=%.4f\n",
+                  soft_enable ? "ON" : "OFF",
+                  (double)soft_rate_up_rpm_s, (double)soft_rate_down_rpm_s,
+                  (double)target_ramped, (double)target_cmd,
+                  (double)soft_cmd_accel_rpm_s, (double)ka_us_per_rpms);
+    return;
+  }
+  if (strcasecmp(line, "KA?") == 0) {
+    Serial.printf("# KA=%.4f us/(rpm/s)  (dPulse=KA*cmd_accel)\n", (double)ka_us_per_rpms);
+    return;
+  }
+  if (strncasecmp(line, "KA", 2) == 0 && (line[2] == ' ' || line[2] == '=' || line[2] == ':')) {
+    char* p = line + 2;
+    while (*p == ' ' || *p == '=' || *p == ':') ++p;
+    float v = strtof(p, nullptr);
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;  // 防止过大脉宽冲击
+    ka_us_per_rpms = v;
+    prefs.putFloat("ka", ka_us_per_rpms);
+    Serial.printf("# ACK KA=%.4f us/(rpm/s)\n", (double)ka_us_per_rpms);
+    return;
+  }
+  if (strcasecmp(line, "ADG?") == 0 || strcasecmp(line, "ADG") == 0) {
+    Serial.printf(
+        "# ADG %s dual=%s ki_scale=%.3f kp_scale=%.3f ilim_dec=%.0f ilim_acc=%.0f "
+        "accel_kp=%.4f accel_ki=%.4f decel_kp=%.4f decel_ki=%.4f\n",
+        adg_on ? "ON" : "OFF", adg_dual ? "ON" : "OFF",
+        (double)adg_ki_decel_scale, (double)adg_kp_decel_scale,
+        (double)adg_i_lim_decel, (double)adg_i_lim_accel,
+        (double)adg_kp_accel, (double)adg_ki_accel,
+        (double)adg_kp_decel, (double)adg_ki_decel);
+    return;
+  }
+  if (strcasecmp(line, "ADG ON") == 0) {
+    adg_on = true;
+    Serial.println("# ACK ADG ON");
+    return;
+  }
+  if (strcasecmp(line, "ADG OFF") == 0) {
+    adg_on = false;
+    Serial.println("# ACK ADG OFF");
+    return;
+  }
+  if (strcasecmp(line, "ADG DUAL ON") == 0) {
+    adg_dual = true;
+    adg_on = true;
+    Serial.println("# ACK ADG DUAL ON (also ADG ON)");
+    return;
+  }
+  if (strcasecmp(line, "ADG DUAL OFF") == 0) {
+    adg_dual = false;
+    Serial.println("# ACK ADG DUAL OFF (scale mode)");
+    return;
+  }
+  if (strncasecmp(line, "ADG KI_SCALE", 12) == 0) {
+    float v = strtof(line + 12, nullptr);
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    adg_ki_decel_scale = v;
+    Serial.printf("# ACK ADG KI_SCALE=%.3f\n", (double)adg_ki_decel_scale);
+    return;
+  }
+  if (strncasecmp(line, "ADG KP_SCALE", 12) == 0) {
+    float v = strtof(line + 12, nullptr);
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    adg_kp_decel_scale = v;
+    Serial.printf("# ACK ADG KP_SCALE=%.3f\n", (double)adg_kp_decel_scale);
+    return;
+  }
+  if (strncasecmp(line, "ADG ILIM", 8) == 0) {
+    // ADG ILIM <decel> [accel]
+    char* p = line + 8;
+    float d = strtof(p, &p);
+    float a = strtof(p, &p);
+    if (d < 50.0f) d = 50.0f;
+    if (d > 800.0f) d = 800.0f;
+    adg_i_lim_decel = d;
+    if (a >= 50.0f && a <= 800.0f) adg_i_lim_accel = a;
+    Serial.printf("# ACK ADG ILIM decel=%.0f accel=%.0f\n",
+                  (double)adg_i_lim_decel, (double)adg_i_lim_accel);
+    return;
+  }
+  if (strncasecmp(line, "ADG ACCEL", 9) == 0) {
+    char* p = line + 9;
+    float a = strtof(p, &p);
+    float b = strtof(p, &p);
+    if (a < 0.0f) a = 0.0f;
+    if (b < 0.0f) b = 0.0f;
+    adg_kp_accel = a;
+    adg_ki_accel = b;
+    Serial.printf("# ACK ADG ACCEL kp=%.4f ki=%.4f\n",
+                  (double)adg_kp_accel, (double)adg_ki_accel);
+    return;
+  }
+  if (strncasecmp(line, "ADG DECEL", 9) == 0) {
+    char* p = line + 9;
+    float a = strtof(p, &p);
+    float b = strtof(p, &p);
+    if (a < 0.0f) a = 0.0f;
+    if (b < 0.0f) b = 0.0f;
+    adg_kp_decel = a;
+    adg_ki_decel = b;
+    Serial.printf("# ACK ADG DECEL kp=%.4f ki=%.4f\n",
+                  (double)adg_kp_decel, (double)adg_ki_decel);
+    return;
+  }
+  if (strcasecmp(line, "ADG SAVE") == 0) {
+    prefs.putBool("adg_on", adg_on);
+    prefs.putBool("adg_dual", adg_dual);
+    prefs.putFloat("adg_kis", adg_ki_decel_scale);
+    prefs.putFloat("adg_kps", adg_kp_decel_scale);
+    prefs.putFloat("adg_ild", adg_i_lim_decel);
+    prefs.putFloat("adg_ila", adg_i_lim_accel);
+    prefs.putFloat("adg_kpa", adg_kp_accel);
+    prefs.putFloat("adg_kia", adg_ki_accel);
+    prefs.putFloat("adg_kpd", adg_kp_decel);
+    prefs.putFloat("adg_kid", adg_ki_decel);
+    Serial.println("# ACK ADG SAVE");
+    return;
+  }
+  if (strncasecmp(line, "SOFT RATE UP", 12) == 0) {
+    float r = strtof(line + 12, nullptr);
+    if (r < 50.0f) r = 50.0f;
+    if (r > 5000.0f) r = 5000.0f;
+    soft_rate_up_rpm_s = r;
+    soft_rate_rpm_s = r;
+    Serial.printf("# ACK SOFT RATE UP=%.1f\n", (double)soft_rate_up_rpm_s);
+    return;
+  }
+  if (strncasecmp(line, "SOFT RATE DOWN", 14) == 0) {
+    float r = strtof(line + 14, nullptr);
+    if (r < 50.0f) r = 50.0f;
+    if (r > 5000.0f) r = 5000.0f;
+    soft_rate_down_rpm_s = r;
+    Serial.printf("# ACK SOFT RATE DOWN=%.1f\n", (double)soft_rate_down_rpm_s);
     return;
   }
   if (strncasecmp(line, "SOFT RATE", 9) == 0) {
     float r = strtof(line + 9, nullptr);
     if (r < 50.0f) r = 50.0f;
     if (r > 5000.0f) r = 5000.0f;
+    soft_rate_up_rpm_s = r;
+    soft_rate_down_rpm_s = r;
     soft_rate_rpm_s = r;
-    Serial.printf("# ACK SOFT RATE=%.1f\n", (double)soft_rate_rpm_s);
+    Serial.printf("# ACK SOFT RATE=%.1f (up=down)\n", (double)r);
     return;
   }
   if (strcasecmp(line, "SOFT ON") == 0 || strcasecmp(line, "SOFT=ON") == 0) {
@@ -1236,12 +1791,14 @@ void handleCommandLine(char* line) {
       return;
     }
     if (strncasecmp(p, "OPEN", 4) == 0) ctrl_mode = MODE_OPEN;
-    else if (strncasecmp(p, "CLOSED", 6) == 0) ctrl_mode = MODE_CLOSED;
-    else if (strncasecmp(p, "MEASURE", 7) == 0) {
+    else if (strncasecmp(p, "CLOSED", 6) == 0) {
+      open_pwm_hold = false;
+      ctrl_mode = MODE_CLOSED;
+    } else if (strncasecmp(p, "MEASURE", 7) == 0) {
       measureBegin();
       return;
     } else if (strncasecmp(p, "LEARN", 5) == 0) {
-      Serial.println("# ERR use LEARN START or MEASURE AUTO");
+      Serial.println("# ERR use LEARN START|RAMP or MEASURE AUTO|RAMP");
       return;
     } else if (strncasecmp(p, "SAFE", 4) == 0) {
       ctrl_mode = MODE_SAFE;
@@ -1368,6 +1925,12 @@ void handleCommandLine(char* line) {
     learnBegin();
     return;
   }
+  if (strcasecmp(line, "LEARN RAMP") == 0) {
+    // 开环斜坡学习：脉宽连续上升，比台阶更快扫完全程
+    if (ctrl_mode != MODE_MEASURE) measureBegin();
+    learnBeginRamp();
+    return;
+  }
   if (strncasecmp(line, "LEARN MAXUS", 11) == 0) {
     // 学习油门上限固定为电调最大；忽略更低值（避免再被设成 1600）
     learn_max_us = ESC_PULSE_MAX_US;
@@ -1408,6 +1971,11 @@ void handleCommandLine(char* line) {
     learnBegin();
     return;
   }
+  if (strcasecmp(line, "MEASURE RAMP") == 0) {
+    if (ctrl_mode != MODE_MEASURE) measureBegin();
+    learnBeginRamp();
+    return;
+  }
   if (strncasecmp(line, "MEASURE +", 9) == 0 || strncasecmp(line, "MEASURE -", 9) == 0) {
     if (ctrl_mode != MODE_MEASURE) measureBegin();
     long delta = strtol(line + 8, nullptr, 10);  // includes sign after space? "MEASURE +50"
@@ -1440,6 +2008,27 @@ void handleCommandLine(char* line) {
     Serial.println("# ACK PID SAVE");
     return;
   }
+  if (strcasecmp(line, "GAIN ON") == 0) {
+    gain_schedule_on = true;
+    prefs.putBool("gainon", true);
+    Serial.println("# ACK GAIN ON");
+    return;
+  }
+  if (strcasecmp(line, "GAIN OFF") == 0) {
+    gain_schedule_on = false;
+    prefs.putBool("gainon", false);
+    Serial.println("# ACK GAIN OFF");
+    return;
+  }
+  if (strcasecmp(line, "GAIN?") == 0 || strcasecmp(line, "GAIN") == 0) {
+    dumpGainMap();
+    return;
+  }
+  if (strcasecmp(line, "GAIN SAVE") == 0) {
+    saveGainMapToNvs(profile_id);
+    Serial.println("# ACK GAIN SAVE");
+    return;
+  }
   if (strncasecmp(line, "PID", 3) == 0) {
     char* p = line + 3;
     float a = strtof(p, &p);
@@ -1461,20 +2050,136 @@ void handleCommandLine(char* line) {
     char* p = line + 4;
     while (*p == ' ' || *p == '=' || *p == ':') ++p;
     if (*p == '\0' || strcasecmp(p, "?") == 0) {
-      Serial.printf("# FREQ %lu Hz period=%luus\n",
-                    (unsigned long)esc_pwm_hz, (unsigned long)esc_period_us);
+      Serial.printf("# FREQ %lu Hz period=%luus proto=%s\n",
+                    (unsigned long)esc_pwm_hz, (unsigned long)esc_period_us,
+                    esc_proto == ESC_PROTO_DSHOT ? "DSHOT" : "PWM");
+      return;
+    }
+    if (esc_proto != ESC_PROTO_PWM) {
+      Serial.println("# ERR FREQ only in PROTO PWM (use DSHOTRATE for DShot)");
       return;
     }
     long hz = strtol(p, nullptr, 10);
-    if (hz < 50 || hz > 400) {
-      Serial.println("# ERR FREQ range 50..400");
+    if (hz < 50 || hz > (long)ESC_PWM_HZ_MAX) {
+      Serial.printf("# ERR FREQ range 50..%lu\n", (unsigned long)ESC_PWM_HZ_MAX);
       return;
     }
-    // 建议按 50 步进；仍允许任意整数以便调试
     bool ok = setEscPwmFreq((uint32_t)hz);
     Serial.printf("# ACK FREQ %lu ok=%d period=%luus pulse=%u\n",
                   (unsigned long)esc_pwm_hz, ok ? 1 : 0,
                   (unsigned long)esc_period_us, (unsigned)esc_pulse_us);
+    return;
+  }
+  if (strcasecmp(line, "PROTO?") == 0 || strcasecmp(line, "PROTO") == 0) {
+    if (esc_proto == ESC_PROTO_DSHOT) {
+      Serial.printf("# PROTO DSHOT rate=%u thr=%u\n",
+                    (unsigned)g_dshot.rate, (unsigned)g_dshot.throttle);
+    } else {
+      Serial.printf("# PROTO PWM freq=%lu pulse=%u\n",
+                    (unsigned long)esc_pwm_hz, (unsigned)esc_pulse_us);
+    }
+    return;
+  }
+  if (strncasecmp(line, "PROTO", 5) == 0) {
+    char* p = line + 5;
+    while (*p == ' ') ++p;
+    if (strncasecmp(p, "PWM", 3) == 0) {
+      bool ok = setEscProtoPwm();
+      Serial.printf("# ACK PROTO PWM ok=%d freq=%lu\n",
+                    ok ? 1 : 0, (unsigned long)esc_pwm_hz);
+      return;
+    }
+    if (strncasecmp(p, "DSHOT", 5) == 0) {
+      // PROTO DSHOT [150|300|600]
+      char* q = p + 5;
+      while (*q == ' ') ++q;
+      DshotRate rate = DSHOT300;
+      if (*q) {
+        long r = strtol(q, nullptr, 10);
+        if (r == 150) rate = DSHOT150;
+        else if (r == 300) rate = DSHOT300;
+        else if (r == 600) rate = DSHOT600;
+        else {
+          Serial.println("# ERR PROTO DSHOT rate 150|300|600");
+          return;
+        }
+      } else if (g_dshot.rate == DSHOT150 || g_dshot.rate == DSHOT300 ||
+                 g_dshot.rate == DSHOT600) {
+        rate = g_dshot.rate;
+      }
+      bool ok = setEscProtoDshot(rate);
+      Serial.printf("# ACK PROTO DSHOT ok=%d rate=%u\n",
+                    ok ? 1 : 0, (unsigned)g_dshot.rate);
+      return;
+    }
+    Serial.println("# ERR PROTO PWM|DSHOT [150|300|600]");
+    return;
+  }
+  if (strcasecmp(line, "DSHOTRATE?") == 0) {
+    Serial.printf("# DSHOTRATE %u proto=%s\n",
+                  (unsigned)g_dshot.rate,
+                  esc_proto == ESC_PROTO_DSHOT ? "DSHOT" : "PWM");
+    return;
+  }
+  if (strncasecmp(line, "DSHOTRATE", 9) == 0) {
+    char* p = line + 9;
+    while (*p == ' ' || *p == '=' || *p == ':') ++p;
+    long r = strtol(p, nullptr, 10);
+    DshotRate rate;
+    if (r == 150) rate = DSHOT150;
+    else if (r == 300) rate = DSHOT300;
+    else if (r == 600) rate = DSHOT600;
+    else {
+      Serial.println("# ERR DSHOTRATE 150|300|600");
+      return;
+    }
+    if (esc_proto != ESC_PROTO_DSHOT) {
+      bool ok = setEscProtoDshot(rate);
+      Serial.printf("# ACK DSHOTRATE %u ok=%d (entered DSHOT)\n",
+                    (unsigned)rate, ok ? 1 : 0);
+      return;
+    }
+    bool ok = dshotSetRate(g_dshot, rate);
+    dshotSetThrottle(g_dshot, 0, false);
+    esc_pulse_us = ESC_PULSE_MIN_US;
+    Serial.printf("# ACK DSHOTRATE %u ok=%d\n", (unsigned)g_dshot.rate, ok ? 1 : 0);
+    return;
+  }
+  if (strncasecmp(line, "DSHOT", 5) == 0) {
+    // DSHOT <0..2047> 直接油门；勿与 DSHOTRATE 混淆（已先匹配 RATE）
+    char* p = line + 5;
+    while (*p == ' ' || *p == '=' || *p == ':') ++p;
+    if (*p == '\0' || strcasecmp(p, "?") == 0) {
+      Serial.printf("# DSHOT thr=%u rate=%u proto=%s\n",
+                    (unsigned)g_dshot.throttle, (unsigned)g_dshot.rate,
+                    esc_proto == ESC_PROTO_DSHOT ? "DSHOT" : "PWM");
+      return;
+    }
+    long v = strtol(p, nullptr, 10);
+    if (v < 0 || v > 2047) {
+      Serial.println("# ERR DSHOT range 0..2047");
+      return;
+    }
+    if (esc_proto != ESC_PROTO_DSHOT) {
+      if (!setEscProtoDshot(g_dshot.rate == DSHOT_OFF ? DSHOT300 : g_dshot.rate)) {
+        Serial.println("# ERR enter DSHOT failed");
+        return;
+      }
+    }
+    open_pwm_hold = true;
+    run_state = RUN_RUNNING;
+    ctrl_mode = MODE_OPEN;
+    dshotSetThrottle(g_dshot, (uint16_t)v, false);
+    // 同步显示用脉宽（逆映射近似）
+    if (v <= 0) esc_pulse_us = ESC_PULSE_MIN_US;
+    else {
+      float t = ((float)v - 48.0f) / (2047.0f - 48.0f);
+      if (t < 0) t = 0;
+      if (t > 1) t = 1;
+      esc_pulse_us = (uint16_t)(ESC_PULSE_MIN_US +
+                                t * (ESC_PULSE_MAX_US - ESC_PULSE_MIN_US) + 0.5f);
+    }
+    Serial.printf("# ACK DSHOT=%ld pulse~%u\n", v, (unsigned)esc_pulse_us);
     return;
   }
   if (strncasecmp(line, "PWM", 3) == 0) {
@@ -1492,6 +2197,7 @@ void handleCommandLine(char* line) {
       measureSetPulse(us);
       return;
     }
+    open_pwm_hold = true;
     run_state = RUN_RUNNING;
     ctrl_mode = MODE_OPEN;
     applyEscPulse((uint16_t)us);
@@ -1531,6 +2237,7 @@ void setup() {
 
   prefs.begin("escctl", false);
   loadMapsFromNvs();
+  loadGainMapsFromNvs();
 
   spi->begin(PIN_SCLK, PIN_MISO, PIN_MOSI, -1);
   spi->beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE1));
@@ -1542,13 +2249,17 @@ void setup() {
                 (unsigned long)CTRL_HZ, (unsigned long)CTRL_HZ,
                 (unsigned long)SERIAL_BAUD, (unsigned long)esc_pwm_hz, PIN_ESC_PWM);
   Serial.println("# format: t_ms,raw,deg(rel),rad,rpm,ef,agc,magL,magH,pulse_us,target_rpm,mode,kp,ki,kd,profile,run");
-  Serial.println("# cmds: START STOP ESTOP RPM PHASE MOVE STOPAT GOTO LEARN MEASURE ...");
+  Serial.println("# cmds: START STOP ESTOP RPM PHASE MOVE STOPAT GOTO LEARN MEASURE GAIN ...");
   Serial.println("# PHASE: ZERO; MOVE CW/CCW auto→uni path; SENSE AUTO detect ESC dir");
+  Serial.println("# LEARN START=step, LEARN RAMP=slope; GAIN ON|OFF|?|SAVE; KA <us/(rpm/s)>|KA?");
+  Serial.printf("# GAIN schedule=%s points=%d valid=%d\n",
+                gain_schedule_on ? "ON" : "OFF", activeGainMap().n, activeGainMap().valid ? 1 : 0);
   Serial.printf("# phase_zero=%.3f esc_sense=%d rpm_max=%.0f\n",
                 (double)phase_zero_deg, esc_sense, (double)target_rpm_max);
   Serial.printf("# ENC AS5047P cpr=%u deg/count=%.6f | rpm=(dcount/cpr)/dt*60\n",
                 (unsigned)ENC_CPR, (double)ENC_DEG_PER_COUNT);
-  Serial.printf("# ESC min=%uus armed low | profile=%s\n",
+  Serial.println("# cmds: START STOP ESTOP RPM ... PROTO PWM|DSHOT DSHOTRATE DSHOT PWM FREQ");
+  Serial.printf("# ESC min=%uus armed low | profile=%s | proto=PWM\n",
                 (unsigned)ESC_PULSE_MIN_US, profileName());
 }
 

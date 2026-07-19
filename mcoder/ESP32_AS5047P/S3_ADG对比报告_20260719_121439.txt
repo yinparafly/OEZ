@@ -1,0 +1,29 @@
+S3 ADG 对比报告（空载）
+port=COM10 Ka=0.05 SOFT UP/DOWN=800/300
+SCALE: KI_SCALE=0.35 KP_SCALE=1.0 ILIM_DECEL=250
+DUAL: ACCEL kp/ki=0.08/0.25  DECEL kp/ki=0.06/0.08
+
+mode     traj   t_band     tail     peak   over%  pulse  verdict
+BASE     A1       0.96   1997.6   2023.7     1.2   1239  PASS
+BASE     A2       2.70   1999.9   2995.7     0.2   1239  PASS
+SCALE    A1       0.98   1998.0   2037.7     1.9   1239  PASS
+SCALE    A2       2.61   2000.2   2994.8     1.4   1237  PASS
+DUAL     A1       0.98   1998.6   2036.5     1.8   1239  PASS
+DUAL     A2       2.61   2000.2   2994.4     1.5   1237  PASS
+
+—— A2 降速对比（相对 BASE）——
+SCALE: t_band 2.70→2.61s (Δ=-0.10s); overshoot 0.2→1.4% (Δ=+1.1%)
+DUAL: t_band 2.70→2.61s (Δ=-0.10s); overshoot 0.2→1.5% (Δ=+1.3%)
+
+—— A1 升速对比（相对 BASE）——
+SCALE: t_band 0.96→0.98s (Δ=+0.02s); overshoot 1.2→1.9% (Δ=+0.7%)
+DUAL: t_band 0.96→0.98s (Δ=+0.02s); overshoot 1.2→1.8% (Δ=+0.6%)
+
+人工结论（修正脚本自动决策）:
+- 三组均 PASS；空载减速主要由 DOWN=300 斜坡主导。
+- SCALE/DUAL 使 A2 入带略快约 0.1s，但超调略升（仍很小）。
+- **空载默认：ADG OFF**（与测后板端一致）。
+- 固件保留 ADG；扑翼/负载后若见减速积分顶满或冲油门，再开 SCALE（KI_SCALE=0.35 ILIM=250）并 ADG SAVE。
+
+OVERALL: PASS
+csv=E:\OEZCON\mcoder\ESP32_AS5047P\pc\logs\s3_adg_20260719_121439.csv
