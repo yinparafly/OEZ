@@ -24,6 +24,8 @@ import java.util.Locale;
  */
 public class MainActivity extends AppCompatActivity implements BleUartClient.Listener {
     private static final int REQ_BT = 1001;
+    /** 设计减速比，仅对照；界面显示霍尔/编码器实测 */
+    private static final float GEAR_RATIO_DESIGN = (59f * 79f) / (12f * 14f);
 
     private ActivityMainBinding b;
     private BleUartClient ble;
@@ -172,24 +174,46 @@ public class MainActivity extends AppCompatActivity implements BleUartClient.Lis
     }
 
     @Override
-    public void onRpm(float rpm, float target) {
+    public void onRpm(float rpm, float target, int pulseUs, float outHzMeas, float gearMeas) {
         // 有遥测就显示数值（含 0）；未收到时才显示「未收到」
         b.rpmValue.setTextSize(56f);
         b.rpmValue.setText(String.format(Locale.US, "%.0f", rpm));
         b.rpmChart.addSample(rpm);
+        if (outHzMeas >= 0f) {
+            float outRpm = outHzMeas * 60f;
+            if (gearMeas >= 0f) {
+                float err = (gearMeas - GEAR_RATIO_DESIGN) / GEAR_RATIO_DESIGN * 100f;
+                b.outFreqText.setText(String.format(Locale.US,
+                        "输出(霍尔实测): %.2f Hz / %.1f RPM\n"
+                                + "减速比实测 %.3f  设计 %.3f  偏差 %+.1f%%",
+                        outHzMeas, outRpm, gearMeas, GEAR_RATIO_DESIGN, err));
+            } else {
+                b.outFreqText.setText(String.format(Locale.US,
+                        "输出(霍尔实测): %.2f Hz / %.1f RPM\n减速比实测 —（需≥2次下扑）",
+                        outHzMeas, outRpm));
+            }
+        } else {
+            b.outFreqText.setText(String.format(Locale.US,
+                    "输出(霍尔实测): —（等下扑≥2次）\n设计 i=(59×79)/(12×14)=%.3f",
+                    GEAR_RATIO_DESIGN));
+        }
         if (target > 0.5f) {
             lastTarget = target;
-            b.targetText.setText(String.format(Locale.US, "目标 %.0f", target));
+            b.targetText.setText(String.format(Locale.US,
+                    "目标 %.0f RPM  ·  油门 %d μs", target, pulseUs));
         } else if (lastTarget > 0) {
-            b.targetText.setText(String.format(Locale.US, "目标 %.0f", lastTarget));
+            b.targetText.setText(String.format(Locale.US,
+                    "目标 %.0f RPM  ·  油门 %d μs", lastTarget, pulseUs));
         } else {
-            b.targetText.setText("目标 —");
+            b.targetText.setText(String.format(Locale.US, "目标 —  ·  油门 %d μs", pulseUs));
         }
     }
 
     private void showRpmPending() {
         b.rpmValue.setTextSize(40f);
         b.rpmValue.setText("未收到");
+        b.outFreqText.setText(String.format(Locale.US,
+                "输出(霍尔实测): —\n设计 i=(59×79)/(12×14)=%.3f", GEAR_RATIO_DESIGN));
     }
 
     private void toast(String s) {

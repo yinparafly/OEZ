@@ -14,7 +14,8 @@
 void bleBegin();
 bool bleConnected();
 bool bleTakeRxLine(char* out, size_t out_sz);
-void bleEmitTelemLite(uint32_t t_ms, float rpm, uint16_t pulse, float target, int mode, int run);
+void bleEmitTelemLite(uint32_t t_ms, float rpm, uint16_t pulse, float target, int mode, int run,
+                      float out_hz_meas, float gear_meas);
 void bleSetRate(uint16_t hz);
 void bleSetLite(bool on);
 uint16_t bleTelemHz();

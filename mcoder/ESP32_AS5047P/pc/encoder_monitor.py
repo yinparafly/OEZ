@@ -157,11 +157,21 @@ def parse_meta_line(line: str) -> dict | None:
     return meta
 
 
+# 扑翼霍尔标识色（与相位盘一致）
+HALL_DOWN_COLOR = "#E07A3D"  # 下扑 0°
+HALL_UP_COLOR = "#2B7FD4"  # 上举 ~180°
+DISC_NEEDLE_COLOR = "#1A9B5C"
+# 设计减速比 (59×79)/(12×14)=4661/168≈27.744；仅作对照，显示用霍尔/编码器实测
+GEAR_RATIO_DESIGN = (59.0 * 79.0) / (12.0 * 14.0)
+assert abs(GEAR_RATIO_DESIGN - (59.0 / 12.0) * (79.0 / 14.0)) < 1e-9
+GEAR_RATIO_UI = GEAR_RATIO_DESIGN  # 兼容旧引用
+
+
 def parse_line(line: str) -> tuple | None:
     """完整或 BLE 瘦身行。
 
-    完整: t_ms,raw,deg,rad,rpm,ef,agc,magL,magH,pulse,target,mode,kp,ki,kd,profile,run
-    BLE:  B,t_ms,rpm,pulse,target,mode,run
+    完整: …,hall_dn,hall_up,disc_est,hd_mdeg,hu_mdeg[,out_hz_meas,gear_meas]
+    BLE:  B,t_ms,motor_rpm,pulse,target,mode,run[,out_hz_meas,gear_meas]
     """
     line = line.strip()
     if not line or line.startswith("#"):
@@ -176,6 +186,8 @@ def parse_line(line: str) -> tuple | None:
             target = float(parts[4])
             mode = int(float(parts[5]))
             run = int(float(parts[6]))
+            out_hz = float(parts[7]) if len(parts) >= 8 else -1.0
+            gear_m = float(parts[8]) if len(parts) >= 9 else -1.0
             return (
                 t_ms,
                 0,
@@ -194,6 +206,13 @@ def parse_line(line: str) -> tuple | None:
                 0.0,
                 0,
                 run,
+                1,
+                1,
+                -1.0,
+                -1.0,
+                -1.0,
+                out_hz,
+                gear_m,
             )
         if len(parts) < 5:
             return None
@@ -214,6 +233,13 @@ def parse_line(line: str) -> tuple | None:
         kd = float(parts[14]) if len(parts) >= 15 else 0.0
         profile = int(float(parts[15])) if len(parts) >= 16 else 0
         run = int(float(parts[16])) if len(parts) >= 17 else 0
+        hall_dn = int(float(parts[17])) if len(parts) >= 18 else 1
+        hall_up = int(float(parts[18])) if len(parts) >= 19 else 1
+        disc_est = float(parts[19]) if len(parts) >= 20 else -1.0
+        hd_mdeg = float(parts[20]) if len(parts) >= 21 else -1.0
+        hu_mdeg = float(parts[21]) if len(parts) >= 22 else -1.0
+        out_hz = float(parts[22]) if len(parts) >= 23 else -1.0
+        gear_m = float(parts[23]) if len(parts) >= 24 else -1.0
         return (
             t_ms,
             raw,
@@ -232,6 +258,13 @@ def parse_line(line: str) -> tuple | None:
             kd,
             profile,
             run,
+            hall_dn,
+            hall_up,
+            disc_est,
+            hd_mdeg,
+            hu_mdeg,
+            out_hz,
+            gear_m,
         )
     except ValueError:
         return None
@@ -402,6 +435,17 @@ class EncoderMonitorApp:
         self.recording = False
         self.rec_t0_ms: float | None = None
         self.rec_rows: list[tuple] = []
+        self.flap_events: list[dict] = []
+
+        # 扑翼霍尔 / 输出盘相位（GPIO4 下扑、GPIO5 上举）
+        self.hall_dn_lvl = 1
+        self.hall_up_lvl = 1
+        self.disc_est: float | None = None
+        self.hall_dn_motor_deg: float | None = None
+        self.hall_up_motor_deg: float | None = None
+        self.hall_up_disc_deg: float | None = None
+        self._hall_flash_until = 0.0
+        self._hall_flash_kind = ""
 
         self.live_t: deque[float] = deque()
         self.live_rpm: deque[float] = deque()
@@ -614,6 +658,11 @@ class EncoderMonitorApp:
         self.rpm_var = tk.StringVar(value="实测: — RPM")
         self.rpm_dir_var = tk.StringVar(value="—")  # 正=顺时针 逆=逆时针
         self.rpm_target_disp = tk.StringVar(value="目标: — RPM")
+        self.out_freq_var = tk.StringVar(
+            value="输出端(霍尔实测): — Hz  |  减速比实测 — / 设计 27.744"
+        )
+        self._out_hz_meas: float | None = None
+        self._gear_meas: float | None = None
         self.enc_info_var = tk.StringVar(
             value="编码器: AS5047P 一圈 16384 点（14bit）"
         )
@@ -647,6 +696,12 @@ class EncoderMonitorApp:
         ).pack(anchor=tk.W)
         ttk.Label(
             rpm_box, textvariable=self.rpm_target_disp, font=("Segoe UI", 12)
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            rpm_box,
+            textvariable=self.out_freq_var,
+            font=("Segoe UI", 11, "bold"),
+            foreground="#0a5a9c",
         ).pack(anchor=tk.W)
         ttk.Label(
             rpm_box, textvariable=self.enc_info_var, font=("Segoe UI", 9), foreground="#666"
@@ -1025,6 +1080,43 @@ class EncoderMonitorApp:
         ttk.Button(goto_row, text="停止转动", command=self._stop).pack(
             side=tk.LEFT, expand=True, fill=tk.X
         )
+
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        ttk.Label(parent, text="扑翼霍尔 / 输出盘", font=("Segoe UI", 9, "bold")).pack(
+            anchor=tk.W
+        )
+        ttk.Label(
+            parent,
+            text=(
+                f"YL-57/A3144：VCC=5V · 触发=低(同厂商51样例)\n"
+                f"下扑DO→GPIO4 · 上举DO→GPIO5（须分压到3.3V）\n"
+                f"减速 i=(59×79)/(12×14)={GEAR_RATIO_UI:.4f} (=4661/168)"
+            ),
+            foreground="#666",
+            wraplength=220,
+        ).pack(anchor=tk.W)
+        self.hall_info = tk.StringVar(value="霍尔: 未连接遥测")
+        ttk.Label(parent, textvariable=self.hall_info, wraplength=220).pack(
+            anchor=tk.W, pady=(2, 0)
+        )
+        self.disc_info = tk.StringVar(value="盘相位: —  |  下扑/上举电机角: —")
+        ttk.Label(parent, textvariable=self.disc_info, wraplength=220).pack(anchor=tk.W)
+        legend = ttk.Frame(parent)
+        legend.pack(fill=tk.X, pady=2)
+        tk.Label(
+            legend, text="● 下扑0°", fg=HALL_DOWN_COLOR, font=("Segoe UI", 9, "bold")
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            legend, text="  ● 上举~180°", fg=HALL_UP_COLOR, font=("Segoe UI", 9, "bold")
+        ).pack(side=tk.LEFT)
+        hall_btn = ttk.Frame(parent)
+        hall_btn.pack(fill=tk.X, pady=2)
+        ttk.Button(hall_btn, text="HALL?", width=8, command=lambda: self._send("HALL?")).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Button(
+            hall_btn, text="HALL CAL", width=9, command=lambda: self._send("HALL CAL")
+        ).pack(side=tk.LEFT)
 
         ttk.Label(
             parent,
@@ -2082,24 +2174,63 @@ class EncoderMonitorApp:
         fp = dict(fontproperties=_CN_FONT) if _CN_FONT is not None else {}
         ax.set_theta_zero_location("N")
         ax.set_theta_direction(-1)
-        ax.set_ylim(0, 1.15)
+        ax.set_ylim(0, 1.25)
         ax.set_yticks([])
         ax.set_xticks([math.radians(a) for a in (0, 90, 180, 270)])
-        ax.set_xticklabels(["0°", "90°", "180°", "270°"], fontsize=8, **fp)
-        ax.set_title("相位", fontsize=10, pad=10, **fp)
+        ax.set_xticklabels(["0°下扑", "90°", "180°上举", "270°"], fontsize=7, **fp)
+        ax.set_title("输出盘相位", fontsize=10, pad=10, **fp)
         theta_c = [math.radians(a) for a in range(0, 361, 2)]
         ax.plot(theta_c, [1.0] * len(theta_c), color="#888", linewidth=1.0)
-        (self.needle,) = ax.plot([0, 0], [0, 0.92], color="#d62728", linewidth=2.2)
-        self.needle_tip = ax.plot([0], [0.92], marker="o", markersize=5, color="#d62728")[0]
+        # 下扑 / 上举固定参考扇区（安装校准前上举按 180°）
+        th0 = math.radians(0.0)
+        th180 = math.radians(180.0)
+        (self.mark_down,) = ax.plot(
+            [th0, th0], [0.55, 1.12], color=HALL_DOWN_COLOR, linewidth=3.5, solid_capstyle="round"
+        )
+        (self.mark_up,) = ax.plot(
+            [th180, th180], [0.55, 1.12], color=HALL_UP_COLOR, linewidth=3.5, solid_capstyle="round"
+        )
+        # 绿针=盘相位估计；红针=电机相对相位
+        (self.needle_disc,) = ax.plot(
+            [0, 0], [0, 0.95], color=DISC_NEEDLE_COLOR, linewidth=2.4
+        )
+        self.needle_disc_tip = ax.plot(
+            [0], [0.95], marker="o", markersize=5, color=DISC_NEEDLE_COLOR
+        )[0]
+        (self.needle,) = ax.plot([0, 0], [0, 0.72], color="#d62728", linewidth=1.6, alpha=0.85)
+        self.needle_tip = ax.plot([0], [0.72], marker="o", markersize=4, color="#d62728")[0]
 
     def _update_phase_dial(self, deg: float | None) -> None:
+        # 红针：电机相对相位
         if deg is None:
             self.needle.set_data([0, 0], [0, 0])
             self.needle_tip.set_data([0], [0])
-            return
-        th = math.radians(deg % 360.0)
-        self.needle.set_data([th, th], [0.0, 0.92])
-        self.needle_tip.set_data([th], [0.92])
+        else:
+            th_m = math.radians(deg % 360.0)
+            self.needle.set_data([th_m, th_m], [0.0, 0.72])
+            self.needle_tip.set_data([th_m], [0.72])
+
+        # 绿针：输出盘相位（霍尔下扑标定后）
+        if self.disc_est is None:
+            self.needle_disc.set_data([0, 0], [0, 0])
+            self.needle_disc_tip.set_data([0], [0])
+        else:
+            th_d = math.radians(self.disc_est % 360.0)
+            self.needle_disc.set_data([th_d, th_d], [0.0, 0.95])
+            self.needle_disc_tip.set_data([th_d], [0.95])
+
+        # 上举标记：用最近一次霍尔上举时的盘相位，否则 180°
+        up_deg = self.hall_up_disc_deg if self.hall_up_disc_deg is not None else 180.0
+        th_u = math.radians(up_deg % 360.0)
+        self.mark_up.set_data([th_u, th_u], [0.55, 1.12])
+
+        # 触发闪烁：加粗对应色标
+        now = time.time()
+        flash = now < self._hall_flash_until
+        lw_dn = 5.5 if flash and self._hall_flash_kind == "DOWN" else 3.5
+        lw_up = 5.5 if flash and self._hall_flash_kind == "UP" else 3.5
+        self.mark_down.set_linewidth(lw_dn)
+        self.mark_up.set_linewidth(lw_up)
 
     def _bring_dialog_front(self) -> None:
         """把主窗抬到前台，但不要 -topmost：Windows 上 topmost 父窗会盖住 messagebox。"""
@@ -2175,6 +2306,80 @@ class EncoderMonitorApp:
 
         # after_idle：等当前串口轮询帧结束立刻弹，不要人为再拖几百毫秒
         self.root.after_idle(_show)
+
+    def _on_hall_meta(self, raw: str) -> None:
+        """霍尔边沿事件：更新盘相位标记并记入 flap_events。"""
+        try:
+            parts = {
+                p.split("=", 1)[0]: p.split("=", 1)[1]
+                for p in raw.replace(",", " ").split()
+                if "=" in p
+            }
+        except ValueError:
+            parts = {}
+        kind = "DOWN" if "HALL DOWN" in raw else ("UP" if "HALL UP" in raw else "")
+        if not kind:
+            if "ACK HALL CAL" in raw:
+                self.ack_var.set("指令反馈: 已把当前电机角标为盘 0°（下扑）")
+            elif "HALL" in raw:
+                self.ack_var.set(f"指令反馈: {raw.lstrip('# ').strip()[:160]}")
+            return
+
+        def _f(key: str) -> float | None:
+            v = parts.get(key)
+            if v is None:
+                return None
+            try:
+                x = float(v)
+                return None if x < -0.5 and key.startswith("disc") else x
+            except ValueError:
+                return None
+
+        motor_rel = _f("motor_rel")
+        disc_est = _f("disc_est")
+        t_ms = _f("t_ms")
+        if kind == "DOWN":
+            if motor_rel is not None:
+                self.hall_dn_motor_deg = motor_rel
+            self.disc_est = 0.0 if disc_est is None else disc_est
+            oh = _f("out_hz")
+            gm = _f("gear_meas")
+            if oh is not None and oh >= 0:
+                self._out_hz_meas = oh
+            if gm is not None and gm >= 0:
+                self._gear_meas = gm
+            self._hall_flash_kind = "DOWN"
+        else:
+            if motor_rel is not None:
+                self.hall_up_motor_deg = motor_rel
+            if disc_est is not None:
+                self.hall_up_disc_deg = disc_est
+                self.disc_est = disc_est
+            self._hall_flash_kind = "UP"
+        self._hall_flash_until = time.time() + 0.45
+        self._plot_dirty = True
+
+        ev = {
+            "wall_s": f"{time.time():.3f}",
+            "t_ms": "" if t_ms is None else f"{t_ms:.0f}",
+            "kind": kind,
+            "label": "下扑" if kind == "DOWN" else "上举",
+            "motor_rel": "" if motor_rel is None else f"{motor_rel:.3f}",
+            "motor_abs": parts.get("motor_abs", ""),
+            "raw": parts.get("raw", ""),
+            "disc_est": "" if disc_est is None else f"{disc_est:.3f}",
+            "count": parts.get("count", ""),
+        }
+        self.flap_events.append(ev)
+        if hasattr(self, "hall_info"):
+            tag = "下扑0°" if kind == "DOWN" else "上举"
+            col_hint = "橙" if kind == "DOWN" else "蓝"
+            self.hall_info.set(
+                f"霍尔事件: {tag}({col_hint}) motor={ev['motor_rel']}° disc={ev['disc_est']}°"
+            )
+        self.ack_var.set(
+            f"霍尔 {ev['label']}: 电机相对 {ev['motor_rel']}° · 盘 {ev['disc_est']}°"
+        )
 
     def _handle_op_feedback(self, raw: str) -> None:
         """解析板子 ACK/ERR，给用户明确成功/失败交互。"""
@@ -3359,6 +3564,7 @@ class EncoderMonitorApp:
         self.recording = True
         self.rec_t0_ms = None
         self.rec_rows.clear()
+        self.flap_events.clear()
         self.live_t.clear()
         self.live_rpm.clear()
         self._rpm_signed_hist.clear()
@@ -3376,8 +3582,9 @@ class EncoderMonitorApp:
         self.recording = False
         self.btn_rec.configure(text="开始记录")
         n = len(self.rec_rows)
-        self.rec_info.set(f"记录结束: {n} 点")
-        if n > 0:
+        ne = len(self.flap_events)
+        self.rec_info.set(f"记录结束: {n} 点 · 霍尔事件 {ne}")
+        if n > 0 or ne > 0:
             self.btn_export.configure(state=tk.NORMAL)
 
     def _clear_plot(self) -> None:
@@ -3393,12 +3600,13 @@ class EncoderMonitorApp:
         if hasattr(self, "rpm_dir_var"):
             self.rpm_dir_var.set("—")
         self.rec_rows.clear()
+        self.flap_events.clear()
         self.btn_export.configure(state=tk.DISABLED)
         self.rec_info.set("记录: 未开始")
         self._redraw()
 
     def _export_csv(self) -> None:
-        if not self.rec_rows:
+        if not self.rec_rows and not self.flap_events:
             self._dlg_info("提示", "没有可导出的数据")
             return
         default = datetime.now().strftime("as5047p_rpm_%Y%m%d_%H%M%S.csv")
@@ -3411,10 +3619,60 @@ class EncoderMonitorApp:
             return
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["t_s", "deg", "rad", "rpm", "raw", "pulse_us", "target_rpm"])
+            w.writerow(
+                [
+                    "t_s",
+                    "motor_deg",
+                    "rad",
+                    "rpm",
+                    "raw",
+                    "pulse_us",
+                    "target_rpm",
+                    "hall_dn",
+                    "hall_up",
+                    "disc_est",
+                    "hd_mdeg",
+                    "hu_mdeg",
+                    "out_hz_meas",
+                    "gear_meas",
+                ]
+            )
             for row in self.rec_rows:
                 w.writerow(row)
-        self._dlg_info("完成", f"已保存: {path}")
+        if self.flap_events:
+            ev_path = str(Path(path).with_name(Path(path).stem + "_hall_events.csv"))
+            with open(ev_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(
+                    [
+                        "wall_s",
+                        "t_ms",
+                        "kind",
+                        "label",
+                        "motor_rel",
+                        "motor_abs",
+                        "raw",
+                        "disc_est",
+                        "count",
+                    ]
+                )
+                for ev in self.flap_events:
+                    w.writerow(
+                        [
+                            ev.get("wall_s", ""),
+                            ev.get("t_ms", ""),
+                            ev.get("kind", ""),
+                            ev.get("label", ""),
+                            ev.get("motor_rel", ""),
+                            ev.get("motor_abs", ""),
+                            ev.get("raw", ""),
+                            ev.get("disc_est", ""),
+                            ev.get("count", ""),
+                        ]
+                    )
+            self._dlg_info("完成", f"已保存:\n{path}\n{ev_path}")
+        else:
+            self._dlg_info("完成", f"已保存: {path}")
 
     def _poll(self) -> None:
         # 1) 限量消化队列，保证本帧还能响应按钮/拖窗
@@ -3446,6 +3704,8 @@ class EncoderMonitorApp:
                             self.ctrl_hz = int(meta["ctrl_hz"])
                         raw = meta.get("raw")
                         if isinstance(raw, str):
+                            if "HALL" in raw:
+                                self._on_hall_meta(raw)
                             if (
                                 "LEARN settle" in raw or "LEARN RAMP settle" in raw
                             ) and self._learn_log_writer is not None:
@@ -3473,6 +3733,7 @@ class EncoderMonitorApp:
                                     "UNI",
                                     "EVAL",
                                     "LEARN RESULT",
+                                    "HALL",
                                 )
                             ) and "LEARN settle" not in raw and "LEARN RAMP settle" not in raw:
                                 self.ack_var.set(f"指令反馈: {raw.lstrip('# ').strip()[:160]}")
@@ -3558,9 +3819,28 @@ class EncoderMonitorApp:
             else:
                 self._rpm_disp = abs(mean)
                 self._rpm_dir = "正" if mean >= 0 else "逆"
-        self.rpm_var.set(f"实测: {self._rpm_disp:.1f} RPM")
+        self.rpm_var.set(f"电机实测: {self._rpm_disp:.1f} RPM")
         if hasattr(self, "rpm_dir_var"):
             self.rpm_dir_var.set(self._rpm_dir)
+        if hasattr(self, "out_freq_var"):
+            if self._out_hz_meas is not None and self._out_hz_meas >= 0:
+                out_rpm = self._out_hz_meas * 60.0
+                if self._gear_meas is not None and self._gear_meas >= 0:
+                    err = (self._gear_meas - GEAR_RATIO_DESIGN) / GEAR_RATIO_DESIGN * 100.0
+                    self.out_freq_var.set(
+                        f"输出端(霍尔实测): {self._out_hz_meas:.2f} Hz / {out_rpm:.1f} RPM  |  "
+                        f"减速比实测 {self._gear_meas:.3f} 设计 {GEAR_RATIO_DESIGN:.3f} "
+                        f"偏差 {err:+.1f}%"
+                    )
+                else:
+                    self.out_freq_var.set(
+                        f"输出端(霍尔实测): {self._out_hz_meas:.2f} Hz / {out_rpm:.1f} RPM  |  "
+                        f"减速比实测 —（需≥2次下扑）设计 {GEAR_RATIO_DESIGN:.3f}"
+                    )
+            else:
+                self.out_freq_var.set(
+                    f"输出端(霍尔实测): —（等下扑霍尔≥2次）| 设计 i=(59×79)/(12×14)={GEAR_RATIO_DESIGN:.3f}"
+                )
 
         # 曲线只吃均值后的平滑点（不再吃瞬时 |rpm|，避免齿状）
         if now - self._last_live_append >= LIVE_APPEND_MIN_S:
@@ -3601,12 +3881,58 @@ class EncoderMonitorApp:
             kd,
             profile,
             run,
+            hall_dn,
+            hall_up,
+            disc_est,
+            hd_mdeg,
+            hu_mdeg,
+            out_hz,
+            gear_m,
         ) = s
         self.deg_var.set(f"{deg:7.2f} °")
         abs_deg = (float(raw) * 360.0) / 16384.0
         if hasattr(self, "phase_info"):
             self.phase_info.set(
                 f"相对相位: {deg:.2f}°  |  绝对: {abs_deg:.2f}°"
+            )
+        self.hall_dn_lvl = int(hall_dn)
+        self.hall_up_lvl = int(hall_up)
+        if disc_est is not None and float(disc_est) >= -0.5:
+            self.disc_est = float(disc_est)
+        if hd_mdeg is not None and float(hd_mdeg) >= -0.5:
+            self.hall_dn_motor_deg = float(hd_mdeg)
+        if hu_mdeg is not None and float(hu_mdeg) >= -0.5:
+            self.hall_up_motor_deg = float(hu_mdeg)
+        if out_hz is not None and float(out_hz) >= 0:
+            self._out_hz_meas = float(out_hz)
+        if gear_m is not None and float(gear_m) >= 0:
+            self._gear_meas = float(gear_m)
+        if hasattr(self, "hall_info"):
+            # 厂商 51 样例：DO==0 为触发
+            dn_act = "触发" if hall_dn == 0 else "空闲"
+            up_act = "触发" if hall_up == 0 else "空闲"
+            self.hall_info.set(
+                f"GPIO4下扑:{dn_act}({hall_dn})  GPIO5上举:{up_act}({hall_up})"
+            )
+        if hasattr(self, "disc_info"):
+            dtxt = f"{self.disc_est:.1f}°" if self.disc_est is not None else "—"
+            hd = (
+                f"{self.hall_dn_motor_deg:.1f}°"
+                if self.hall_dn_motor_deg is not None
+                else "—"
+            )
+            hu = (
+                f"{self.hall_up_motor_deg:.1f}°"
+                if self.hall_up_motor_deg is not None
+                else "—"
+            )
+            up_d = (
+                f"{self.hall_up_disc_deg:.1f}°"
+                if self.hall_up_disc_deg is not None
+                else "180°?"
+            )
+            self.disc_info.set(
+                f"盘相位: {dtxt}  |  下扑电机角 {hd}  |  上举电机角 {hu} (盘{up_d})"
             )
         self.rpm_target_disp.set(f"目标: {target:.0f} RPM")
         self.enc_info_var.set(
@@ -3664,6 +3990,13 @@ class EncoderMonitorApp:
             kd,
             profile,
             run,
+            hall_dn,
+            hall_up,
+            disc_est,
+            hd_mdeg,
+            hu_mdeg,
+            out_hz,
+            gear_m,
         ) = sample
 
         self._last_telem = sample
@@ -3680,6 +4013,16 @@ class EncoderMonitorApp:
         self.prev_deg = deg
         self.prev_t_ms = t_ms
         self.current_deg = deg
+        if float(disc_est) >= -0.5:
+            self.disc_est = float(disc_est)
+        if float(hd_mdeg) >= -0.5:
+            self.hall_dn_motor_deg = float(hd_mdeg)
+        if float(hu_mdeg) >= -0.5:
+            self.hall_up_motor_deg = float(hu_mdeg)
+        if float(out_hz) >= 0:
+            self._out_hz_meas = float(out_hz)
+        if float(gear_m) >= 0:
+            self._gear_meas = float(gear_m)
         now_wall = time.time()
         self._rpm_signed_hist.append((now_wall, rpm_meas))
         while self._rpm_signed_hist and (
@@ -3724,9 +4067,18 @@ class EncoderMonitorApp:
                     int(raw),
                     pulse,
                     f"{target:.1f}",
+                    int(hall_dn),
+                    int(hall_up),
+                    f"{float(disc_est):.3f}",
+                    f"{float(hd_mdeg):.3f}",
+                    f"{float(hu_mdeg):.3f}",
+                    f"{float(out_hz):.3f}",
+                    f"{float(gear_m):.3f}",
                 )
             )
-            self.rec_info.set(f"记录中… {len(self.rec_rows)} 点  t={t_s:.2f}s")
+            self.rec_info.set(
+                f"记录中… {len(self.rec_rows)} 点 · 霍尔事件 {len(self.flap_events)}  t={t_s:.2f}s"
+            )
 
     @staticmethod
     def _downsample_xy(

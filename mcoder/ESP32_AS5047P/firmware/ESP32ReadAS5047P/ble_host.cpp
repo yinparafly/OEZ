@@ -3,6 +3,7 @@
  ************************************************/
 #include "ble_host.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +26,9 @@ static volatile bool g_ble_ready = false;
 static uint16_t g_ble_telem_hz = BLE_TELEM_HZ_DEFAULT;
 static bool g_ble_lite = true;
 static uint32_t g_ble_last_telem_ms = 0;
+// 最近一帧瘦身遥测缓存：ACK/HALL meta 的 setValue 会冲掉 TX，手机 READ 易读到错行
+static char g_ble_last_telem[96];
+static size_t g_ble_last_telem_n = 0;
 
 static char g_ble_rx_line[96];
 static size_t g_ble_rx_len = 0;
@@ -119,19 +123,32 @@ void bleSendRaw(const char* data, size_t n) {
   g_ble_tx->notify();
 }
 
+/** meta（ACK/HALL…）通知后，把 TX 特征值恢复为最新遥测，避免 READ 轮询读到 ACK */
+static void bleRestoreTelemValue() {
+  if (!bleConnected() || g_ble_tx == nullptr || g_ble_last_telem_n == 0) return;
+  g_ble_tx->setValue((uint8_t*)g_ble_last_telem, g_ble_last_telem_n);
+}
+
+void bleSendMeta(const char* data, size_t n) {
+  if (!bleConnected() || !data || n == 0) return;
+  g_ble_tx->setValue((uint8_t*)data, n);
+  g_ble_tx->notify();
+  bleRestoreTelemValue();
+}
+
 void bleSendLine(const char* s) {
   if (!s) return;
   size_t n = strlen(s);
   if (n == 0) return;
   if (s[n - 1] == '\n') {
-    bleSendRaw(s, n);
+    bleSendMeta(s, n);
   } else {
     char tmp[256];
     if (n + 2 > sizeof(tmp)) n = sizeof(tmp) - 2;
     memcpy(tmp, s, n);
     tmp[n] = '\n';
     tmp[n + 1] = '\0';
-    bleSendRaw(tmp, n + 1);
+    bleSendMeta(tmp, n + 1);
   }
 }
 
@@ -196,23 +213,36 @@ bool bleTakeRxLine(char* out, size_t out_sz) {
   return true;
 }
 
-void bleEmitTelemLite(uint32_t t_ms, float rpm, uint16_t pulse, float target, int mode, int run) {
+void bleEmitTelemLite(uint32_t t_ms, float rpm, uint16_t pulse, float target, int mode, int run,
+                      float out_hz_meas, float gear_meas) {
   if (!bleConnected()) return;
   uint32_t period = 1000UL / (uint32_t)g_ble_telem_hz;
   if (period < 20) period = 20;
   if ((uint32_t)(t_ms - g_ble_last_telem_ms) < period) return;
   g_ble_last_telem_ms = t_ms;
 
-  char buf[96];
+  // 手机/PC 显示用转速大小（与控制环一致），避免符号造成“差很大”的错觉
+  float rpm_out = fabsf(rpm);
+  float oh = isnan(out_hz_meas) ? -1.0f : out_hz_meas;
+  float gm = isnan(gear_meas) ? -1.0f : gear_meas;
+
+  char buf[112];
   if (g_ble_lite) {
-    snprintf(buf, sizeof(buf), "B,%lu,%.1f,%u,%.1f,%d,%d\n", (unsigned long)t_ms, (double)rpm,
-             (unsigned)pulse, (double)target, mode, run);
+    // B,t_ms,motor_rpm,pulse,target,mode,run,out_hz_meas,gear_meas
+    snprintf(buf, sizeof(buf), "B,%lu,%.1f,%u,%.1f,%d,%d,%.3f,%.3f\n",
+             (unsigned long)t_ms, (double)rpm_out, (unsigned)pulse, (double)target, mode, run,
+             (double)oh, (double)gm);
   } else {
     snprintf(buf, sizeof(buf), "%lu,0,0,0,%.2f,0,0,0,0,%u,%.1f,%d,0,0,0,0,%d\n",
-             (unsigned long)t_ms, (double)rpm, (unsigned)pulse, (double)target, mode, run);
+             (unsigned long)t_ms, (double)rpm_out, (unsigned)pulse, (double)target, mode, run);
   }
-  // setValue + notify：Win 上若未订阅，PC 仍可用 READ 轮询拿到最新行
-  bleSendRaw(buf, strlen(buf));
+  size_t n = strlen(buf);
+  if (n >= sizeof(g_ble_last_telem)) n = sizeof(g_ble_last_telem) - 1;
+  memcpy(g_ble_last_telem, buf, n);
+  g_ble_last_telem[n] = '\0';
+  g_ble_last_telem_n = n;
+  // setValue + notify：Win/手机若未订阅，仍可用 READ 拿到最新行
+  bleSendRaw(buf, n);
 }
 
 void bleSetRate(uint16_t hz) {
@@ -241,6 +271,10 @@ void hostPrintf(const char* fmt, ...) {
   Serial.write((const uint8_t*)buf, (size_t)n);
   if (!bleConnected()) return;
   if (buf[0] >= '0' && buf[0] <= '9') return;  // USB 全速遥测不灌 BLE
-  bleSendRaw(buf, (size_t)n);
-  if (buf[n - 1] != '\n') bleSendRaw("\n", 1);
+  // meta：notify 后恢复遥测特征值，避免手机 READ 读到 # ACK / # HALL
+  if (buf[n - 1] != '\n' && n + 1 < (int)sizeof(buf)) {
+    buf[n++] = '\n';
+    buf[n] = '\0';
+  }
+  bleSendMeta(buf, (size_t)n);
 }

@@ -62,7 +62,12 @@ public class BleUartClient {
 
         void onConnected(boolean ok);
 
-        void onRpm(float rpm, float target);
+        /**
+         * @param rpm 电机编码器实测 RPM
+         * @param outHzMeas 霍尔下扑周期实测输出频率 Hz（&lt;0 表示尚未测到）
+         * @param gearMeas 实测减速比=电机转数/盘转（&lt;0 表示尚未测到）
+         */
+        void onRpm(float rpm, float target, int pulseUs, float outHzMeas, float gearMeas);
     }
 
     public static class DeviceItem {
@@ -103,12 +108,11 @@ public class BleUartClient {
         public void run() {
             if (!connected) return;
             long now = System.currentTimeMillis();
-            // 保活
-            enqueueWrite("PING");
-            // 无推送时 100ms 级读 TX（固件 setValue 后可读）
-            if (now - lastPushMs > 300) {
+            // 先读遥测，再 PING，降低 ACK 覆盖 TX 后立刻 READ 的概率
+            if (now - lastPushMs > 200) {
                 enqueueRead();
             }
+            enqueueWrite("PING");
             status(String.format(Locale.US,
                     "已连接 · 收行%d · 转速更新%d%s",
                     rxLines, rpmUpdates,
@@ -468,23 +472,23 @@ public class BleUartClient {
         if (line.startsWith("#")) return;
         try {
             String[] p = line.split(",");
-            float rpm;
-            float target = 0f;
-            if (p.length >= 3 && p[0].trim().equalsIgnoreCase("B")) {
-                // B,t_ms,rpm,pulse,target,mode,run
-                rpm = Float.parseFloat(p[2].trim());
-                if (p.length >= 5) target = Float.parseFloat(p[4].trim());
-            } else if (p.length >= 5) {
-                rpm = Float.parseFloat(p[4].trim());
-                if (p.length >= 11) target = Float.parseFloat(p[10].trim());
-            } else {
+            // B,t_ms,motor_rpm,pulse,target,mode,run[,out_hz_meas,gear_meas]
+            if (p.length < 7 || !p[0].trim().equalsIgnoreCase("B")) {
                 return;
             }
-            final float r = Math.abs(rpm);
-            final float t = target;
+            float rpm = Math.abs(Float.parseFloat(p[2].trim()));
+            int pulse = (int) Float.parseFloat(p[3].trim());
+            float target = Float.parseFloat(p[4].trim());
+            float outHz = p.length >= 8 ? Float.parseFloat(p[7].trim()) : -1f;
+            float gearM = p.length >= 9 ? Float.parseFloat(p[8].trim()) : -1f;
             lastPushMs = System.currentTimeMillis();
             rpmUpdates++;
-            ui.post(() -> listener.onRpm(r, t));
+            final float r = rpm;
+            final float t = target;
+            final int pu = pulse;
+            final float oh = outHz;
+            final float gm = gearM;
+            ui.post(() -> listener.onRpm(r, t, pu, oh, gm));
         } catch (Exception ignored) {
         }
     }

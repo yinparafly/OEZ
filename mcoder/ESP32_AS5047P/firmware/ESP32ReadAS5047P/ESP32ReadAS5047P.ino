@@ -3,6 +3,12 @@
  *
  * 电调：GPIO9，默认 50Hz，脉宽 1000~2000us（上电先最低油门）
  *   FREQ <50..600> 可改刷新率（测完请回 50；>500Hz 周期<2000μs，高油门夹断）
+ * 扑翼霍尔（YL-57 / LM393+A3144，VCC=5V）：
+ *   厂商 51 样例以 DO==0 为触发（低有效）；商家文案写反时以样例+实测为准
+ *   GPIO4 = 输出盘 0°（下扑）DO；GPIO5 = ~180°（上举）DO
+ *   DO 高电平可能近 5V → 须分压/电平转换到 3.3V，勿直灌 ESP32
+ * 减速比：小齿 12、14 → 大齿 59、79；总比 (59×79)/(12×14)=4661/168≈27.744
+ *   （与 (59/12)×(79/14) 代数相同）
  * 策略：台阶辨识前馈图 f_inv + PI；profile: noload / flap
  *
  * 指令（行末 \n）：
@@ -19,6 +25,7 @@
  *   GAIN ON|OFF | GAIN? | GAIN SAVE   （转速分区 PID 表，插值替代全局 PID）
  *   PHASE ZERO | PHASE? | MOVE CW|CCW <deg> [rpm]
  *   STOPAT <deg>|OFF | GOTO <deg> [CW|CCW|AUTO] [rpm]
+ *   HALL? | HALL CAL | HALL ACTIVE LOW|HIGH
  *   ADAPT ON|OFF | PWM <1000..2000>
  *   PROTO PWM|DSHOT|? | DSHOTRATE 150|300|600|? | DSHOT <0..2047>
  *   BLE? | BLE RATE <5..50> | BLE LITE ON|OFF   （蓝牙遥测降频/瘦身）
@@ -38,6 +45,18 @@ static const int PIN_SCLK = 12;
 static const int PIN_MISO = 13;
 static const int PIN_MOSI = 11;
 static const int PIN_ESC_PWM = 9;
+// 扑翼输出盘霍尔（A3144 模块 DO→GPIO，VCC=5V；默认触发=低，同厂商 51 样例）
+static const int PIN_HALL_DOWN = 4;  // 0° 下扑起点
+static const int PIN_HALL_UP   = 5;  // ~180° 上举
+// 两级减速：电机→12/59→14/79→输出盘；总比按用户给定公式
+static const float GEAR_TEETH_PINION1 = 12.0f;
+static const float GEAR_TEETH_WHEEL1  = 59.0f;
+static const float GEAR_TEETH_PINION2 = 14.0f;
+static const float GEAR_TEETH_WHEEL2  = 79.0f;
+// (59×79)/(12×14) = 4661/168 ≈ 27.7440476  （= (59/12)×(79/14)）
+static const float GEAR_RATIO =
+    (GEAR_TEETH_WHEEL1 * GEAR_TEETH_WHEEL2) /
+    (GEAR_TEETH_PINION1 * GEAR_TEETH_PINION2);
 
 // ---- 时序 ----
 static const uint32_t SERIAL_BAUD = 921600;
@@ -212,6 +231,33 @@ static const uint16_t CRAWL_PULSE_MIN = 1250;  // 开环爬行最低脉宽，保
 uint32_t last_host_ms = 0;
 bool host_seen = false;
 
+// ---- 扑翼霍尔 / 输出盘相位（相对电机编码器反算）----
+bool hall_active_low = true;       // 厂商 51 样例：if(DO==0) 触发；可用 HALL ACTIVE 改
+uint8_t hall_dn_lvl = 1;           // 原始读数 0/1
+uint8_t hall_up_lvl = 1;
+uint8_t hall_dn_prev = 1;
+uint8_t hall_up_prev = 1;
+uint32_t hall_dn_count = 0;
+uint32_t hall_up_count = 0;
+float motor_unwrapped_deg = 0.0f;  // 累计电机角（°），用于盘相位
+bool flap_calibrated = false;      // 以下扑沿为盘 0°
+float flap_zero_motor_unwrap = 0.0f;
+float last_hd_motor_rel = NAN;     // 触发时电机相对相位
+float last_hu_motor_rel = NAN;
+float last_hd_motor_abs = NAN;
+float last_hu_motor_abs = NAN;
+uint16_t last_hd_raw = 0;
+uint16_t last_hu_raw = 0;
+float last_hd_disc = NAN;          // 触发时盘相位估计（下扑应为≈0）
+float last_hu_disc = NAN;          // 上举触发时盘相位（期望≈180）
+uint32_t last_hd_ms = 0;
+uint32_t last_hu_ms = 0;
+float last_hd_motor_unwrap = NAN;  // 上次下扑沿时的电机展开角
+// 霍尔实测输出端频率 / 实测减速比（非设计比换算）
+float out_hz_meas = NAN;           // 两次下扑沿周期 → Hz
+float out_rpm_meas = NAN;          // = out_hz_meas * 60
+float gear_ratio_meas = NAN;       // 一盘转内电机转数 = |Δunwrap|/360
+
 // ---------------- SPI / 编码器 ----------------
 uint16_t evenParityBit(uint16_t value15) {
   uint16_t x = value15 & 0x7FFF;
@@ -334,6 +380,126 @@ float wrap180(float d) {
 
 float phaseRelFromAbs(float abs_deg) {
   return wrap360(abs_deg - phase_zero_deg);
+}
+
+float discEstFromMotor() {
+  if (!flap_calibrated || GEAR_RATIO < 1.0f) return NAN;
+  return wrap360((motor_unwrapped_deg - flap_zero_motor_unwrap) / GEAR_RATIO);
+}
+
+bool hallIsActive(uint8_t lvl) {
+  return hall_active_low ? (lvl == 0) : (lvl == 1);
+}
+
+bool hallEdgeTrigger(uint8_t prev, uint8_t now) {
+  // 进入有效电平的边沿记一次事件
+  return !hallIsActive(prev) && hallIsActive(now);
+}
+
+void hallSetup() {
+  // DO 经分压后接入；低有效时空闲多为高，用上拉更稳（分压后高≤3.3V）
+  pinMode(PIN_HALL_DOWN, INPUT_PULLUP);
+  pinMode(PIN_HALL_UP, INPUT_PULLUP);
+  hall_dn_lvl = (uint8_t)digitalRead(PIN_HALL_DOWN);
+  hall_up_lvl = (uint8_t)digitalRead(PIN_HALL_UP);
+  hall_dn_prev = hall_dn_lvl;
+  hall_up_prev = hall_up_lvl;
+}
+
+void hallCalibrateNow() {
+  flap_zero_motor_unwrap = motor_unwrapped_deg;
+  flap_calibrated = true;
+  last_hd_disc = 0.0f;
+}
+
+void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
+  // 对齐厂商 51 样例：先读一次，短延时后再确认仍为触发电平（消抖）
+  uint8_t dn0 = (uint8_t)digitalRead(PIN_HALL_DOWN);
+  uint8_t up0 = (uint8_t)digitalRead(PIN_HALL_UP);
+  delayMicroseconds(200);
+  hall_dn_lvl = (uint8_t)digitalRead(PIN_HALL_DOWN);
+  hall_up_lvl = (uint8_t)digitalRead(PIN_HALL_UP);
+  if (hall_dn_lvl != dn0) hall_dn_lvl = hall_dn_prev;  // 抖动则本拍忽略
+  if (hall_up_lvl != up0) hall_up_lvl = hall_up_prev;
+
+  if (hallEdgeTrigger(hall_dn_prev, hall_dn_lvl)) {
+    // 两次下扑沿：实测盘频 + 实测减速比（电机展开角差 / 360）
+    if (hall_dn_count >= 1 && last_hd_ms > 0 && !isnan(last_hd_motor_unwrap)) {
+      uint32_t dt_ms = now - last_hd_ms;
+      if (dt_ms >= 30 && dt_ms <= 30000) {
+        out_hz_meas = 1000.0f / (float)dt_ms;
+        out_rpm_meas = out_hz_meas * 60.0f;
+        float motor_revs = fabsf(motor_unwrapped_deg - last_hd_motor_unwrap) / 360.0f;
+        if (motor_revs > 0.05f) gear_ratio_meas = motor_revs;  // 一盘转内电机转数
+      }
+    }
+    hall_dn_count++;
+    last_hd_ms = now;
+    last_hd_motor_rel = motor_rel;
+    last_hd_motor_abs = motor_abs;
+    last_hd_raw = raw;
+    last_hd_motor_unwrap = motor_unwrapped_deg;
+    // 下扑沿：自动把当前电机展开角标为盘 0°（可用 HALL CAL 重标）
+    flap_zero_motor_unwrap = motor_unwrapped_deg;
+    flap_calibrated = true;
+    last_hd_disc = 0.0f;
+    hostPrintf(
+        "# HALL DOWN t_ms=%lu motor_rel=%.3f motor_abs=%.3f raw=%u "
+        "out_hz=%.3f gear_meas=%.3f gear_design=%.4f count=%lu\n",
+        (unsigned long)now, (double)motor_rel, (double)motor_abs, (unsigned)raw,
+        (double)(isnan(out_hz_meas) ? -1.0f : out_hz_meas),
+        (double)(isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas),
+        (double)GEAR_RATIO, (unsigned long)hall_dn_count);
+  }
+
+  if (hallEdgeTrigger(hall_up_prev, hall_up_lvl)) {
+    hall_up_count++;
+    last_hu_ms = now;
+    last_hu_motor_rel = motor_rel;
+    last_hu_motor_abs = motor_abs;
+    last_hu_raw = raw;
+    last_hu_disc = discEstFromMotor();
+    hostPrintf(
+        "# HALL UP t_ms=%lu motor_rel=%.3f motor_abs=%.3f raw=%u "
+        "disc_est=%.3f count=%lu gear_design=%.4f\n",
+        (unsigned long)now, (double)motor_rel, (double)motor_abs, (unsigned)raw,
+        (double)(isnan(last_hu_disc) ? -1.0f : last_hu_disc),
+        (unsigned long)hall_up_count, (double)GEAR_RATIO);
+  }
+
+  hall_dn_prev = hall_dn_lvl;
+  hall_up_prev = hall_up_lvl;
+}
+
+void hallPrintStatus() {
+  float disc = discEstFromMotor();
+  hostPrintf(
+      "# HALL dn_pin=%d up_pin=%d active=%s dn_lvl=%u up_lvl=%u "
+      "dn_cnt=%lu up_cnt=%lu cal=%d gear=%.6f (59*79)/(12*14)\n",
+      PIN_HALL_DOWN, PIN_HALL_UP, hall_active_low ? "LOW" : "HIGH",
+      (unsigned)hall_dn_lvl, (unsigned)hall_up_lvl,
+      (unsigned long)hall_dn_count, (unsigned long)hall_up_count,
+      flap_calibrated ? 1 : 0, (double)GEAR_RATIO);
+  hostPrintf(
+      "# HALL last_dn motor_rel=%.3f disc=%.3f | last_up motor_rel=%.3f disc=%.3f | "
+      "disc_now=%.3f\n",
+      (double)(isnan(last_hd_motor_rel) ? -1.0f : last_hd_motor_rel),
+      (double)(isnan(last_hd_disc) ? -1.0f : last_hd_disc),
+      (double)(isnan(last_hu_motor_rel) ? -1.0f : last_hu_motor_rel),
+      (double)(isnan(last_hu_disc) ? -1.0f : last_hu_disc),
+      (double)(isnan(disc) ? -1.0f : disc));
+  float err = NAN;
+  if (!isnan(gear_ratio_meas) && GEAR_RATIO > 0.1f) {
+    err = (gear_ratio_meas - GEAR_RATIO) / GEAR_RATIO * 100.0f;
+  }
+  hostPrintf(
+      "# HALL MEAS out_hz=%.3f out_rpm=%.2f gear_meas=%.4f design=%.4f err%%=%.2f "
+      "(需≥2次下扑沿)\n",
+      (double)(isnan(out_hz_meas) ? -1.0f : out_hz_meas),
+      (double)(isnan(out_rpm_meas) ? -1.0f : out_rpm_meas),
+      (double)(isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas),
+      (double)GEAR_RATIO,
+      (double)(isnan(err) ? -999.0f : err));
 }
 
 // ---------------- ESC PWM / DShot ----------------
@@ -1853,6 +2019,33 @@ void handleCommandLine(char* line) {
                   profileName(), activeMap().valid, activeMap().n);
     return;
   }
+  if (strcasecmp(line, "HALL?") == 0 || strcasecmp(line, "HALL") == 0) {
+    hallPrintStatus();
+    return;
+  }
+  if (strcasecmp(line, "HALL CAL") == 0) {
+    hallCalibrateNow();
+    hostPrintf("# ACK HALL CAL disc0 at motor_unwrap=%.3f gear=%.4f\n",
+               (double)flap_zero_motor_unwrap, (double)GEAR_RATIO);
+    return;
+  }
+  if (strncasecmp(line, "HALL ACTIVE", 11) == 0) {
+    char* p = line + 11;
+    while (*p == ' ' || *p == '=' || *p == ':') ++p;
+    if (strcasecmp(p, "LOW") == 0) {
+      hall_active_low = true;
+      hostPrintln("# ACK HALL ACTIVE LOW");
+      return;
+    }
+    if (strcasecmp(p, "HIGH") == 0) {
+      hall_active_low = false;
+      hostPrintln("# ACK HALL ACTIVE HIGH");
+      return;
+    }
+    hostPrintln("# ERR HALL ACTIVE LOW|HIGH");
+    return;
+  }
+
   if (strcasecmp(line, "PHASE ZERO") == 0 || strcasecmp(line, "PHASE0") == 0) {
     if (isnan(last_deg)) {
       hostPrintln("# ERR no angle yet");
@@ -2265,6 +2458,8 @@ void pollSerialCommands() {
 void setup() {
   setupEscPwmMinFirst();
 
+  hallSetup();
+
   pinMode(PIN_CS, OUTPUT);
   digitalWrite(PIN_CS, HIGH);
 
@@ -2289,10 +2484,12 @@ void setup() {
                 (unsigned long)SERIAL_BAUD, (unsigned long)esc_pwm_hz, PIN_ESC_PWM);
   hostPrintf("# BLE name=%s NUS rate_default=%uHz lite=1 (cmds: BLE? BLE RATE BLE LITE)\n",
              BLE_DEVICE_NAME, (unsigned)BLE_TELEM_HZ_DEFAULT);
-  hostPrintln("# format: t_ms,raw,deg(rel),rad,rpm,ef,agc,magL,magH,pulse_us,target_rpm,mode,kp,ki,kd,profile,run");
-  hostPrintln("# BLE lite: B,t_ms,rpm,pulse,target,mode,run");
-  hostPrintln("# cmds: START STOP ESTOP RPM PHASE MOVE STOPAT GOTO LEARN MEASURE GAIN ...");
+  hostPrintln("# format: t_ms,raw,deg(rel),rad,rpm,...,run,hall_dn,hall_up,disc_est,hd_mdeg,hu_mdeg,out_hz_meas,gear_meas");
+  hostPrintln("# BLE lite: B,t_ms,motor_rpm,pulse,target,mode,run,out_hz_meas,gear_meas");
+  hostPrintln("# MEAS: out_hz from HALL DOWN period; gear_meas=motor_revs/disc_rev; design=(59*79)/(12*14)");
+  hostPrintln("# cmds: START STOP ESTOP RPM PHASE MOVE STOPAT GOTO LEARN MEASURE GAIN HALL ...");
   hostPrintln("# PHASE: ZERO; MOVE CW/CCW auto→uni path; SENSE AUTO detect ESC dir");
+  hostPrintln("# HALL: GPIO4=下扑0° GPIO5=上举~180°; HALL? HALL CAL HALL ACTIVE LOW|HIGH");
   hostPrintln("# LEARN START=step, LEARN RAMP=slope; GAIN ON|OFF|?|SAVE; KA <us/(rpm/s)>|KA?");
   hostPrintf("# GAIN schedule=%s points=%d valid=%d\n",
                 gain_schedule_on ? "ON" : "OFF", activeGainMap().n, activeGainMap().valid ? 1 : 0);
@@ -2300,6 +2497,11 @@ void setup() {
                 (double)phase_zero_deg, esc_sense, (double)target_rpm_max);
   hostPrintf("# ENC AS5047P cpr=%u deg/count=%.6f | rpm=(dcount/cpr)/dt*60\n",
                 (unsigned)ENC_CPR, (double)ENC_DEG_PER_COUNT);
+  hostPrintf("# HALL pins dn=%d up=%d gear=(%g*%g)/(%g*%g)=%.6f (=4661/168) active=LOW\n",
+                PIN_HALL_DOWN, PIN_HALL_UP,
+                (double)GEAR_TEETH_WHEEL1, (double)GEAR_TEETH_WHEEL2,
+                (double)GEAR_TEETH_PINION1, (double)GEAR_TEETH_PINION2,
+                (double)GEAR_RATIO);
   hostPrintln("# cmds: START STOP ESTOP RPM ... PROTO PWM|DSHOT DSHOTRATE DSHOT PWM FREQ");
   hostPrintf("# ESC min=%uus armed low | profile=%s | proto=PWM\n",
                 (unsigned)ESC_PULSE_MIN_US, profileName());
@@ -2332,16 +2534,25 @@ void loop() {
   }
   last_deg = abs_deg;
   last_ms = now;
+  motor_unwrapped_deg += ddeg;
 
   phaseTick(abs_deg, ddeg);
+  hallPoll(now, deg, abs_deg, s.raw);
   controlTick(rpm_mag, dt);  // 闭环用转速大小（≥0）
 
   int mode_i = (int)ctrl_mode;
   int run_i = (int)run_state;
   int prof_i = (int)profile_id;
+  float disc_est = discEstFromMotor();
+  float hd_m = isnan(last_hd_motor_rel) ? -1.0f : last_hd_motor_rel;
+  float hu_m = isnan(last_hu_motor_rel) ? -1.0f : last_hu_motor_rel;
+  float disc_out = isnan(disc_est) ? -1.0f : disc_est;
+  float oh = isnan(out_hz_meas) ? -1.0f : out_hz_meas;
+  float gm = isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas;
 
   // USB：全速完整遥测；BLE：限速瘦身（hostPrintf 对数字开头行不转发 BLE）
-  hostPrintf("%lu,%u,%.3f,%.6f,%.2f,%u,%u,%u,%u,%u,%.1f,%d,%.4f,%.4f,%.4f,%d,%d\n",
+  // 末尾: hall_dn,hall_up,disc_est,hd_mdeg,hu_mdeg,out_hz_meas,gear_meas
+  hostPrintf("%lu,%u,%.3f,%.6f,%.2f,%u,%u,%u,%u,%u,%.1f,%d,%.4f,%.4f,%.4f,%d,%d,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 (unsigned long)now,
                 (unsigned)s.raw,
                 deg,
@@ -2358,7 +2569,14 @@ void loop() {
                 (double)ki,
                 (double)kd,
                 prof_i,
-                run_i);
-  bleEmitTelemLite(now, rpm_signed_stable, esc_pulse_us, target_ramped, mode_i, run_i);
+                run_i,
+                (unsigned)hall_dn_lvl,
+                (unsigned)hall_up_lvl,
+                (double)disc_out,
+                (double)hd_m,
+                (double)hu_m,
+                (double)oh,
+                (double)gm);
+  bleEmitTelemLite(now, rpm_signed_stable, esc_pulse_us, target_ramped, mode_i, run_i, oh, gm);
   (void)prof_i;
 }

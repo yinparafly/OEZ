@@ -76,7 +76,7 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="当前转速"
+                android:text="电机实测转速"
                 android:textColor="@color/muted"
                 android:textSize="14sp" />
 
@@ -106,6 +106,17 @@
                 android:text="目标 —"
                 android:textColor="@color/muted"
                 android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/outFreqText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:gravity="center"
+                android:text="输出(霍尔实测): —\n设计 i=(59×79)/(12×14)≈27.744"
+                android:textColor="@color/accent_bright"
+                android:textSize="15sp"
+                android:textStyle="bold" />
         </LinearLayout>
 
         <TextView
