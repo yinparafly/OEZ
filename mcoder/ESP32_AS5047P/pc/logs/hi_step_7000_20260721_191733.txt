@@ -1,0 +1,43 @@
+=== 高速阶梯 第一档 7000RPM  2026-07-21T19:17:33 ===
+port=COM10 target=7000 rpmmax=12000 soft_up=900 soft_down=700
+hold=32s settle>=11s keepalive=0.5s gear=27.744
+FF csv=E:\OEZCON\mcoder\ESP32_AS5047P\pc\logs\learn_relearn_20260721_181947.csv points=29 ff_max=6259.2RPM@1448us ff_pulse@7000=1448.0 ff_pulse@7500(clamped)=1448.0
+注意: 前馈图最高仅 6259RPM，7000/7500 超出学习范围（PID 积分补偿），ff_pulse 为末点钳位值
+--- idle ENC? (电机停) ---
+[IDLE] enc_sample_hz=2000.0 cpu%=2.53 loop_hz=96496.0
+CMD STOP -> ['# ACK STOP soft=0 pulse=1000']
+CMD MODE CLOSED -> ['# ACK MODE CLOSED']
+CMD SOFT ON -> ['# ACK SOFT ON']
+CMD SOFT RATE UP 900 -> ['# ACK SOFT RATE UP=900.0']
+CMD SOFT RATE DOWN 700 -> ['# ACK SOFT RATE DOWN=700.0']
+CMD RPMMAX 12000 -> ['# ACK RPMMAX=12000 (learn stops ~11760, overspeed=13200)']
+CMD START -> ['# ACK START target=0.0 mode=CLOSED']
+
+=== 平滑升到 7000 并稳定保持 ===
+[t= 0.0s] enc_sample_hz=2000.0 cpu%=2.66 pulse=1072 enc_rpm~0
+[t= 3.1s] enc_sample_hz=2000.0 cpu%=2.9 pulse=1208 enc_rpm~2815
+[t= 6.1s] enc_sample_hz=2000.0 cpu%=2.89 pulse=1397 enc_rpm~5624
+[t= 9.2s] enc_sample_hz=2000.0 cpu%=2.8 pulse=1487 enc_rpm~6844
+[t=12.2s] enc_sample_hz=2000.0 cpu%=2.75 pulse=1496 enc_rpm~6974
+[t=15.3s] enc_sample_hz=2000.0 cpu%=2.87 pulse=1497 enc_rpm~6987
+[t=18.3s] enc_sample_hz=2000.0 cpu%=2.76 pulse=1497 enc_rpm~6996
+[t=21.4s] enc_sample_hz=2000.0 cpu%=2.78 pulse=1497 enc_rpm~6999
+[t=24.4s] enc_sample_hz=2000.0 cpu%=2.8 pulse=1497 enc_rpm~7003
+[t=27.5s] enc_sample_hz=2000.0 cpu%=2.77 pulse=1496 enc_rpm~7011
+[t=30.6s] enc_sample_hz=2000.0 cpu%=2.77 pulse=1496 enc_rpm~7014
+
+--- 平滑降速 & 停车 ---
+
+===== SUMMARY (第一档 7000RPM) =====
+aborted=None
+idle enc_sample_hz=2000.0 cpu%=2.53 loop_hz=96496.0
+稳态样本 n=4846 窗口=[11,32]s (~21s)
+编码器 enc_rpm: mean=6997.1 std=16.6 min=6758 max=7155 spread=398 peak=7155 overshoot=2.22%
+静差 static_err=-2.9 (-0.04%)  达到7000并稳定=是
+pulse: mean=1496.4 max=1503 饱和(->2000)=否 距2000余量≈504us
+PID 输出 u=pulse-ff: ff_pulse@7000=1448.0 -> u=48.38505984316953  (前馈末点=6259.2RPM@1448us, 7000 超出前馈图)
+enc_sample_hz(运行中)≈2000Hz
+霍尔交叉: out_hz≈4.2519 -> hall_rpm=out_hz*27.744*60=7078 vs enc_mean=6997 误差=1.16%
+HALL MEAS: # HALL MEAS out_hz=4.237288 out_rpm=254.2373 gear_meas=27.526978 design=27.744048 err_ppm=-7824 src=0deg dn_hz=4.237288 dn_i=27.526978 up_hz=4.237288 up_i=27.522278  (out_rpm=254.24)
+
+余量判断(是否可继续 7500): pulse 距 2000 约 504us; 前馈图覆盖7500=否(末点6259 RPM)

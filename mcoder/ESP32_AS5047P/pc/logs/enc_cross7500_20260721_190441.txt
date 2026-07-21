@@ -1,0 +1,26 @@
+=== cross-7500 verify 2026-07-21T19:04:41 stages=[6000, 8000] ===
+CMD STOP -> ['# ACK STOP soft=0 pulse=1000']
+CMD MODE CLOSED -> ['# ACK MODE CLOSED']
+CMD SOFT ON -> ['# ACK SOFT ON']
+CMD SOFT RATE UP 900 -> ['# ACK SOFT RATE UP=900.0']
+CMD SOFT RATE DOWN 700 -> ['# ACK SOFT RATE DOWN=700.0']
+CMD RPMMAX 9000 -> ['# ACK RPMMAX=9000 (learn stops ~8820, overspeed=9900)']
+CMD START -> ['# ACK START target=0.0 mode=CLOSED']
+
+=== STAGE 6000 ===
+[t= 0.0s] enc_hz=2000.0 cpu%=2.67 enc_rpm=60000.0
+[t= 3.1s] enc_hz=2000.0 cpu%=2.91 enc_rpm=60000.0
+[t= 6.2s] enc_hz=2000.0 cpu%=2.95 enc_rpm=60000.0
+[t= 9.3s] enc_hz=2000.0 cpu%=2.8 enc_rpm=60000.0
+[STAGE 6000] enc_mean=5831 min=4638 max=6012 spread=1374 out_hz=3.623 hall_rpm=6031
+
+=== STAGE 8000 ===
+[t= 0.0s] enc_hz=2000.0 cpu%=2.81 enc_rpm=60000.0
+[t= 3.1s] enc_hz=2000.0 cpu%=2.76 enc_rpm=60000.0
+[t= 6.2s] enc_hz=2000.0 cpu%=2.82 enc_rpm=60000.0
+[t= 9.3s] enc_hz=2000.0 cpu%=2.74 enc_rpm=60000.0
+[STAGE 8000] enc_mean=7277 min=6960 max=7471 spread=511 out_hz=4.386 hall_rpm=7301
+
+===== SUMMARY (cross 7500) =====
+  RPM6000: enc_mean=5831 spread=1374 hall_rpm=6031 err=3.4% 
+  RPM8000: enc_mean=7277 spread=511 hall_rpm=7301 err=0.3% 

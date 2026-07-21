@@ -1,0 +1,86 @@
+=== ENC high-rate verify 2026-07-21T19:02:49 ===
+port=COM10 stages=[2000, 4000, 6000] hold=14.0s keepalive=0.5s gear=27.744
+BANNER # ENC AS5047P cpr=16384 deg/count=0.021973 | rpm=(dcount/cpr)/dt*60
+--- idle ENC? (电机停) ---
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.54 loop_hz=100928 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=1 raw=15279 rpm=0.2 ef=0 agc=47 seq=3982
+[IDLE] enc_sample_hz=2000.0 cpu%=2.54 loop_hz=100928.0
+CMD STOP -> ['# ACK STOP soft=0 pulse=1000']
+CMD MODE CLOSED -> ['# ACK MODE CLOSED']
+CMD SOFT ON -> ['# ACK SOFT ON']
+CMD SOFT RATE UP 800 -> ['# ACK SOFT RATE UP=800.0']
+CMD SOFT RATE DOWN 600 -> ['# ACK SOFT RATE DOWN=600.0']
+CMD RPMMAX 6000 -> ['# ACK RPMMAX=6000 (learn stops ~5880, overspeed=6600)']
+CMD START -> ['# ACK START target=0.0 mode=CLOSED']
+
+=== STAGE RPM 2000 ===
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.79 loop_hz=84654 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=2 raw=15280 rpm=0.9 ef=0 agc=47 seq=14087
+[t= 0.0s] enc_hz=2000.0 cpu%=2.79 loop_hz=84654.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.94 loop_hz=67426 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=1152299 raw=4313 rpm=2025.7 ef=1 agc=47 seq=20328
+[t= 3.1s] enc_hz=2000.0 cpu%=2.94 loop_hz=67426.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.99 loop_hz=68252 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=2879941 raw=11635 rpm=1983.9 ef=1 agc=47 seq=26639
+[t= 6.3s] enc_hz=2000.0 cpu%=2.99 loop_hz=68252.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.90 loop_hz=68544 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=4612845 raw=7835 rpm=2025.8 ef=1 agc=47 seq=32984
+[t= 9.4s] enc_hz=2000.0 cpu%=2.9 loop_hz=68544.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.92 loop_hz=68504 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=6331974 raw=6644 rpm=2011.9 ef=1 agc=47 seq=39279
+[t=12.6s] enc_hz=2000.0 cpu%=2.92 loop_hz=68504.0
+   # HALL DOWN t_ms=21754 motor_rel=343.191 raw=15619 out_hz=1.184834 gear_meas=27.696472 design=27.744048 src=0deg count=17 irq_us=21751647
+   # HALL DOWN t_ms=21802 motor_rel=330.425 raw=15038 out_hz=1.184834 gear_meas=27.696472 design=27.744048 src=0deg count=18 irq_us=21799393
+[STAGE 2000] enc_rpm mean=2001 min=1934 max=2054 spread=119 enc_sample_hz~2000 out_hz=1.202 hall_rpm(out*gear*60)=2001 HALL_MEAS out_rpm=None
+
+=== STAGE RPM 4000 ===
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.59 loop_hz=72122 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=7231282 raw=4832 rpm=-0.2 ef=1 agc=47 seq=45414
+[t= 0.0s] enc_hz=2000.0 cpu%=2.59 loop_hz=72122.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.55 loop_hz=70226 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=8370439 raw=13493 rpm=2671.2 ef=1 agc=47 seq=51623
+[t= 3.1s] enc_hz=2000.0 cpu%=2.55 loop_hz=70226.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.57 loop_hz=69760 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=11553672 raw=1846 rpm=4066.4 ef=1 agc=47 seq=57959
+[t= 6.3s] enc_hz=2000.0 cpu%=2.57 loop_hz=69760.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.55 loop_hz=69878 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=14904452 raw=10290 rpm=4027.1 ef=1 agc=47 seq=64014
+[t= 9.3s] enc_hz=2000.0 cpu%=2.55 loop_hz=69878.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.54 loop_hz=70332 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=18277584 raw=8318 rpm=4082.6 ef=1 agc=47 seq=70110
+[t=12.3s] enc_hz=2000.0 cpu%=2.54 loop_hz=70332.0
+   # HALL UP t_ms=37266 motor_rel=201.357 raw=9164 out_hz=2.450980 gear_meas=27.582275 design=27.744048 src=180deg count=53 irq_us=37264328
+   # HALL DOWN t_ms=37474 motor_rel=221.484 raw=10080 out_hz=2.427184 gear_meas=27.839722 design=27.744048 src=0deg count=51 irq_us=37471372
+   # HALL UP t_ms=37678 motor_rel=149.546 raw=6806 out_hz=2.427184 gear_meas=27.856079 design=27.744048 src=180deg count=54 irq_us=37674683
+   # HALL DOWN t_ms=37882 motor_rel=75.059 raw=3416 out_hz=2.450980 gear_meas=27.593262 design=27.744048 src=0deg count=52 irq_us=37881968
+   # HALL DOWN t_ms=37898 motor_rel=105.183 raw=4787 out_hz=2.450980 gear_meas=27.593262 design=27.744048 src=0deg count=53 irq_us=37896943
+   # HALL UP t_ms=38086 motor_rel=1.055 raw=48 out_hz=2.450980 gear_meas=27.587524 design=27.744048 src=180deg count=55 irq_us=38084919
+   # HALL DOWN t_ms=38294 motor_rel=23.665 raw=1077 out_hz=2.525253 gear_meas=26.773560 design=27.744048 src=0deg count=54 irq_us=38292190
+   # HALL UP t_ms=38498 motor_rel=307.266 raw=13984 out_hz=2.427184 gear_meas=27.850586 design=27.744048 src=180deg count=56 irq_us=38495418
+   # HALL DOWN t_ms=38702 motor_rel=267.671 raw=12182 out_hz=2.450980 gear_meas=27.677795 design=27.744048 src=0deg count=55 irq_us=38701025
+   # HALL DOWN t_ms=38718 motor_rel=300.894 raw=13694 out_hz=2.450980 gear_meas=27.677795 design=27.744048 src=0deg count=56 irq_us=38715831
+[STAGE 4000] enc_rpm mean=4054 min=4000 max=4112 spread=112 enc_sample_hz~2000 out_hz=2.451 hall_rpm(out*gear*60)=4080 HALL_MEAS out_rpm=None
+
+=== STAGE RPM 6000 ===
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.57 loop_hz=70140 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=22026539 raw=5337 rpm=4287.4 ef=1 agc=47 seq=76862
+[t= 0.0s] enc_hz=2000.0 cpu%=2.57 loop_hz=70140.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.62 loop_hz=67890 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=26470755 raw=9489 rpm=6002.9 ef=1 agc=47 seq=82943
+[t= 3.0s] enc_hz=2000.0 cpu%=2.62 loop_hz=67890.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.60 loop_hz=67880 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=31411269 raw=2035 rpm=6057.2 ef=1 agc=47 seq=88975
+[t= 6.1s] enc_hz=2000.0 cpu%=2.6 loop_hz=67880.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.58 loop_hz=68802 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=36521293 raw=251 rpm=6055.0 ef=1 agc=47 seq=95162
+[t= 9.1s] enc_hz=2000.0 cpu%=2.58 loop_hz=68802.0
+   # ENC target_hz=2000 meas_hz=2000.0 cpu%=2.58 loop_hz=68894 window=8 spi_hz=8000000 nyquist_rpm=60000 counts=41533149 raw=14987 rpm=6029.3 ef=1 agc=47 seq=101234
+[t=12.2s] enc_hz=2000.0 cpu%=2.58 loop_hz=68894.0
+   # HALL UP t_ms=53059 motor_rel=338.840 raw=15421 out_hz=3.623188 gear_meas=27.797241 design=27.744048 src=180deg count=119 irq_us=53055580
+   # HALL UP t_ms=53067 motor_rel=267.847 raw=12190 out_hz=3.623188 gear_meas=27.797241 design=27.744048 src=180deg count=120 irq_us=53064410
+   # HALL DOWN t_ms=53195 motor_rel=228.516 raw=10400 out_hz=3.676471 gear_meas=27.388184 design=27.744048 src=0deg count=121 irq_us=53194850
+   # HALL UP t_ms=53335 motor_rel=265.452 raw=12081 out_hz=3.731343 gear_meas=26.993347 design=27.744048 src=180deg count=121 irq_us=53331286
+   # HALL UP t_ms=53343 motor_rel=195.073 raw=8878 out_hz=3.731343 gear_meas=26.993347 design=27.744048 src=180deg count=122 irq_us=53339808
+   # HALL DOWN t_ms=53471 motor_rel=152.952 raw=6961 out_hz=3.623188 gear_meas=27.790100 design=27.744048 src=0deg count=122 irq_us=53470342
+   # HALL UP t_ms=53611 motor_rel=180.703 raw=8224 out_hz=3.731343 gear_meas=26.960083 design=27.744048 src=180deg count=123 irq_us=53607093
+   # HALL DOWN t_ms=53747 motor_rel=70.181 raw=3194 out_hz=3.623188 gear_meas=27.770081 design=27.744048 src=0deg count=123 irq_us=53745996
+   # HALL UP t_ms=53883 motor_rel=316.033 raw=14383 out_hz=3.676471 gear_meas=27.375916 design=27.744048 src=180deg count=124 irq_us=53882765
+   # HALL UP t_ms=53895 motor_rel=29.465 raw=1341 out_hz=3.676471 gear_meas=27.375916 design=27.744048 src=180deg count=125 irq_us=53891241
+   # HALL DOWN t_ms=54023 motor_rel=348.464 raw=15859 out_hz=3.623188 gear_meas=27.773010 design=27.744048 src=0deg count=124 irq_us=54021937
+   # HALL UP t_ms=54159 motor_rel=232.998 raw=10604 out_hz=3.787879 gear_meas=26.565369 design=27.744048 src=180deg count=126 irq_us=54158472
+   # HALL DOWN t_ms=54299 motor_rel=267.627 raw=12180 out_hz=3.623188 gear_meas=27.775452 design=27.744048 src=0deg count=125 irq_us=54297495
+[STAGE 6000] enc_rpm mean=6037 min=5968 max=6072 spread=105 enc_sample_hz~2000 out_hz=3.623 hall_rpm(out*gear*60)=6031 HALL_MEAS out_rpm=None
+
+--- ramp down & stop ---
+
+===== SUMMARY =====
+idle enc_sample_hz=2000.0 cpu%=2.54 loop_hz=100928.0
+  RPM2000: enc_mean=2001 spread=119 enc_hz~2000 hall_rpm=2001 hall_err=0.0% stable
+  RPM4000: enc_mean=4054 spread=112 enc_hz~2000 hall_rpm=4080 hall_err=0.6% stable
+  RPM6000: enc_mean=6037 spread=105 enc_hz~2000 hall_rpm=6031 hall_err=0.1% stable
+结论: enc_sample_hz≈2000Hz(target 2000); 折叠=否

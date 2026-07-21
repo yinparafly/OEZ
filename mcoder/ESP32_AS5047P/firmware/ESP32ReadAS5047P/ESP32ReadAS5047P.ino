@@ -37,6 +37,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "driver/gpio.h"
+#include "esp_timer.h"
 #include "esc_dshot.h"
 #include "ble_host.h"
 // ---- 引脚 ----
@@ -60,10 +62,38 @@ static const float GEAR_RATIO =
 
 // ---- 时序 ----
 static const uint32_t SERIAL_BAUD = 921600;
-// 100Hz 时角度差分 (±180°/样本) 理论测速上限≈3000RPM；6000 目标需 >200Hz
+// 控制环仍 250Hz；编码器角度采样/测速已解耦到 ENC_SAMPLE_HZ（esp_timer，见下），
+// 差分解缠在高频侧完成，Nyquist 由采样率决定：@2kHz ≈0.5rev/样本 → 60000RPM，远够 12000。
 static const uint32_t CTRL_HZ = 250;
 static const uint32_t CTRL_MS = 1000 / CTRL_HZ;
 static const uint32_t HOST_TIMEOUT_MS = 1500;
+
+// ---- 高频编码器采样（与控制环解耦）----
+// esp_timer 周期回调（运行于 esp_timer 任务上下文，非 ISR，可安全同步 SPI 读）。
+// 每拍读 ANGLECOM，整型差分解缠累加到 g_enc.counts；测速用累加计数做窗口差分
+// （累加已解缠，窗口差分不再受 Nyquist 折叠限制），滤波后喂 250Hz 控制环/遥测。
+static const uint32_t ENC_SAMPLE_HZ = 2000;                       // 目标采样率（1–2kHz）
+static const uint32_t ENC_SAMPLE_PERIOD_US = 1000000UL / ENC_SAMPLE_HZ;
+static const uint32_t ENC_SPI_HZ = 8000000;                       // AS5047P 支持到 10MHz
+static const int      ENC_HIST = 16;                              // counts 历史环形长度
+static const int      ENC_VEL_WINDOW = 8;                         // 测速窗口样本数(@2kHz=4ms)
+static const uint32_t ENC_DIAG_DIV = 100;                         // 每 N 采样读一次 DIAAGC
+static const uint32_t ENC_SIGN_FLIP_SAMPLES = ENC_SAMPLE_HZ / 12; // 反向持续 ~83ms 才翻符号
+
+// 共享快照结构：采样回调写、loop 读，portMUX 保护（提前声明，规避 .ino 原型顺序问题）。
+struct EncShared {
+  int64_t counts;      // 解缠累加编码器计数（Nyquist 由 ENC_SAMPLE_HZ 决定）
+  uint16_t raw;        // 最新 raw 角度
+  bool ef;             // ANGLECOM 错误标志位
+  uint8_t agc;
+  bool mag_low;
+  bool mag_high;
+  float rpm_signed;    // 滤波+符号锁定后的带符号 rpm
+  uint32_t t_us;       // 最新采样时间戳
+  uint32_t seq;        // 采样序号（用于测实际采样率）
+  uint32_t busy_acc;   // 采样耗时累计(µs)
+  uint32_t busy_cnt;   // 对应样本数
+};
 
 // ---- 电调 PWM（默认 50Hz，可用 FREQ 改到 600；高刷新时脉宽不得超过周期）----
 static const uint32_t ESC_PWM_HZ_DEFAULT = 50;
@@ -71,9 +101,11 @@ static const uint32_t ESC_PWM_HZ_MAX = 600;
 static const uint16_t ESC_PULSE_MIN_US = 1000;
 static const uint16_t ESC_PULSE_MAX_US = 2000;
 static const uint8_t  ESC_PWM_RES_BITS = 14;
-// 电机允许最大转速（对应 6S）；目标/超速/学习截止均按此约束。当前 3S 调试达不到 6000，属预期。
-static const float    MOTOR_RPM_ABS_MAX = 6000.0f;
-static const float    TARGET_RPM_MAX_DEFAULT = 6000.0f;
+// 电机允许最大转速：放开到 12000（目标/超速/学习截止均按 target_rpm_max 比例，不写死）。
+// 注意：CTRL_HZ=250 时角度差分 Nyquist ≈0.5rev/样本 → 测速上限≈7500RPM；超过会折叠，
+// 需 >400Hz 才能可靠测 12000。高速段以此为准，测到折叠即为编码器采样极限。
+static const float    MOTOR_RPM_ABS_MAX = 12000.0f;
+static const float    TARGET_RPM_MAX_DEFAULT = 12000.0f;
 
 enum EscProto : uint8_t { ESC_PROTO_PWM = 0, ESC_PROTO_DSHOT = 1 };
 EscProto esc_proto = ESC_PROTO_PWM;
@@ -232,13 +264,32 @@ uint32_t last_host_ms = 0;
 bool host_seen = false;
 
 // ---- 扑翼霍尔 / 输出盘相位（相对电机编码器反算）----
-bool hall_active_low = true;       // 厂商 51 样例：if(DO==0) 触发；可用 HALL ACTIVE 改
-uint8_t hall_dn_lvl = 1;           // 原始读数 0/1
+// GPIO4/5：ESP32-S3 DevKit 丝印 IO4/IO5 = Arduino GPIO4/5；非 USB(19/20)/UART0(43/44)/strapping
+volatile bool hall_active_low = true;  // 厂商 51 样例：if(DO==0) 触发；可用 HALL ACTIVE 改
+uint8_t hall_dn_lvl = 1;               // 原始读数 0/1（遥测用，主循环读）
 uint8_t hall_up_lvl = 1;
-uint8_t hall_dn_prev = 1;
+uint8_t hall_dn_prev = 1;              // 主循环边沿备份（对照 ISR）
 uint8_t hall_up_prev = 1;
-uint32_t hall_dn_count = 0;
+uint32_t hall_dn_count = 0;            // 主循环消费后的累计触发次数
 uint32_t hall_up_count = 0;
+// ISR：IDF gpio_isr + ANYEDGE，软件判进入有效电平（避免 Arduino attachInterrupt 漏计）
+static const uint32_t HALL_IRQ_DEBOUNCE_US = 300;  // 同脚最短间隔，滤触点抖
+volatile uint32_t hall_dn_irq_cnt = 0;
+volatile uint32_t hall_up_irq_cnt = 0;
+volatile uint32_t hall_dn_irq_us = 0;  // 最近一次有效沿 micros()
+volatile uint32_t hall_up_irq_us = 0;
+static uint32_t hall_dn_irq_seen = 0;  // 主循环已处理到的 irq 计数
+static uint32_t hall_up_irq_seen = 0;
+volatile uint32_t hall_dn_irq_last_us = 0;
+volatile uint32_t hall_up_irq_last_us = 0;
+// 主循环 digitalRead 采样：转盘时应有低电平占比>0；poll_edge=软件边沿备份计数
+static uint32_t hall_dn_samp_n = 0;
+static uint32_t hall_dn_low_n = 0;
+static uint32_t hall_up_samp_n = 0;
+static uint32_t hall_up_low_n = 0;
+static uint32_t hall_dn_poll_edge = 0;
+static uint32_t hall_up_poll_edge = 0;
+static bool hall_gpio_isr_ok = false;
 float motor_unwrapped_deg = 0.0f;  // 累计电机角（°），用于盘相位
 bool flap_calibrated = false;      // 以下扑沿为盘 0°
 float flap_zero_motor_unwrap = 0.0f;
@@ -252,11 +303,35 @@ float last_hd_disc = NAN;          // 触发时盘相位估计（下扑应为≈
 float last_hu_disc = NAN;          // 上举触发时盘相位（期望≈180）
 uint32_t last_hd_ms = 0;
 uint32_t last_hu_ms = 0;
-float last_hd_motor_unwrap = NAN;  // 上次下扑沿时的电机展开角
-// 霍尔实测输出端频率 / 实测减速比（非设计比换算）
-float out_hz_meas = NAN;           // 两次下扑沿周期 → Hz
+float last_hd_motor_unwrap = NAN;  // 上次下扑(0°)沿电机展开角
+float last_hu_motor_unwrap = NAN;  // 上次上举(180°)沿电机展开角
+// 霍尔实测：同标记两次过点 = 输出盘 1 转
+float out_hz_meas = NAN;           // 最近一次同标记周期 → Hz
 float out_rpm_meas = NAN;          // = out_hz_meas * 60
-float gear_ratio_meas = NAN;       // 一盘转内电机转数 = |Δunwrap|/360
+float gear_ratio_meas = NAN;       // 一盘转内电机转数 ≈27.744
+float out_hz_meas_dn = NAN;        // 仅 0°→0°
+float out_hz_meas_up = NAN;        // 仅 180°→180°
+float gear_ratio_meas_dn = NAN;
+float gear_ratio_meas_up = NAN;
+uint8_t gear_meas_src = 0;         // 1=DOWN 2=UP
+
+// —— 定点（整型）减速比/频率：全程整数运算，避免浮点/打印截断误差 ——
+// AS5047P 每圈 16384 counts；设计比 (59*79)/(12*14)=4661/168=27.7440476190
+static const int64_t ENC_CPR_I = 16384;
+// round(4661/168 * 1e6) = round(27744047.619) = 27744048（=27.744048）
+static const int64_t GEAR_DESIGN_MICRO = 27744048;
+int64_t motor_unwrapped_counts = 0;   // 整型累计编码器计数（raw 差分 ±8192 环绕已处理）
+int last_raw_i = -1;                   // 上拍 raw（<0=未初始化）
+int64_t last_hd_motor_unwrap_counts = 0;
+int64_t last_hu_motor_unwrap_counts = 0;
+bool has_hd_counts = false;
+bool has_hu_counts = false;
+int64_t gear_micro_meas = -1;         // 最近一次同标记两过点：减速比 ×1e6
+int64_t out_hz_micro_meas = -1;       // 最近一次：盘频 Hz ×1e6
+int64_t gear_micro_dn = -1;           // 0°→0° 定点减速比 ×1e6
+int64_t gear_micro_up = -1;           // 180°→180° 定点减速比 ×1e6
+int64_t out_hz_micro_dn = -1;         // 0°→0° 定点盘频 ×1e6
+int64_t out_hz_micro_up = -1;         // 180°→180° 定点盘频 ×1e6
 
 // ---------------- SPI / 编码器 ----------------
 uint16_t evenParityBit(uint16_t value15) {
@@ -317,6 +392,173 @@ AngleSample readAngleCom() {
   s.mag_low = last_mag_low;
   s.mag_high = last_mag_high;
   return s;
+}
+
+// ================= 高频编码器采样（esp_timer 解耦）=================
+// EncShared 结构已在上方配置区声明。
+static portMUX_TYPE g_enc_mux = portMUX_INITIALIZER_UNLOCKED;
+static EncShared g_enc = {};
+static esp_timer_handle_t g_enc_timer = nullptr;
+static uint16_t g_cmd_angle = 0;
+static uint16_t g_cmd_dia = 0;
+
+// —— 回调私有状态（仅采样回调访问，无需加锁）——
+static int      enc_cb_last_raw = -1;
+static int64_t  enc_cb_counts = 0;
+static int64_t  enc_hist_counts[ENC_HIST] = {0};
+static uint32_t enc_hist_us[ENC_HIST] = {0};
+static int      enc_hist_head = 0;
+static int      enc_hist_fill = 0;
+static float    enc_cb_rpm_filt = 0.0f;
+static float    enc_cb_rpm_stable = 0.0f;
+static int      enc_cb_sign_lock = 0;
+static uint32_t enc_cb_flip_cnt = 0;
+static uint16_t enc_cb_diag_div = 0;
+static uint8_t  enc_cb_agc = 0;
+static bool     enc_cb_mag_low = false;
+static bool     enc_cb_mag_high = false;
+
+// —— 供命令/遥测读取的实测统计（loop 侧写）——
+float    enc_sample_hz_meas = 0.0f;  // 实测采样率
+float    enc_cpu_pct = 0.0f;         // 采样任务 CPU 占用估计(%)
+float    enc_loop_hz = 0.0f;         // 主循环空转频率（越高越空闲）
+
+static inline void encReadDiagInline() {
+  spiFrame(g_cmd_dia);
+  uint16_t d = spiFrame(g_cmd_angle);
+  if (checkEvenParity(d)) {
+    enc_cb_agc = d & 0xFF;
+    enc_cb_mag_high = (d >> 10) & 1;
+    enc_cb_mag_low = (d >> 11) & 1;
+  }
+}
+
+// esp_timer 周期回调（ESP_TIMER_TASK 分发，任务上下文，可安全同步 SPI）
+static void encSampleCb(void* /*arg*/) {
+  uint32_t t0 = micros();
+
+  if (++enc_cb_diag_div >= ENC_DIAG_DIV) {
+    enc_cb_diag_div = 0;
+    encReadDiagInline();
+  }
+  uint16_t rx = spiFrame(g_cmd_angle);
+  bool ef = (rx >> 14) & 1;
+  uint16_t raw = rx & 0x3FFF;
+  uint32_t now = t0;
+
+  // 整型差分解缠（±8192 环绕）累加到 counts
+  if (enc_cb_last_raw >= 0) {
+    int draw = (int)raw - enc_cb_last_raw;
+    if (draw > 8192) draw -= 16384;
+    else if (draw < -8192) draw += 16384;
+    enc_cb_counts += draw;
+  }
+  enc_cb_last_raw = (int)raw;
+
+  // 写历史环
+  int cur = enc_hist_head;
+  enc_hist_counts[cur] = enc_cb_counts;
+  enc_hist_us[cur] = now;
+  enc_hist_head = (enc_hist_head + 1) % ENC_HIST;
+  if (enc_hist_fill < ENC_HIST) enc_hist_fill++;
+
+  // 测速：用已解缠累加计数做窗口差分（不受 Nyquist 折叠限制）
+  float rpm_inst = enc_cb_rpm_filt;
+  int w = ENC_VEL_WINDOW;
+  if (w > enc_hist_fill - 1) w = enc_hist_fill - 1;
+  if (w >= 1) {
+    int idx = (cur - w + ENC_HIST) % ENC_HIST;
+    int64_t dc = enc_cb_counts - enc_hist_counts[idx];
+    uint32_t dt_us = now - enc_hist_us[idx];
+    if (dt_us > 0) {
+      rpm_inst = (float)dc * 60000000.0f / ((float)ENC_CPR_I * (float)dt_us);
+    }
+  }
+
+  // 拒绝明显不可能的尖峰
+  float lim = target_rpm_max * 1.5f + 500.0f;
+  if (fabsf(rpm_inst) > lim) rpm_inst = enc_cb_rpm_filt;
+  // 窗口本身已平滑，EMA 取轻（0.9/0.1）
+  enc_cb_rpm_filt = 0.90f * enc_cb_rpm_filt + 0.10f * rpm_inst;
+
+  // 符号锁定：单向高速时避免噪声造成 ±RPM 乱跳
+  float mag = fabsf(enc_cb_rpm_filt);
+  int sgn = (enc_cb_rpm_filt > 0.0f) ? 1 : ((enc_cb_rpm_filt < 0.0f) ? -1 : 0);
+  if (mag < 80.0f) {
+    enc_cb_sign_lock = 0;
+    enc_cb_flip_cnt = 0;
+    enc_cb_rpm_stable = enc_cb_rpm_filt;
+  } else {
+    if (enc_cb_sign_lock == 0) {
+      if (sgn != 0) enc_cb_sign_lock = sgn;
+    } else if (sgn != 0 && sgn != enc_cb_sign_lock) {
+      if (++enc_cb_flip_cnt >= ENC_SIGN_FLIP_SAMPLES) {
+        enc_cb_sign_lock = sgn;
+        enc_cb_flip_cnt = 0;
+      }
+    } else {
+      enc_cb_flip_cnt = 0;
+    }
+    int use = (enc_cb_sign_lock != 0) ? enc_cb_sign_lock : sgn;
+    if (use == 0) use = 1;
+    enc_cb_rpm_stable = (float)use * mag;
+  }
+
+  uint32_t busy = micros() - t0;
+  portENTER_CRITICAL(&g_enc_mux);
+  g_enc.counts = enc_cb_counts;
+  g_enc.raw = raw;
+  g_enc.ef = ef;
+  g_enc.agc = enc_cb_agc;
+  g_enc.mag_low = enc_cb_mag_low;
+  g_enc.mag_high = enc_cb_mag_high;
+  g_enc.rpm_signed = enc_cb_rpm_stable;
+  g_enc.t_us = now;
+  g_enc.seq++;
+  g_enc.busy_acc += busy;
+  g_enc.busy_cnt++;
+  portEXIT_CRITICAL(&g_enc_mux);
+}
+
+// 读快照（loop 侧调用）
+static inline void encGetSnapshot(EncShared* out) {
+  portENTER_CRITICAL(&g_enc_mux);
+  *out = g_enc;
+  portEXIT_CRITICAL(&g_enc_mux);
+}
+
+// 取并清零采样耗时累计（供 CPU 估计）
+static inline void encTakeBusy(uint32_t* acc, uint32_t* cnt) {
+  portENTER_CRITICAL(&g_enc_mux);
+  *acc = g_enc.busy_acc;
+  *cnt = g_enc.busy_cnt;
+  g_enc.busy_acc = 0;
+  g_enc.busy_cnt = 0;
+  portEXIT_CRITICAL(&g_enc_mux);
+}
+
+// 启动高频采样（SPI 已在 setup 里 begin/beginTransaction）
+void encoderBegin() {
+  g_cmd_angle = buildReadCmd(REG_ANGLECOM);
+  g_cmd_dia = buildReadCmd(REG_DIAAGC);
+  // 预热：先发一次诊断+角度命令，使后续帧返回有效数据
+  encReadDiagInline();
+  spiFrame(g_cmd_angle);
+  enc_cb_last_raw = -1;
+  enc_cb_counts = 0;
+  enc_hist_head = 0;
+  enc_hist_fill = 0;
+
+  const esp_timer_create_args_t args = {
+      .callback = &encSampleCb,
+      .arg = nullptr,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "enc_sample",
+      .skip_unhandled_events = true,
+  };
+  if (esp_timer_create(&args, &g_enc_timer) == ESP_OK) {
+    esp_timer_start_periodic(g_enc_timer, ENC_SAMPLE_PERIOD_US);
+  }
 }
 
 float unwrapDeltaDeg(float cur, float prev) {
@@ -391,17 +633,73 @@ bool hallIsActive(uint8_t lvl) {
   return hall_active_low ? (lvl == 0) : (lvl == 1);
 }
 
-bool hallEdgeTrigger(uint8_t prev, uint8_t now) {
-  // 进入有效电平的边沿记一次事件
-  return !hallIsActive(prev) && hallIsActive(now);
+/** IDF GPIO ISR：ANYEDGE 后读电平，只计「进入有效电平」的一侧（=软件判下降/上升） */
+static void IRAM_ATTR hallDnIsr(void* /*arg*/) {
+  const int lvl = gpio_get_level((gpio_num_t)PIN_HALL_DOWN);
+  const bool hit = hall_active_low ? (lvl == 0) : (lvl == 1);
+  if (!hit) return;
+  uint32_t t = micros();
+  uint32_t last = hall_dn_irq_last_us;
+  if ((uint32_t)(t - last) < HALL_IRQ_DEBOUNCE_US) return;
+  hall_dn_irq_last_us = t;
+  hall_dn_irq_us = t;
+  hall_dn_irq_cnt++;
+}
+
+static void IRAM_ATTR hallUpIsr(void* /*arg*/) {
+  const int lvl = gpio_get_level((gpio_num_t)PIN_HALL_UP);
+  const bool hit = hall_active_low ? (lvl == 0) : (lvl == 1);
+  if (!hit) return;
+  uint32_t t = micros();
+  uint32_t last = hall_up_irq_last_us;
+  if ((uint32_t)(t - last) < HALL_IRQ_DEBOUNCE_US) return;
+  hall_up_irq_last_us = t;
+  hall_up_irq_us = t;
+  hall_up_irq_cnt++;
+}
+
+void hallAttachIrqs() {
+  // 不用 Arduino attachInterrupt：直接 gpio_config + gpio_isr_handler_add（ANYEDGE）
+  gpio_config_t io = {};
+  io.pin_bit_mask = (1ULL << PIN_HALL_DOWN) | (1ULL << PIN_HALL_UP);
+  io.mode = GPIO_MODE_INPUT;
+  // 去掉内部上拉：内部~45k 上拉到 3.3V 与外部高阻分压(100k/200k,戴维南≈67k)叠加，
+  // 会把 DO 拉低时的脚电压抬到≈2V(>VIL 0.8V)，导致永远读高。悬空电平交给外部分压决定。
+  io.pull_up_en = GPIO_PULLUP_DISABLE;
+  io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io.intr_type = GPIO_INTR_ANYEDGE;
+  esp_err_t cfg = gpio_config(&io);
+
+  static bool isr_service = false;
+  if (!isr_service) {
+    esp_err_t e = gpio_install_isr_service(0);
+    if (e == ESP_OK || e == ESP_ERR_INVALID_STATE) {
+      isr_service = true;
+    }
+  }
+
+  gpio_isr_handler_remove((gpio_num_t)PIN_HALL_DOWN);
+  gpio_isr_handler_remove((gpio_num_t)PIN_HALL_UP);
+  esp_err_t a0 = gpio_isr_handler_add((gpio_num_t)PIN_HALL_DOWN, hallDnIsr, nullptr);
+  esp_err_t a1 = gpio_isr_handler_add((gpio_num_t)PIN_HALL_UP, hallUpIsr, nullptr);
+  gpio_intr_enable((gpio_num_t)PIN_HALL_DOWN);
+  gpio_intr_enable((gpio_num_t)PIN_HALL_UP);
+  hall_gpio_isr_ok = isr_service && (cfg == ESP_OK) && (a0 == ESP_OK) && (a1 == ESP_OK);
 }
 
 void hallSetup() {
-  // DO 经分压后接入；低有效时空闲多为高，用上拉更稳（分压后高≤3.3V）
-  pinMode(PIN_HALL_DOWN, INPUT_PULLUP);
-  pinMode(PIN_HALL_UP, INPUT_PULLUP);
-  hall_dn_lvl = (uint8_t)digitalRead(PIN_HALL_DOWN);
-  hall_up_lvl = (uint8_t)digitalRead(PIN_HALL_UP);
+  hall_dn_irq_cnt = 0;
+  hall_up_irq_cnt = 0;
+  hall_dn_irq_seen = 0;
+  hall_up_irq_seen = 0;
+  hall_dn_samp_n = hall_dn_low_n = 0;
+  hall_up_samp_n = hall_up_low_n = 0;
+  hall_dn_poll_edge = hall_up_poll_edge = 0;
+  hall_dn_irq_last_us = micros();
+  hall_up_irq_last_us = hall_dn_irq_last_us;
+  hallAttachIrqs();
+  hall_dn_lvl = (uint8_t)gpio_get_level((gpio_num_t)PIN_HALL_DOWN);
+  hall_up_lvl = (uint8_t)gpio_get_level((gpio_num_t)PIN_HALL_UP);
   hall_dn_prev = hall_dn_lvl;
   hall_up_prev = hall_up_lvl;
 }
@@ -412,26 +710,83 @@ void hallCalibrateNow() {
   last_hd_disc = 0.0f;
 }
 
-void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
-  // 对齐厂商 51 样例：先读一次，短延时后再确认仍为触发电平（消抖）
-  uint8_t dn0 = (uint8_t)digitalRead(PIN_HALL_DOWN);
-  uint8_t up0 = (uint8_t)digitalRead(PIN_HALL_UP);
-  delayMicroseconds(200);
-  hall_dn_lvl = (uint8_t)digitalRead(PIN_HALL_DOWN);
-  hall_up_lvl = (uint8_t)digitalRead(PIN_HALL_UP);
-  if (hall_dn_lvl != dn0) hall_dn_lvl = hall_dn_prev;  // 抖动则本拍忽略
-  if (hall_up_lvl != up0) hall_up_lvl = hall_up_prev;
+/** 把定点 ×1e6 值格式化为「整数.六位」；<0 视为无数据打印 -1.000000 */
+static void fmtMicro(char* buf, size_t n, int64_t micro) {
+  if (micro < 0) {
+    snprintf(buf, n, "-1.000000");
+    return;
+  }
+  snprintf(buf, n, "%lld.%06lld", (long long)(micro / 1000000LL),
+           (long long)(micro % 1000000LL));
+}
 
-  if (hallEdgeTrigger(hall_dn_prev, hall_dn_lvl)) {
-    // 两次下扑沿：实测盘频 + 实测减速比（电机展开角差 / 360）
-    if (hall_dn_count >= 1 && last_hd_ms > 0 && !isnan(last_hd_motor_unwrap)) {
-      uint32_t dt_ms = now - last_hd_ms;
-      if (dt_ms >= 30 && dt_ms <= 30000) {
-        out_hz_meas = 1000.0f / (float)dt_ms;
-        out_rpm_meas = out_hz_meas * 60.0f;
-        float motor_revs = fabsf(motor_unwrapped_deg - last_hd_motor_unwrap) / 360.0f;
-        if (motor_revs > 0.05f) gear_ratio_meas = motor_revs;  // 一盘转内电机转数
-      }
+/**
+ * 同相位标记两次过点：测盘频 + 电机转数（应≈ GEAR_RATIO）。
+ * 浮点值保留（供旧逻辑/遥测），减速比与频率另用整型定点计算，避免浮点误差。
+ */
+static void hallMeasureFullTurn(uint32_t now, uint32_t prev_ms, float prev_unwrap,
+                                int64_t prev_counts, bool has_prev_counts,
+                                float* out_hz_slot, float* gear_slot,
+                                int64_t* out_hz_micro_slot, int64_t* gear_micro_slot,
+                                uint8_t src) {
+  if (prev_ms == 0 || isnan(prev_unwrap)) return;
+  uint32_t dt_ms = now - prev_ms;
+  // 1Hz→1000ms … 6Hz→167ms；放宽上下限防误触发/卡死
+  if (dt_ms < 50 || dt_ms > 30000) return;
+  float hz = 1000.0f / (float)dt_ms;
+  float motor_revs = fabsf(motor_unwrapped_deg - prev_unwrap) / 360.0f;
+  if (motor_revs < 0.5f) return;  // 一盘转至少半圈电机，滤抖
+  *out_hz_slot = hz;
+  *gear_slot = motor_revs;
+  out_hz_meas = hz;
+  out_rpm_meas = hz * 60.0f;
+  gear_ratio_meas = motor_revs;
+  gear_meas_src = src;
+  // —— 定点整型：减速比 = Δcounts/16384，频率 = 1000/dt_ms，均 ×1e6 后整数除（四舍五入）——
+  if (has_prev_counts && dt_ms > 0) {
+    int64_t dcounts = motor_unwrapped_counts - prev_counts;
+    if (dcounts < 0) dcounts = -dcounts;
+    if (dcounts >= (ENC_CPR_I / 2)) {  // 至少半圈电机，与浮点滤抖一致
+      int64_t gm_micro = (dcounts * 1000000LL + ENC_CPR_I / 2) / ENC_CPR_I;
+      int64_t oh_micro = (1000000000LL + (int64_t)dt_ms / 2) / (int64_t)dt_ms;
+      *gear_micro_slot = gm_micro;
+      *out_hz_micro_slot = oh_micro;
+      gear_micro_meas = gm_micro;
+      out_hz_micro_meas = oh_micro;
+    }
+  }
+}
+
+void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
+  // 电平采样（诊断低占比）+ 软件边沿备份；主事件仍由 GPIO ISR 累计
+  hall_dn_lvl = (uint8_t)gpio_get_level((gpio_num_t)PIN_HALL_DOWN);
+  hall_up_lvl = (uint8_t)gpio_get_level((gpio_num_t)PIN_HALL_UP);
+  hall_dn_samp_n++;
+  hall_up_samp_n++;
+  if (hall_dn_lvl == 0) hall_dn_low_n++;
+  if (hall_up_lvl == 0) hall_up_low_n++;
+
+  // 主循环边沿备份：进入有效电平记 poll_edge（宽脉冲时与 irq 对照；窄脉冲可能漏）
+  if (!hallIsActive(hall_dn_prev) && hallIsActive(hall_dn_lvl)) {
+    hall_dn_poll_edge++;
+  }
+  if (!hallIsActive(hall_up_prev) && hallIsActive(hall_up_lvl)) {
+    hall_up_poll_edge++;
+  }
+  hall_dn_prev = hall_dn_lvl;
+  hall_up_prev = hall_up_lvl;
+
+  uint32_t dn_irq = hall_dn_irq_cnt;
+  uint32_t up_irq = hall_up_irq_cnt;
+
+  // —— 0° 下扑：两次过 0 点 = 输出盘一整转 ——
+  while (hall_dn_irq_seen != dn_irq) {
+    hall_dn_irq_seen++;
+    if (hall_dn_count >= 1) {
+      hallMeasureFullTurn(now, last_hd_ms, last_hd_motor_unwrap,
+                          last_hd_motor_unwrap_counts, has_hd_counts,
+                          &out_hz_meas_dn, &gear_ratio_meas_dn,
+                          &out_hz_micro_dn, &gear_micro_dn, 1);
     }
     hall_dn_count++;
     last_hd_ms = now;
@@ -439,47 +794,79 @@ void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
     last_hd_motor_abs = motor_abs;
     last_hd_raw = raw;
     last_hd_motor_unwrap = motor_unwrapped_deg;
-    // 下扑沿：自动把当前电机展开角标为盘 0°（可用 HALL CAL 重标）
+    last_hd_motor_unwrap_counts = motor_unwrapped_counts;
+    has_hd_counts = true;
     flap_zero_motor_unwrap = motor_unwrapped_deg;
     flap_calibrated = true;
     last_hd_disc = 0.0f;
-    hostPrintf(
-        "# HALL DOWN t_ms=%lu motor_rel=%.3f motor_abs=%.3f raw=%u "
-        "out_hz=%.3f gear_meas=%.3f gear_design=%.4f count=%lu\n",
-        (unsigned long)now, (double)motor_rel, (double)motor_abs, (unsigned)raw,
-        (double)(isnan(out_hz_meas) ? -1.0f : out_hz_meas),
-        (double)(isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas),
-        (double)GEAR_RATIO, (unsigned long)hall_dn_count);
+    {
+      char b_oh[24], b_g[24], b_d[24];
+      fmtMicro(b_oh, sizeof(b_oh), out_hz_micro_dn);
+      fmtMicro(b_g, sizeof(b_g), gear_micro_dn);
+      fmtMicro(b_d, sizeof(b_d), GEAR_DESIGN_MICRO);
+      hostPrintf(
+          "# HALL DOWN t_ms=%lu motor_rel=%.3f raw=%u "
+          "out_hz=%s gear_meas=%s design=%s src=0deg count=%lu irq_us=%lu\n",
+          (unsigned long)now, (double)motor_rel, (unsigned)raw,
+          b_oh, b_g, b_d, (unsigned long)hall_dn_count,
+          (unsigned long)hall_dn_irq_us);
+    }
   }
 
-  if (hallEdgeTrigger(hall_up_prev, hall_up_lvl)) {
+  // —— 180° 上举：两次过 180 点 = 输出盘一整转 ——
+  while (hall_up_irq_seen != up_irq) {
+    hall_up_irq_seen++;
+    if (hall_up_count >= 1) {
+      hallMeasureFullTurn(now, last_hu_ms, last_hu_motor_unwrap,
+                          last_hu_motor_unwrap_counts, has_hu_counts,
+                          &out_hz_meas_up, &gear_ratio_meas_up,
+                          &out_hz_micro_up, &gear_micro_up, 2);
+    }
     hall_up_count++;
     last_hu_ms = now;
     last_hu_motor_rel = motor_rel;
     last_hu_motor_abs = motor_abs;
     last_hu_raw = raw;
+    last_hu_motor_unwrap = motor_unwrapped_deg;
+    last_hu_motor_unwrap_counts = motor_unwrapped_counts;
+    has_hu_counts = true;
     last_hu_disc = discEstFromMotor();
-    hostPrintf(
-        "# HALL UP t_ms=%lu motor_rel=%.3f motor_abs=%.3f raw=%u "
-        "disc_est=%.3f count=%lu gear_design=%.4f\n",
-        (unsigned long)now, (double)motor_rel, (double)motor_abs, (unsigned)raw,
-        (double)(isnan(last_hu_disc) ? -1.0f : last_hu_disc),
-        (unsigned long)hall_up_count, (double)GEAR_RATIO);
+    {
+      char b_oh[24], b_g[24], b_d[24];
+      fmtMicro(b_oh, sizeof(b_oh), out_hz_micro_up);
+      fmtMicro(b_g, sizeof(b_g), gear_micro_up);
+      fmtMicro(b_d, sizeof(b_d), GEAR_DESIGN_MICRO);
+      hostPrintf(
+          "# HALL UP t_ms=%lu motor_rel=%.3f raw=%u "
+          "out_hz=%s gear_meas=%s design=%s src=180deg count=%lu irq_us=%lu\n",
+          (unsigned long)now, (double)motor_rel, (unsigned)raw,
+          b_oh, b_g, b_d, (unsigned long)hall_up_count,
+          (unsigned long)hall_up_irq_us);
+    }
   }
-
-  hall_dn_prev = hall_dn_lvl;
-  hall_up_prev = hall_up_lvl;
 }
 
 void hallPrintStatus() {
   float disc = discEstFromMotor();
+  float dn_low_pct =
+      hall_dn_samp_n ? (100.0f * (float)hall_dn_low_n / (float)hall_dn_samp_n) : 0.0f;
+  float up_low_pct =
+      hall_up_samp_n ? (100.0f * (float)hall_up_low_n / (float)hall_up_samp_n) : 0.0f;
   hostPrintf(
-      "# HALL dn_pin=%d up_pin=%d active=%s dn_lvl=%u up_lvl=%u "
-      "dn_cnt=%lu up_cnt=%lu cal=%d gear=%.6f (59*79)/(12*14)\n",
+      "# HALL dn_pin=%d up_pin=%d active=%s irq=%s isr_ok=%d dn_lvl=%u up_lvl=%u "
+      "dn_cnt=%lu up_cnt=%lu irq_dn=%lu irq_up=%lu cal=%d gear=%.6f (59*79)/(12*14)\n",
       PIN_HALL_DOWN, PIN_HALL_UP, hall_active_low ? "LOW" : "HIGH",
+      "ANYEDGE+SW", hall_gpio_isr_ok ? 1 : 0,
       (unsigned)hall_dn_lvl, (unsigned)hall_up_lvl,
       (unsigned long)hall_dn_count, (unsigned long)hall_up_count,
+      (unsigned long)hall_dn_irq_cnt, (unsigned long)hall_up_irq_cnt,
       flap_calibrated ? 1 : 0, (double)GEAR_RATIO);
+  hostPrintf(
+      "# HALL SAMP dn_low%%=%.2f (%lu/%lu) up_low%%=%.2f (%lu/%lu) "
+      "poll_dn=%lu poll_up=%lu (spinning: low%% should be >0 if DO reaches pad)\n",
+      (double)dn_low_pct, (unsigned long)hall_dn_low_n, (unsigned long)hall_dn_samp_n,
+      (double)up_low_pct, (unsigned long)hall_up_low_n, (unsigned long)hall_up_samp_n,
+      (unsigned long)hall_dn_poll_edge, (unsigned long)hall_up_poll_edge);
   hostPrintf(
       "# HALL last_dn motor_rel=%.3f disc=%.3f | last_up motor_rel=%.3f disc=%.3f | "
       "disc_now=%.3f\n",
@@ -488,18 +875,26 @@ void hallPrintStatus() {
       (double)(isnan(last_hu_motor_rel) ? -1.0f : last_hu_motor_rel),
       (double)(isnan(last_hu_disc) ? -1.0f : last_hu_disc),
       (double)(isnan(disc) ? -1.0f : disc));
-  float err = NAN;
-  if (!isnan(gear_ratio_meas) && GEAR_RATIO > 0.1f) {
-    err = (gear_ratio_meas - GEAR_RATIO) / GEAR_RATIO * 100.0f;
+  // 定点误差（相对设计值）：ppm = (gear_micro - design)*1e6 / design（整数）
+  long long err_ppm = -999999;
+  if (gear_micro_meas > 0) {
+    err_ppm = (long long)((gear_micro_meas - GEAR_DESIGN_MICRO) * 1000000LL /
+                          GEAR_DESIGN_MICRO);
   }
+  char m_oh[24], m_g[24], m_d[24], m_dnh[24], m_dni[24], m_uph[24], m_upi[24];
+  fmtMicro(m_oh, sizeof(m_oh), out_hz_micro_meas);
+  fmtMicro(m_g, sizeof(m_g), gear_micro_meas);
+  fmtMicro(m_d, sizeof(m_d), GEAR_DESIGN_MICRO);
+  fmtMicro(m_dnh, sizeof(m_dnh), out_hz_micro_dn);
+  fmtMicro(m_dni, sizeof(m_dni), gear_micro_dn);
+  fmtMicro(m_uph, sizeof(m_uph), out_hz_micro_up);
+  fmtMicro(m_upi, sizeof(m_upi), gear_micro_up);
   hostPrintf(
-      "# HALL MEAS out_hz=%.3f out_rpm=%.2f gear_meas=%.4f design=%.4f err%%=%.2f "
-      "(需≥2次下扑沿)\n",
-      (double)(isnan(out_hz_meas) ? -1.0f : out_hz_meas),
-      (double)(isnan(out_rpm_meas) ? -1.0f : out_rpm_meas),
-      (double)(isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas),
-      (double)GEAR_RATIO,
-      (double)(isnan(err) ? -999.0f : err));
+      "# HALL MEAS out_hz=%s out_rpm=%.4f gear_meas=%s design=%s err_ppm=%lld "
+      "src=%s dn_hz=%s dn_i=%s up_hz=%s up_i=%s\n",
+      m_oh, (double)(isnan(out_rpm_meas) ? -1.0f : out_rpm_meas), m_g, m_d, err_ppm,
+      gear_meas_src == 1 ? "0deg" : (gear_meas_src == 2 ? "180deg" : "?"),
+      m_dnh, m_dni, m_uph, m_upi);
 }
 
 // ---------------- ESC PWM / DShot ----------------
@@ -1730,6 +2125,19 @@ void handleCommandLine(char* line) {
     hostPrintln("# ACK PING");
     return;
   }
+  if (strcasecmp(line, "ENC?") == 0 || strcasecmp(line, "ENC") == 0) {
+    EncShared snap;
+    encGetSnapshot(&snap);
+    hostPrintf(
+        "# ENC target_hz=%lu meas_hz=%.1f cpu%%=%.2f loop_hz=%.0f window=%d spi_hz=%lu "
+        "nyquist_rpm=%lu counts=%lld raw=%u rpm=%.1f ef=%u agc=%u seq=%lu\n",
+        (unsigned long)ENC_SAMPLE_HZ, (double)enc_sample_hz_meas, (double)enc_cpu_pct,
+        (double)enc_loop_hz, ENC_VEL_WINDOW, (unsigned long)ENC_SPI_HZ,
+        (unsigned long)(ENC_SAMPLE_HZ * 30UL), (long long)snap.counts, (unsigned)snap.raw,
+        (double)snap.rpm_signed, (unsigned)snap.ef, (unsigned)snap.agc,
+        (unsigned long)snap.seq);
+    return;
+  }
   if (strcasecmp(line, "BLE?") == 0) {
     hostPrintf("# BLE conn=%d rate=%u lite=%d name=%s\n",
                bleConnected() ? 1 : 0, (unsigned)bleTelemHz(), bleLiteOn() ? 1 : 0,
@@ -2034,12 +2442,14 @@ void handleCommandLine(char* line) {
     while (*p == ' ' || *p == '=' || *p == ':') ++p;
     if (strcasecmp(p, "LOW") == 0) {
       hall_active_low = true;
-      hostPrintln("# ACK HALL ACTIVE LOW");
+      hallAttachIrqs();
+      hostPrintln("# ACK HALL ACTIVE LOW (IRQ ANYEDGE+SW enter-low)");
       return;
     }
     if (strcasecmp(p, "HIGH") == 0) {
       hall_active_low = false;
-      hostPrintln("# ACK HALL ACTIVE HIGH");
+      hallAttachIrqs();
+      hostPrintln("# ACK HALL ACTIVE HIGH (IRQ ANYEDGE+SW enter-high)");
       return;
     }
     hostPrintln("# ERR HALL ACTIVE LOW|HIGH");
@@ -2474,14 +2884,19 @@ void setup() {
   loadGainMapsFromNvs();
 
   spi->begin(PIN_SCLK, PIN_MISO, PIN_MOSI, -1);
-  spi->beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE1));
+  spi->beginTransaction(SPISettings(ENC_SPI_HZ, MSBFIRST, SPI_MODE1));
   spiFrame(buildReadCmd(REG_ERRFL));
   spiFrame(buildReadCmd(REG_NOP));
+  // 启动高频编码器采样任务（esp_timer），控制环从此只取最新快照
+  encoderBegin();
 
   hostPrintln("# AS5047P + ESC Ready (ESP32-S3)");
-  hostPrintf("# sample_hz=%lu ctrl_hz=%lu baud=%lu esc_pwm_hz=%lu pin=%d\n",
-                (unsigned long)CTRL_HZ, (unsigned long)CTRL_HZ,
-                (unsigned long)SERIAL_BAUD, (unsigned long)esc_pwm_hz, PIN_ESC_PWM);
+  hostPrintf("# enc_sample_hz=%lu (target) ctrl_hz=%lu baud=%lu esc_pwm_hz=%lu pin=%d spi_hz=%lu\n",
+                (unsigned long)ENC_SAMPLE_HZ, (unsigned long)CTRL_HZ,
+                (unsigned long)SERIAL_BAUD, (unsigned long)esc_pwm_hz, PIN_ESC_PWM,
+                (unsigned long)ENC_SPI_HZ);
+  hostPrintf("# ENC decoupled sampling: esp_timer @%luHz, vel=window-diff(counts), Nyquist~%luRPM (ENC? for live)\n",
+                (unsigned long)ENC_SAMPLE_HZ, (unsigned long)(ENC_SAMPLE_HZ * 30UL));
   hostPrintf("# BLE name=%s NUS rate_default=%uHz lite=1 (cmds: BLE? BLE RATE BLE LITE)\n",
              BLE_DEVICE_NAME, (unsigned)BLE_TELEM_HZ_DEFAULT);
   hostPrintln("# format: t_ms,raw,deg(rel),rad,rpm,...,run,hall_dn,hall_up,disc_est,hd_mdeg,hu_mdeg,out_hz_meas,gear_meas");
@@ -2489,7 +2904,7 @@ void setup() {
   hostPrintln("# MEAS: out_hz from HALL DOWN period; gear_meas=motor_revs/disc_rev; design=(59*79)/(12*14)");
   hostPrintln("# cmds: START STOP ESTOP RPM PHASE MOVE STOPAT GOTO LEARN MEASURE GAIN HALL ...");
   hostPrintln("# PHASE: ZERO; MOVE CW/CCW auto→uni path; SENSE AUTO detect ESC dir");
-  hostPrintln("# HALL: GPIO4=下扑0° GPIO5=上举~180°; HALL? HALL CAL HALL ACTIVE LOW|HIGH");
+  hostPrintln("# HALL: GPIO4=下扑0° GPIO5=上举~180° IDF gpio_isr ANYEDGE+SW; HALL? HALL CAL HALL ACTIVE LOW|HIGH");
   hostPrintln("# LEARN START=step, LEARN RAMP=slope; GAIN ON|OFF|?|SAVE; KA <us/(rpm/s)>|KA?");
   hostPrintf("# GAIN schedule=%s points=%d valid=%d\n",
                 gain_schedule_on ? "ON" : "OFF", activeGainMap().n, activeGainMap().valid ? 1 : 0);
@@ -2510,35 +2925,73 @@ void setup() {
 void loop() {
   pollSerialCommands();
 
+  static uint32_t loop_iters = 0;
+  loop_iters++;  // 主循环空转计数（CPU 空闲粗估）
+
   static uint32_t next_ms = 0;
   uint32_t now = millis();
   if ((int32_t)(now - next_ms) < 0) return;
   next_ms = now + CTRL_MS;
 
-  AngleSample s = readAngleCom();
-  float abs_deg = (float)s.raw * ENC_DEG_PER_COUNT;
+  // —— 取高频采样最新快照（与控制环解耦；测速/解缠已在 esp_timer 侧完成）——
+  EncShared snap;
+  encGetSnapshot(&snap);
+
+  uint16_t raw = snap.raw;
+  float abs_deg = (float)raw * ENC_DEG_PER_COUNT;
   float deg = phaseRelFromAbs(abs_deg);  // 遥测 deg = 用户相对相位（零点后）
   float rad = deg * (TWO_PI_F / 360.0f);
 
-  float rpm_mag = 0.0f;
-  float dt = CTRL_MS * 0.001f;
+  // 定点累计计数/展开角由采样侧维护，这里只镜像给既有逻辑（hall/相位）
+  motor_unwrapped_counts = snap.counts;
+  motor_unwrapped_deg = (float)snap.counts * ENC_DEG_PER_COUNT;
+  rpm_signed_stable = snap.rpm_signed;
+  rpm_filt = snap.rpm_signed;  // measureHold 用 rpm_filt
+  float rpm_mag = fabsf(snap.rpm_signed);
+
+  // 本控制拍相对上一拍的角度增量（由已解缠累加计数得出，高速也不折叠）
+  static bool have_last_counts = false;
+  static int64_t last_loop_counts = 0;
   float ddeg = 0.0f;
-  if (!isnan(last_deg) && now > last_ms) {
-    dt = (now - last_ms) * 0.001f;
-    if (dt > 0.0005f) {
-      ddeg = unwrapDeltaDeg(abs_deg, last_deg);  // 必须用绝对角，相对相位跨 0° 会误判正负
-      rpm_mag = updateRpmFromDelta(ddeg, dt);
-    }
-  } else {
-    rpm_mag = fabsf(rpm_signed_stable);
+  if (have_last_counts) {
+    ddeg = (float)(snap.counts - last_loop_counts) * ENC_DEG_PER_COUNT;
   }
-  last_deg = abs_deg;
+  last_loop_counts = snap.counts;
+  have_last_counts = true;
+
+  float dt = CTRL_MS * 0.001f;
+  if (last_ms != 0 && now > last_ms) {
+    float d = (now - last_ms) * 0.001f;
+    if (d > 0.0005f) dt = d;
+  }
+  if (snap.seq > 0) last_deg = abs_deg;  // 有真实采样后才认为角度有效
   last_ms = now;
-  motor_unwrapped_deg += ddeg;
 
   phaseTick(abs_deg, ddeg);
-  hallPoll(now, deg, abs_deg, s.raw);
+  hallPoll(now, deg, abs_deg, raw);
   controlTick(rpm_mag, dt);  // 闭环用转速大小（≥0）
+
+  // —— 实测采样率 / CPU 占用估计 / 主循环空转频率（每 ~500ms 更新）——
+  static uint32_t stat_prev_ms = 0;
+  static uint32_t stat_prev_seq = 0;
+  if (stat_prev_ms == 0) {
+    stat_prev_ms = now;
+    stat_prev_seq = snap.seq;
+    loop_iters = 0;
+  } else if ((now - stat_prev_ms) >= 500) {
+    uint32_t dms = now - stat_prev_ms;
+    enc_sample_hz_meas = (float)(snap.seq - stat_prev_seq) * 1000.0f / (float)dms;
+    enc_loop_hz = (float)loop_iters * 1000.0f / (float)dms;
+    uint32_t bacc, bcnt;
+    encTakeBusy(&bacc, &bcnt);
+    if (bcnt > 0) {
+      float avg_us = (float)bacc / (float)bcnt;         // 每样本采样耗时
+      enc_cpu_pct = avg_us * enc_sample_hz_meas / 10000.0f;  // 占空比(%)
+    }
+    stat_prev_ms = now;
+    stat_prev_seq = snap.seq;
+    loop_iters = 0;
+  }
 
   int mode_i = (int)ctrl_mode;
   int run_i = (int)run_state;
@@ -2551,17 +3004,17 @@ void loop() {
   float gm = isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas;
 
   // USB：全速完整遥测；BLE：限速瘦身（hostPrintf 对数字开头行不转发 BLE）
-  // 末尾: hall_dn,hall_up,disc_est,hd_mdeg,hu_mdeg,out_hz_meas,gear_meas
-  hostPrintf("%lu,%u,%.3f,%.6f,%.2f,%u,%u,%u,%u,%u,%.1f,%d,%.4f,%.4f,%.4f,%d,%d,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+  // 末尾追加 enc_sample_hz（实测采样率），旧列位置不变，解析器按前置索引读取兼容
+  hostPrintf("%lu,%u,%.3f,%.6f,%.2f,%u,%u,%u,%u,%u,%.1f,%d,%.4f,%.4f,%.4f,%d,%d,%u,%u,%.3f,%.3f,%.3f,%.5f,%.5f,%.1f\n",
                 (unsigned long)now,
-                (unsigned)s.raw,
+                (unsigned)raw,
                 deg,
                 rad,
                 rpm_signed_stable,
-                (unsigned)s.ef,
-                (unsigned)s.agc,
-                (unsigned)s.mag_low,
-                (unsigned)s.mag_high,
+                (unsigned)snap.ef,
+                (unsigned)snap.agc,
+                (unsigned)snap.mag_low,
+                (unsigned)snap.mag_high,
                 (unsigned)esc_pulse_us,
                 (double)target_ramped,
                 mode_i,
@@ -2576,7 +3029,8 @@ void loop() {
                 (double)hd_m,
                 (double)hu_m,
                 (double)oh,
-                (double)gm);
+                (double)gm,
+                (double)enc_sample_hz_meas);
   bleEmitTelemLite(now, rpm_signed_stable, esc_pulse_us, target_ramped, mode_i, run_i, oh, gm);
   (void)prof_i;
 }
