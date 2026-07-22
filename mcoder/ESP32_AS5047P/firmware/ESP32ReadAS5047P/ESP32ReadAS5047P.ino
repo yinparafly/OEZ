@@ -22,7 +22,7 @@
  *   输出：esp_timer @400Hz → 信号量 → motorControlTask@Core1（只读快照/PID/ESC；零直打串口）
  *   telemTask@Core0 低优：USB 遥测≤20Hz（Serial.write 批量）+ hostDrainAsyncLog
  *   loop：仅命令解析 + 轻量 drain
- *   阶段 D/E 预留：enc_ring / Q16.16（本轮不做）
+ *   阶段 D/E 备份：enc_ring.h + q16_math.h；USE_FIXED_POINT 默认 0（浮点主路）
  *
  * 指令：START STOP ESTOP PING | ENC? CTRL? TELEM? CORE? | BLE ON|OFF|? | FLIGHT ON|OFF|?
  *   RPM / MODE / FREQ / BLE RATE|LITE …
@@ -40,6 +40,13 @@
 #include "freertos/task.h"
 #include "esc_dshot.h"
 #include "ble_host.h"
+#include "q16_math.h"
+#include "enc_ring.h"
+
+// 备份：Q16/环缓。默认 0=浮点主路径（采集2k/使用2k/输出400）；改为 1 启用定点求速+EMA+环缓写入
+#ifndef USE_FIXED_POINT
+#define USE_FIXED_POINT 0
+#endif
 
 // 测试固件默认开 BLE；飞行构建可改为 0（不 bleBegin）
 #ifndef FEATURE_BLE_DEFAULT
@@ -86,7 +93,7 @@ static const int      ENC_HIST = 16;
 static const int      ENC_VEL_WINDOW = 8;                         // 使用侧测速窗(@2kHz=4ms)
 static const uint32_t ENC_DIAG_DIV = 100;
 static const uint32_t ENC_SIGN_FLIP_SAMPLES = ENC_SAMPLE_HZ / 12;
-// 阶段 D 预留 enc_ring；阶段 E 预留 Q16——本轮仍 portMUX 快照 + 浮点 PID。
+// 默认：portMUX 快照 + 浮点求速/PID。USE_FIXED_POINT=1 时采集侧定点求速+环缓（输出仍读 EncShared）。
 
 // 共享快照：采集/使用回调写、输出任务读，portMUX 保护。
 struct EncShared {
@@ -434,6 +441,14 @@ static uint8_t  enc_cb_agc = 0;
 static bool     enc_cb_mag_low = false;
 static bool     enc_cb_mag_high = false;
 
+#if USE_FIXED_POINT
+static enc_ring_t g_enc_ring;
+static q16_t      enc_cb_rpm_filt_q16 = 0;
+static q16_t      enc_cb_rpm_stable_q16 = 0;
+static const q16_t ENC_EMA_ALPHA_Q16 = FLOAT_TO_Q16(0.10f);
+#endif
+
+
 // —— 供命令/遥测读取的实测统计（loop 侧写）——
 float    enc_sample_hz_meas = 0.0f;  // 实测采样率
 float    enc_cpu_pct = 0.0f;         // 采样任务 CPU 占用估计(%)
@@ -474,13 +489,55 @@ static void encSampleCb(void* /*arg*/) {
   enc_cb_last_raw = (int)raw;
 
   // 写历史环
+#if USE_FIXED_POINT
+  // 备份路径：环缓 + Q16 窗差求速 + EMA（禁打印）
+  enc_ring_push(&g_enc_ring, now, enc_cb_counts);
+  enc_ring_sample_t peek[ENC_VEL_WINDOW + 1];
+  uint32_t npeek = enc_ring_peek_n(&g_enc_ring, peek, (uint32_t)(ENC_VEL_WINDOW + 1));
+  q16_t rpm_inst_q = enc_cb_rpm_filt_q16;
+  if (npeek >= 2) {
+    uint32_t i0 = 0;
+    uint32_t i1 = npeek - 1;
+    int64_t dc = peek[i1].counts - peek[i0].counts;
+    uint32_t dt_us = peek[i1].t_us - peek[i0].t_us;
+    if (dt_us > 0) {
+      rpm_inst_q = calc_rpm_window_q16(dc, dt_us, (int32_t)ENC_CPR_I);
+    }
+  }
+  q16_t lim_q = FLOAT_TO_Q16(target_rpm_max * 1.5f + 500.0f);
+  if (q16_abs(rpm_inst_q) > lim_q) rpm_inst_q = enc_cb_rpm_filt_q16;
+  enc_cb_rpm_filt_q16 = ema_update_q16(enc_cb_rpm_filt_q16, rpm_inst_q, ENC_EMA_ALPHA_Q16);
+  float mag = Q16_TO_FLOAT(q16_abs(enc_cb_rpm_filt_q16));
+  int sgn = (enc_cb_rpm_filt_q16 > 0) ? 1 : ((enc_cb_rpm_filt_q16 < 0) ? -1 : 0);
+  if (mag < 80.0f) {
+    enc_cb_sign_lock = 0;
+    enc_cb_flip_cnt = 0;
+    enc_cb_rpm_stable_q16 = enc_cb_rpm_filt_q16;
+  } else {
+    if (enc_cb_sign_lock == 0) {
+      if (sgn != 0) enc_cb_sign_lock = sgn;
+    } else if (sgn != 0 && sgn != enc_cb_sign_lock) {
+      if (++enc_cb_flip_cnt >= ENC_SIGN_FLIP_SAMPLES) {
+        enc_cb_sign_lock = sgn;
+        enc_cb_flip_cnt = 0;
+      }
+    } else {
+      enc_cb_flip_cnt = 0;
+    }
+    int use = (enc_cb_sign_lock != 0) ? enc_cb_sign_lock : sgn;
+    if (use == 0) use = 1;
+    enc_cb_rpm_stable_q16 = FLOAT_TO_Q16((float)use * mag);
+  }
+  enc_cb_rpm_filt = Q16_TO_FLOAT(enc_cb_rpm_filt_q16);
+  enc_cb_rpm_stable = Q16_TO_FLOAT(enc_cb_rpm_stable_q16);
+#else
+  // 主路径：浮点历史窗 + EMA（采集2k/使用2k）
   int cur = enc_hist_head;
   enc_hist_counts[cur] = enc_cb_counts;
   enc_hist_us[cur] = now;
   enc_hist_head = (enc_hist_head + 1) % ENC_HIST;
   if (enc_hist_fill < ENC_HIST) enc_hist_fill++;
 
-  // 测速：用已解缠累加计数做窗口差分（不受 Nyquist 折叠限制）
   float rpm_inst = enc_cb_rpm_filt;
   int w = ENC_VEL_WINDOW;
   if (w > enc_hist_fill - 1) w = enc_hist_fill - 1;
@@ -493,13 +550,10 @@ static void encSampleCb(void* /*arg*/) {
     }
   }
 
-  // 拒绝明显不可能的尖峰
   float lim = target_rpm_max * 1.5f + 500.0f;
   if (fabsf(rpm_inst) > lim) rpm_inst = enc_cb_rpm_filt;
-  // 窗口本身已平滑，EMA 取轻（0.9/0.1）
   enc_cb_rpm_filt = 0.90f * enc_cb_rpm_filt + 0.10f * rpm_inst;
 
-  // 符号锁定：单向高速时避免噪声造成 ±RPM 乱跳
   float mag = fabsf(enc_cb_rpm_filt);
   int sgn = (enc_cb_rpm_filt > 0.0f) ? 1 : ((enc_cb_rpm_filt < 0.0f) ? -1 : 0);
   if (mag < 80.0f) {
@@ -521,6 +575,7 @@ static void encSampleCb(void* /*arg*/) {
     if (use == 0) use = 1;
     enc_cb_rpm_stable = (float)use * mag;
   }
+#endif
 
   uint32_t busy = micros() - t0;
   portENTER_CRITICAL(&g_enc_mux);
@@ -567,6 +622,11 @@ void encoderBegin() {
   enc_cb_counts = 0;
   enc_hist_head = 0;
   enc_hist_fill = 0;
+#if USE_FIXED_POINT
+  enc_ring_init(&g_enc_ring);
+  enc_cb_rpm_filt_q16 = 0;
+  enc_cb_rpm_stable_q16 = 0;
+#endif
 
   const esp_timer_create_args_t args = {
       .callback = &encSampleCb,
@@ -2181,6 +2241,17 @@ void handleCommandLine(char* line) {
         (unsigned long)ENC_SAMPLE_HZ, (unsigned long)CTRL_HZ);
     return;
   }
+
+  if (strcasecmp(line, "FIXED?") == 0 || strcasecmp(line, "FIXED") == 0) {
+#if USE_FIXED_POINT
+    hostPrintf("# FIXED use_fixed_point=1 enc_ring_cap=%u count=%lu overrun=%lu (Q16 backup path)\n",
+               (unsigned)ENC_RING_CAP, (unsigned long)enc_ring_count(&g_enc_ring),
+               (unsigned long)enc_ring_overruns(&g_enc_ring));
+#else
+    hostPrintf("# FIXED use_fixed_point=0 (float main; enable with USE_FIXED_POINT=1)\n");
+#endif
+    return;
+  }
   if (strcasecmp(line, "CORE?") == 0 || strcasecmp(line, "CORE") == 0) {
     hostPrintf("# CORE ctrl=%lu enc_cb=%lu loop=%lu (ctrl pin Core1; enc_cb 随调度)\n",
                (unsigned long)g_ctrl_core_id, (unsigned long)g_enc_cb_core_id,
@@ -3135,6 +3206,7 @@ void setup() {
              flight_mode ? "FLIGHT" : "TEST", bleIsEnabled() ? "on" : "off");
   hostPrintln("# 数据流: 采集2k → 使用2k(求速全用) → 输出400(最新RPM→ESC)");
   hostPrintln("# HARD: no Serial/hostPrintf in 2k encSampleCb or 400Hz motorCtrl (async log + telemTask)");
+  hostPrintf("# USE_FIXED_POINT=%d (0=float main; 1=Q16/ring backup; see README_Q16_BACKUP.md)\n", USE_FIXED_POINT);
   hostPrintf("# collect/use_hz=%lu out_hz=%lu esc_pwm_hz=%lu usb_telem_hz=%lu (frames/s) baud=%lu pin=%d\n",
              (unsigned long)ENC_SAMPLE_HZ, (unsigned long)CTRL_HZ, (unsigned long)esc_pwm_hz,
              (unsigned long)USB_TELEM_HZ, (unsigned long)SERIAL_BAUD, PIN_ESC_PWM);
