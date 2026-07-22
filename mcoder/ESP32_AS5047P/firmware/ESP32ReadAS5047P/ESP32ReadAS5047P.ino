@@ -15,7 +15,12 @@
  *   FREQ <50..600> 可改刷新率（>500Hz 周期<2000μs，高油门夹断）
  * 扑翼霍尔（YL-57 / LM393+A3144，VCC=5V）：
  *   GPIO4 = 输出盘 0°（下扑）DO；GPIO5 = ~180°（上举）DO
- * 减速比：(59×79)/(12×14)=4661/168≈27.744
+ * 减速比：小齿 12·14 / 大齿 59·79 → (59/12)*(79/14)=4661/168≈27.7440476
+ *
+ * 盘相位传感模型（霍尔稀疏绝对 + 磁编连续）：
+ *   霍尔沿 → latch disc_ref∈{0,180} 与 motor_counts_at_hall；
+ *   之后 disc = wrap(disc_ref + esc_sense·Δmotor_deg / gear)；
+ *   提前制动用编码器推算的盘相位，霍尔仅复位/确认。
  *
  * 调度（阶段 A/B）：
  *   采集+使用：esp_timer @2000Hz → encSampleCb（SPI+解缠+窗差分+EMA）→ EncShared；零打印
@@ -24,9 +29,18 @@
  *   loop：仅命令解析 + 轻量 drain
  *   阶段 D/E 备份：enc_ring.h + q16_math.h；USE_FIXED_POINT 默认 0（浮点主路）
  *
- * 指令：START STOP ESTOP PING | ENC? CTRL? TELEM? CORE? | BLE ON|OFF|? | FLIGHT ON|OFF|?
+ * 指令：START STOP ESTOP PING | ENC? CTRL? TELEM? LOAD? | CORE? FIXED? Q16CMP?|RESET
+ *   TELEM ON|OFF|? | LOAD RESET | BLE ON|OFF|? | FLIGHT ON|OFF|?
+ *   HOST ON|OFF|? | HOST TO <sec>           （台架：可关/改主机超时；默认 1.5s）
+ *   TEST START <name> | TEST STOP | TEST?   （板内分段测试，见 onboardTest）
+ *   TUNE REC ON|OFF | TUNE? | TUNE DUMP     （板载整定环形记录，见 tune_rec.h）
+ *   HOLD PHASE <deg> [crawl_rpm] [stop_ms] | PHASE HOLD … | PHASE <0|90|180> …
+ *     扑翼盘相位保持：0°=霍尔 GPIO4 下扑；180°=GPIO5 上举；90°=半行程（编码器/减速比反算）
+ *     stop_ms>0：从当前转速闭环软降→爬行，再提前制动；壁钟≈stop_ms（如 3000）
  *   RPM / MODE / FREQ / BLE RATE|LITE …
  * 蓝牙：OEZ-RPM；测试默认 ON；FLIGHT ON → 关 BLE + 禁主机超时 ESTOP
+ * TEST 运行中同样禁用 HOST_TIMEOUT ESTOP；段内自判在转（enc+hall），主机只发 START/STOP。
+ * HOST OFF / HOST TO 0 亦禁用超时（台架）；HOST ON 恢复默认 1.5s。
  ************************************************/
 #include <SPI.h>
 #include <Preferences.h>
@@ -42,6 +56,7 @@
 #include "ble_host.h"
 #include "q16_math.h"
 #include "enc_ring.h"
+#include "tune_rec.h"
 
 // 备份：Q16/环缓。默认 0=浮点主路径（采集2k/使用2k/输出400）；改为 1 启用定点求速+EMA+环缓写入
 #ifndef USE_FIXED_POINT
@@ -61,15 +76,16 @@ static const int PIN_ESC_PWM = 9;
 // 扑翼输出盘霍尔（A3144 模块 DO→GPIO，VCC=5V；默认触发=低，同厂商 51 样例）
 static const int PIN_HALL_DOWN = 4;  // 0° 下扑起点
 static const int PIN_HALL_UP   = 5;  // ~180° 上举
-// 两级减速：电机→12/59→14/79→输出盘；总比按用户给定公式
-static const float GEAR_TEETH_PINION1 = 12.0f;
-static const float GEAR_TEETH_WHEEL1  = 59.0f;
-static const float GEAR_TEETH_PINION2 = 14.0f;
-static const float GEAR_TEETH_WHEEL2  = 79.0f;
-// (59×79)/(12×14) = 4661/168 ≈ 27.7440476  （= (59/12)×(79/14)）
+// 两级减速：电机→12/59→14/79→输出盘；精确分数 4661/168（勿再近似 27.744）
+static const int32_t GEAR_TEETH_PINION1 = 12;
+static const int32_t GEAR_TEETH_WHEEL1  = 59;
+static const int32_t GEAR_TEETH_PINION2 = 14;
+static const int32_t GEAR_TEETH_WHEEL2  = 79;
+static const int32_t GEAR_RATIO_NUM = GEAR_TEETH_WHEEL1 * GEAR_TEETH_WHEEL2;  // 4661
+static const int32_t GEAR_RATIO_DEN = GEAR_TEETH_PINION1 * GEAR_TEETH_PINION2;  // 168
+// (59/12)*(79/14) = 4661/168 ≈ 27.744047619…
 static const float GEAR_RATIO =
-    (GEAR_TEETH_WHEEL1 * GEAR_TEETH_WHEEL2) /
-    (GEAR_TEETH_PINION1 * GEAR_TEETH_PINION2);
+    (float)GEAR_RATIO_NUM / (float)GEAR_RATIO_DEN;
 
 // ---- 时序 ----
 static const uint32_t SERIAL_BAUD = 921600;
@@ -80,7 +96,9 @@ static const uint32_t CTRL_PERIOD_US = 1000000UL / CTRL_HZ;       // 2500
 // USB 遥测帧率：每秒发送多少「完整 CSV 遥测行」（一帧=一行全字段），不是一帧内算 N 次。
 // 旧稿「100Hz」=每秒 100 帧；现默认 20Hz=每秒 20 帧（周期 50ms），每拍最多 1 行。
 static const uint32_t USB_TELEM_HZ = 20;
-static const uint32_t HOST_TIMEOUT_MS = 1500;                     // 测试态保活；FLIGHT ON 禁用
+static const uint32_t HOST_TIMEOUT_DEFAULT_MS = 1500;             // 上电默认；HOST ON 恢复
+// 运行时可改：0=禁用（HOST OFF）；FLIGHT/TEST/LEARN 亦豁免。见 controlTick。
+uint32_t host_timeout_ms = HOST_TIMEOUT_DEFAULT_MS;
 
 // ---- 采集+使用：高频编码器（与输出解耦）----
 // 采集=SPI+解缠 @2k；使用=窗差分求速同回调 @2k（采了 2k、用 2k）。
@@ -108,6 +126,7 @@ struct EncShared {
   uint32_t seq;        // 采集序号 → ENC? meas_hz
   uint32_t busy_acc;
   uint32_t busy_cnt;
+  uint32_t busy_max;   // 窗内回调耗时 max(µs)，encTakeBusy 时清零
 };
 
 // ---- 电调 PWM（默认与输出同相 400Hz；FREQ 可改 50..600）----
@@ -263,6 +282,38 @@ bool stopat_on = false;
 float stopat_deg = 0.0f;
 float stopat_tol_deg = 4.0f;
 float stopat_prev_rel = NAN;
+// 扑翼盘相位保持：单向爬行 + 提前提前制动（不可等霍尔沿再停，惯量会冲过）
+// 0°=GPIO4 下扑；180°=GPIO5 上举；90°=盘上合成（编码器/减速比，无专用霍尔）
+bool holdph_active = false;
+float holdph_target_deg = 0.0f;       // 盘相位目标 [0,360)
+float holdph_tol_deg = 5.0f;          // 到位容差（盘°）
+float holdph_crawl_rpm = 120.0f;      // 电机轴爬行 RPM（盘更慢 ≈ rpm/GEAR）
+uint16_t holdph_pulse = ESC_PULSE_MIN_US;
+uint16_t holdph_max_pulse = 1450;     // 接近段油门上限（仅爬行）
+uint32_t holdph_t0_ms = 0;
+uint32_t holdph_timeout_ms = 30000;   // 总超时 → ESTOP 1000µs
+uint32_t holdph_brake_ms = 0;         // 进入制动的时刻
+uint32_t holdph_dn0 = 0;
+uint32_t holdph_up0 = 0;
+float holdph_prev_disc = NAN;
+float holdph_prev_remain = NAN;
+bool holdph_hall_seen = false;        // 制动后霍尔确认（非停机触发）
+// 提前量：effective_lead = lead_deg + ω_disc*lead_ms/1000 + k*|rpm_motor|
+float holdph_lead_deg = 10.0f;        // 基础提前盘角 °（NVS hplead）
+float holdph_lead_ms = 100.0f;        // 按当前盘角速度折算的提前时间 ms（NVS hpleadt）
+float holdph_lead_rpm_k = 0.03f;      // 额外盘° / 电机RPM（NVS hpleadk）
+float holdph_stop_rpm = 40.0f;        // 判停电机 RPM 阈值
+// 定时软降：HOLD PHASE <deg> [crawl] [stop_ms]；stop_ms=0 → 旧爬行
+uint32_t holdph_profile_ms = 0;       // 期望壁钟停机时间（软降+爬行接近）
+uint32_t holdph_soft_ms = 0;          // 软降段时长（profile 的前段）
+float holdph_rpm_start = 0.0f;        // 进入时电机 |RPM|
+bool holdph_soft_done = false;        // 软降结束 → 允许 lead 提前制动
+enum HoldPhState : uint8_t {
+  HOLDPH_ST_APPROACH = 0,  // 单向软接近（含可选软降）
+  HOLDPH_ST_BRAKE = 1,     // 已切 1000µs，惯量滑行
+  HOLDPH_ST_SETTLE = 2     // 低速确认到位
+};
+uint8_t holdph_state = HOLDPH_ST_APPROACH;
 // 自动辨识转向（用固定脉宽，避免 RPM→脉宽在未学习时过低转不动）
 bool sense_learn = false;
 float sense_accum = 0.0f;
@@ -275,6 +326,76 @@ static const uint16_t CRAWL_PULSE_MIN = 1250;  // 开环爬行最低脉宽，保
 uint32_t last_host_ms = 0;
 bool host_seen = false;
 bool flight_mode = false;  // FLIGHT ON：关 BLE + 禁用主机超时 ESTOP
+bool test_active = false;  // 板内 TEST 分段：禁 HOST_TIMEOUT（同 FLIGHT）
+static bool tune_owned_by_test = false;  // TEST 自动开 TUNE，结束再关
+// 闭环最近一拍（20Hz 遥测尾列 err,ff,u；仅 CLOSED 有意义）
+float g_closed_err = 0.0f;
+float g_closed_ff = 0.0f;
+float g_closed_u = 0.0f;
+
+// ---- 板内 TEST（写死参数；主机只发 START/STOP/?）----
+static const float    TEST_RPM_SPIN_MIN = 90.0f;
+static const float    TEST_SPIN_FRAC_MIN = 0.70f;
+static const uint32_t TEST_SPIN_SAMPLE_MS = 50;
+static const uint32_t TEST_SPIN_WINDOW_MS = 3000;
+static const uint8_t  TEST_SPIN_MAX_SAMP = 64;
+static const float    TEST_SOFT_RATE_UP = 1000.0f;
+static const float    TEST_SOFT_RATE_DOWN = 800.0f;
+static const float    TEST_RPMMAX = 12000.0f;
+static const float    TEST_SMOKE_RPM = 2000.0f;
+static const uint32_t TEST_SMOKE_HOLD_MS = 12000;  // 10–15s 取中
+static const float    TEST_SMOKE_ERR_FRAC = 0.15f;
+static const float    TEST_STEP_RPM = 7500.0f;
+static const uint32_t TEST_STEP_HOLD_MS = 20000;
+static const float    TEST_STEP_ERR_FRAC = 0.15f;
+static const float    TEST_IDLE_RPM_MAX = 30.0f;
+static const uint32_t TEST_IDLE_WINDOW_MS = 2000;
+static const uint32_t TEST_RAMP_TIMEOUT_MS = 20000;
+static const float    TEST_RAMP_NEAR_RPM = 80.0f;
+
+enum TestKind : uint8_t {
+  TEST_KIND_NONE = 0,
+  TEST_KIND_SMOKE2000,
+  TEST_KIND_STEP7500,
+  TEST_KIND_IDLE
+};
+enum TestPhase : uint8_t {
+  TEST_PH_IDLE = 0,
+  TEST_PH_ARM,
+  TEST_PH_RAMP,
+  TEST_PH_SPIN,
+  TEST_PH_HOLD,
+  TEST_PH_STEP_RAMP,
+  TEST_PH_STEP_SPIN,
+  TEST_PH_STEP_HOLD,
+  TEST_PH_STOPPING,
+  TEST_PH_DONE
+};
+
+static TestKind  test_kind = TEST_KIND_NONE;
+static TestPhase test_phase = TEST_PH_IDLE;
+static uint32_t  test_phase_t0 = 0;
+static float     test_set_rpm = 0.0f;
+static float     test_err_frac = 0.15f;
+static uint32_t  test_hold_ms = 0;
+static char      test_name[16] = "";
+static char      test_reason[40] = "";
+static float     test_spin_buf[TEST_SPIN_MAX_SAMP];
+static uint8_t   test_spin_n = 0;
+static uint32_t  test_spin_above = 0;
+static uint32_t  test_spin_last_ms = 0;
+static uint32_t  test_hall0_dn = 0;
+static uint32_t  test_hall0_up = 0;
+static float     test_hold_sum = 0.0f;
+static float     test_hold_err_sum = 0.0f;
+static uint32_t  test_hold_n = 0;
+static uint16_t  test_pulse_peak = 0;
+static bool      test_pulse_sat = false;
+static float     test_enc_rpm = 0.0f;
+static float     test_err_mean = 0.0f;
+static int       test_hall_d = 0;
+static bool      test_ok = false;
+static bool      test_finish_pending = false;  // ESTOP 路径避免重入
 
 // 输出任务 / 核诊断
 static SemaphoreHandle_t g_ctrl_sem = nullptr;
@@ -286,6 +407,26 @@ static volatile uint32_t g_loop_core_id = 0;
 float ctrl_out_hz_meas = 0.0f;  // 实测输出频率（CTRL?）
 static volatile uint32_t g_ctrl_tick_cnt = 0;
 
+// ---- 负载快照（LOAD? / LOAD RESET；对比浮点/定点、遥测、BLE 等工况）----
+static volatile bool g_usb_telem_on = true;           // TELEM ON|OFF（CSV 写出）
+static volatile uint32_t g_loop_iters = 0;            // loop() 空转告警粗估
+float    loop_hz_meas = 0.0f;                        // 主 loop 迭代率（越高越空闲）
+float    enc_busy_avg_us = 0.0f;                     // 采集回调平均耗时 µs
+uint32_t enc_busy_max_us = 0;                        // 采集回调最大耗时 µs（自 RESET）
+uint32_t enc_busy_max_window_us = 0;                 // 最近统计窗内 max
+float    ctrl_period_avg_us = 0.0f;                  // 控制唤醒间隔均值（期望 2500）
+uint32_t ctrl_period_max_us = 0;                     // 控制唤醒间隔 max（自 RESET）
+float    ctrl_busy_avg_us = 0.0f;                    // 控制任务一拍耗时均值 µs
+uint32_t ctrl_busy_max_us = 0;                       // 控制任务一拍耗时 max（自 RESET）
+uint32_t ctrl_overrun_cnt = 0;                       // 周期 > 期望+slack 次数（自 RESET）
+static const uint32_t CTRL_OVERRUN_SLACK_US = 500;    // >3000µs 记 overrun（期望 2500）
+static portMUX_TYPE g_load_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t g_ctrl_last_wake_us = 0;
+static uint32_t g_ctrl_period_acc_us = 0;
+static uint32_t g_ctrl_period_n = 0;
+static uint32_t g_ctrl_busy_acc_us = 0;
+static uint32_t g_ctrl_busy_n = 0;
+
 // ---- 扑翼霍尔 / 输出盘相位（相对电机编码器反算）----
 // GPIO4/5：ESP32-S3 DevKit 丝印 IO4/IO5 = Arduino GPIO4/5；非 USB(19/20)/UART0(43/44)/strapping
 volatile bool hall_active_low = true;  // 厂商 51 样例：if(DO==0) 触发；可用 HALL ACTIVE 改
@@ -296,7 +437,7 @@ uint8_t hall_up_prev = 1;
 uint32_t hall_dn_count = 0;            // 主循环消费后的累计触发次数
 uint32_t hall_up_count = 0;
 // ISR：IDF gpio_isr + ANYEDGE，软件判进入有效电平（避免 Arduino attachInterrupt 漏计）
-static const uint32_t HALL_IRQ_DEBOUNCE_US = 300;  // 同脚最短间隔，滤触点抖
+static const uint32_t HALL_IRQ_DEBOUNCE_US = 5000;  // 同脚最短间隔 5ms，滤磁滞/触点抖
 volatile uint32_t hall_dn_irq_cnt = 0;
 volatile uint32_t hall_up_irq_cnt = 0;
 volatile uint32_t hall_dn_irq_us = 0;  // 最近一次有效沿 micros()
@@ -305,6 +446,10 @@ static uint32_t hall_dn_irq_seen = 0;  // 主循环已处理到的 irq 计数
 static uint32_t hall_up_irq_seen = 0;
 volatile uint32_t hall_dn_irq_last_us = 0;
 volatile uint32_t hall_up_irq_last_us = 0;
+// 盘相位 latch 防抖：同标记两次绝对复位至少隔这么多电机 counts（≈40° 盘）
+// = 0.40 * gear * CPR ≈ 0.40 * 4661/168 * 16384
+static const int64_t HALL_LATCH_MIN_MOTOR_COUNTS =
+    (int64_t)GEAR_RATIO_NUM * (int64_t)ENC_CPR * 40LL / ((int64_t)GEAR_RATIO_DEN * 360LL);
 // 主循环 digitalRead 采样：转盘时应有低电平占比>0；poll_edge=软件边沿备份计数
 static uint32_t hall_dn_samp_n = 0;
 static uint32_t hall_dn_low_n = 0;
@@ -314,7 +459,16 @@ static uint32_t hall_dn_poll_edge = 0;
 static uint32_t hall_up_poll_edge = 0;
 static bool hall_gpio_isr_ok = false;
 float motor_unwrapped_deg = 0.0f;  // 累计电机角（°），用于盘相位
-bool flap_calibrated = false;      // 以下扑沿为盘 0°
+// —— 盘相位：霍尔绝对复位 + 磁编连续推算 ——
+// 过 GPIO4/5（或 HALL CAL）时 latch；之后仅靠编码器积分，霍尔再过时纠正。
+bool flap_calibrated = false;
+float disc_ref_deg = 0.0f;              // 上次霍尔绝对盘角：0°(GPIO4) 或 180°(GPIO5)
+float disc_ref_motor_unwrap = 0.0f;     // latch 时电机展开角 °
+int64_t disc_ref_motor_counts = 0;      // latch 时电机累计 counts
+// 盘相位常值偏置（NVS hphoff）：修 0↔180 装反/标反；加在 latch+积分之后
+float disc_phase_offset_deg = 0.0f;
+// 兼容旧名：flap_zero_* = 把 disc 写成「相对 0° 的电机展开参考」时的等价零点
+// （仅诊断；主路径用 disc_ref + Δmotor）
 float flap_zero_motor_unwrap = 0.0f;
 float last_hd_motor_rel = NAN;     // 触发时电机相对相位
 float last_hu_motor_rel = NAN;
@@ -322,8 +476,8 @@ float last_hd_motor_abs = NAN;
 float last_hu_motor_abs = NAN;
 uint16_t last_hd_raw = 0;
 uint16_t last_hu_raw = 0;
-float last_hd_disc = NAN;          // 触发时盘相位估计（下扑应为≈0）
-float last_hu_disc = NAN;          // 上举触发时盘相位（期望≈180）
+float last_hd_disc = NAN;          // 触发时盘相位（GPIO4 锁存后应为 0）
+float last_hu_disc = NAN;          // 触发时盘相位（GPIO5 锁存后应为 180）
 uint32_t last_hd_ms = 0;
 uint32_t last_hu_ms = 0;
 float last_hd_motor_unwrap = NAN;  // 上次下扑(0°)沿电机展开角
@@ -339,10 +493,11 @@ float gear_ratio_meas_up = NAN;
 uint8_t gear_meas_src = 0;         // 1=DOWN 2=UP
 
 // —— 定点（整型）减速比/频率：全程整数运算，避免浮点/打印截断误差 ——
-// AS5047P 每圈 16384 counts；设计比 (59*79)/(12*14)=4661/168=27.7440476190
+// AS5047P 每圈 16384 counts；设计比 4661/168（精确）
 static const int64_t ENC_CPR_I = 16384;
-// round(4661/168 * 1e6) = round(27744047.619) = 27744048（=27.744048）
-static const int64_t GEAR_DESIGN_MICRO = 27744048;
+// round(4661/168 * 1e6) = round(27744047.619…) = 27744048
+static const int64_t GEAR_DESIGN_MICRO =
+    (GEAR_RATIO_NUM * 1000000LL + GEAR_RATIO_DEN / 2) / GEAR_RATIO_DEN;
 int64_t motor_unwrapped_counts = 0;   // 整型累计编码器计数（raw 差分 ±8192 环绕已处理）
 int last_raw_i = -1;                   // 上拍 raw（<0=未初始化）
 int64_t last_hd_motor_unwrap_counts = 0;
@@ -448,6 +603,86 @@ static q16_t      enc_cb_rpm_stable_q16 = 0;
 static const q16_t ENC_EMA_ALPHA_Q16 = FLOAT_TO_Q16(0.10f);
 #endif
 
+// 浮点主路旁路：同采样再算 Q16，累积 |Δrpm|（禁打印；查询用 Q16CMP?）
+#ifndef Q16_SHADOW_COMPARE
+#if !USE_FIXED_POINT
+#define Q16_SHADOW_COMPARE 1
+#else
+#define Q16_SHADOW_COMPARE 0
+#endif
+#endif
+#if Q16_SHADOW_COMPARE
+static const q16_t ENC_EMA_ALPHA_Q16_SHADOW = FLOAT_TO_Q16(0.10f);
+static q16_t   shadow_rpm_filt_q16 = 0;
+static q16_t   shadow_rpm_stable_q16 = 0;
+static int     shadow_sign_lock = 0;
+static uint32_t shadow_flip_cnt = 0;
+static portMUX_TYPE g_q16cmp_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t q16cmp_n = 0;
+static double   q16cmp_sum_abs = 0.0;
+static float    q16cmp_max_abs = 0.0f;
+static float    q16cmp_last_f = 0.0f;
+static float    q16cmp_last_q = 0.0f;
+
+static inline void q16cmpStatsReset() {
+  portENTER_CRITICAL(&g_q16cmp_mux);
+  q16cmp_n = 0;
+  q16cmp_sum_abs = 0.0;
+  q16cmp_max_abs = 0.0f;
+  // keep last_f/last_q for readability
+  portEXIT_CRITICAL(&g_q16cmp_mux);
+}
+
+static inline void q16cmpFullReset() {
+  q16cmpStatsReset();
+  shadow_rpm_filt_q16 = 0;
+  shadow_rpm_stable_q16 = 0;
+  shadow_sign_lock = 0;
+  shadow_flip_cnt = 0;
+}
+
+static inline void q16cmpShadowUpdate(bool have_win, int64_t dc, uint32_t dt_us,
+                                      float rpm_float_stable) {
+  q16_t rpm_inst_q = shadow_rpm_filt_q16;
+  if (have_win && dt_us > 0) {
+    rpm_inst_q = calc_rpm_window_q16(dc, dt_us, (int32_t)ENC_CPR_I);
+  }
+  q16_t lim_q = FLOAT_TO_Q16(target_rpm_max * 1.5f + 500.0f);
+  if (q16_abs(rpm_inst_q) > lim_q) rpm_inst_q = shadow_rpm_filt_q16;
+  shadow_rpm_filt_q16 = ema_update_q16(shadow_rpm_filt_q16, rpm_inst_q, ENC_EMA_ALPHA_Q16_SHADOW);
+  float mag = Q16_TO_FLOAT(q16_abs(shadow_rpm_filt_q16));
+  int sgn = (shadow_rpm_filt_q16 > 0) ? 1 : ((shadow_rpm_filt_q16 < 0) ? -1 : 0);
+  if (mag < 80.0f) {
+    shadow_sign_lock = 0;
+    shadow_flip_cnt = 0;
+    shadow_rpm_stable_q16 = shadow_rpm_filt_q16;
+  } else {
+    if (shadow_sign_lock == 0) {
+      if (sgn != 0) shadow_sign_lock = sgn;
+    } else if (sgn != 0 && sgn != shadow_sign_lock) {
+      if (++shadow_flip_cnt >= ENC_SIGN_FLIP_SAMPLES) {
+        shadow_sign_lock = sgn;
+        shadow_flip_cnt = 0;
+      }
+    } else {
+      shadow_flip_cnt = 0;
+    }
+    int use = (shadow_sign_lock != 0) ? shadow_sign_lock : sgn;
+    if (use == 0) use = 1;
+    shadow_rpm_stable_q16 = FLOAT_TO_Q16((float)use * mag);
+  }
+  float rpm_q = Q16_TO_FLOAT(shadow_rpm_stable_q16);
+  float d = fabsf(rpm_float_stable - rpm_q);
+  portENTER_CRITICAL(&g_q16cmp_mux);
+  q16cmp_n++;
+  q16cmp_sum_abs += (double)d;
+  if (d > q16cmp_max_abs) q16cmp_max_abs = d;
+  q16cmp_last_f = rpm_float_stable;
+  q16cmp_last_q = rpm_q;
+  portEXIT_CRITICAL(&g_q16cmp_mux);
+}
+#endif
+
 
 // —— 供命令/遥测读取的实测统计（loop 侧写）——
 float    enc_sample_hz_meas = 0.0f;  // 实测采样率
@@ -541,11 +776,17 @@ static void encSampleCb(void* /*arg*/) {
   float rpm_inst = enc_cb_rpm_filt;
   int w = ENC_VEL_WINDOW;
   if (w > enc_hist_fill - 1) w = enc_hist_fill - 1;
+  bool have_win = false;
+  int64_t dc_win = 0;
+  uint32_t dt_win = 0;
   if (w >= 1) {
     int idx = (cur - w + ENC_HIST) % ENC_HIST;
     int64_t dc = enc_cb_counts - enc_hist_counts[idx];
     uint32_t dt_us = now - enc_hist_us[idx];
     if (dt_us > 0) {
+      have_win = true;
+      dc_win = dc;
+      dt_win = dt_us;
       rpm_inst = (float)dc * 60000000.0f / ((float)ENC_CPR_I * (float)dt_us);
     }
   }
@@ -575,6 +816,10 @@ static void encSampleCb(void* /*arg*/) {
     if (use == 0) use = 1;
     enc_cb_rpm_stable = (float)use * mag;
   }
+#if Q16_SHADOW_COMPARE
+  // 同窗 (dc,dt) 旁路 Q16：控制仍用浮点；仅统计 |Δ|
+  q16cmpShadowUpdate(have_win, dc_win, dt_win, enc_cb_rpm_stable);
+#endif
 #endif
 
   uint32_t busy = micros() - t0;
@@ -590,6 +835,7 @@ static void encSampleCb(void* /*arg*/) {
   g_enc.seq++;
   g_enc.busy_acc += busy;
   g_enc.busy_cnt++;
+  if (busy > g_enc.busy_max) g_enc.busy_max = busy;
   portEXIT_CRITICAL(&g_enc_mux);
   hostExitRealtimeCb();
 }
@@ -601,14 +847,40 @@ static inline void encGetSnapshot(EncShared* out) {
   portEXIT_CRITICAL(&g_enc_mux);
 }
 
-// 取并清零采样耗时累计（供 CPU 估计）
-static inline void encTakeBusy(uint32_t* acc, uint32_t* cnt) {
+// 取并清零采样耗时累计（供 CPU / LOAD 估计）
+static inline void encTakeBusy(uint32_t* acc, uint32_t* cnt, uint32_t* mx) {
   portENTER_CRITICAL(&g_enc_mux);
   *acc = g_enc.busy_acc;
   *cnt = g_enc.busy_cnt;
+  *mx = g_enc.busy_max;
   g_enc.busy_acc = 0;
   g_enc.busy_cnt = 0;
+  g_enc.busy_max = 0;
   portEXIT_CRITICAL(&g_enc_mux);
+}
+
+static void loadStatsReset() {
+  portENTER_CRITICAL(&g_load_mux);
+  enc_busy_max_us = 0;
+  enc_busy_max_window_us = 0;
+  enc_busy_avg_us = 0.0f;
+  ctrl_period_max_us = 0;
+  ctrl_period_avg_us = 0.0f;
+  ctrl_busy_max_us = 0;
+  ctrl_busy_avg_us = 0.0f;
+  ctrl_overrun_cnt = 0;
+  g_ctrl_last_wake_us = 0;
+  g_ctrl_period_acc_us = 0;
+  g_ctrl_period_n = 0;
+  g_ctrl_busy_acc_us = 0;
+  g_ctrl_busy_n = 0;
+  portEXIT_CRITICAL(&g_load_mux);
+  uint32_t a, c, m;
+  encTakeBusy(&a, &c, &m);  // 清窗内累计
+  (void)a;
+  (void)c;
+  (void)m;
+  hostAsyncLogDropReset();
 }
 
 // 启动高频采样（SPI 已在 setup 里 begin/beginTransaction）
@@ -626,6 +898,9 @@ void encoderBegin() {
   enc_ring_init(&g_enc_ring);
   enc_cb_rpm_filt_q16 = 0;
   enc_cb_rpm_stable_q16 = 0;
+#endif
+#if Q16_SHADOW_COMPARE
+  q16cmpFullReset();
 #endif
 
   const esp_timer_create_args_t args = {
@@ -704,8 +979,47 @@ float phaseRelFromAbs(float abs_deg) {
 }
 
 float discEstFromMotor() {
+  // 传感模型：霍尔 latch 绝对盘角 + 磁编连续推算
+  //   disc = wrap( disc_ref + esc_sense * (motor_now − motor_at_hall) / gear + offset )
+  // gear = 4661/168；esc_sense 使盘角随驱动方向递增；offset 修 0↔180 标反
   if (!flap_calibrated || GEAR_RATIO < 1.0f) return NAN;
-  return wrap360((motor_unwrapped_deg - flap_zero_motor_unwrap) / GEAR_RATIO);
+  float d_motor =
+      (float)(motor_unwrapped_counts - disc_ref_motor_counts) * ENC_DEG_PER_COUNT;
+  float d_disc = (float)esc_sense * d_motor / GEAR_RATIO;
+  return wrap360(disc_ref_deg + d_disc + disc_phase_offset_deg);
+}
+
+/** 盘上单向剩余角：盘相位已定义为随油门方向递增，始终 target−disc（勿再套 uniTravelDeg/esc_sense） */
+static float discRemainFwd(float disc, float target) {
+  float d = wrap360(target - disc);
+  return (d < 0.5f) ? 0.0f : d;
+}
+
+/**
+ * 霍尔（或 HALL CAL）绝对复位：记下 disc_ref 与当时电机计数。
+ * 之后盘相位只靠磁编；再过霍尔时再次调用纠正漂移。
+ */
+static void discLatchHall(float abs_disc_deg) {
+  abs_disc_deg = wrap360(abs_disc_deg);
+  disc_ref_deg = abs_disc_deg;
+  disc_ref_motor_unwrap = motor_unwrapped_deg;
+  disc_ref_motor_counts = motor_unwrapped_counts;
+  // 等价「盘 0° 时的电机展开角」：便于旧日志对照
+  // zero_motor = motor_now − esc_sense * disc_ref * gear
+  flap_zero_motor_unwrap =
+      motor_unwrapped_deg - (float)esc_sense * abs_disc_deg * GEAR_RATIO;
+  flap_calibrated = true;
+}
+
+/** 同霍尔抖动时拒绝重复 latch；换 0↔180 标记时行程门限减半 */
+static bool discLatchHallAllowed(float abs_disc_deg) {
+  if (!flap_calibrated) return true;
+  int64_t dc = motor_unwrapped_counts - disc_ref_motor_counts;
+  if (dc < 0) dc = -dc;
+  float dref = fabsf(wrap180(abs_disc_deg - disc_ref_deg));
+  int64_t need = HALL_LATCH_MIN_MOTOR_COUNTS;
+  if (dref > 90.0f) need = HALL_LATCH_MIN_MOTOR_COUNTS / 2;
+  return dc >= need;
 }
 
 bool hallIsActive(uint8_t lvl) {
@@ -784,9 +1098,12 @@ void hallSetup() {
 }
 
 void hallCalibrateNow() {
-  flap_zero_motor_unwrap = motor_unwrapped_deg;
-  flap_calibrated = true;
+  // 语义：当前物理位 = 盘 0°（应在 GPIO4 下扑点执行；非任意姿）
+  discLatchHall(0.0f);
   last_hd_disc = 0.0f;
+  last_hd_motor_unwrap = motor_unwrapped_deg;
+  last_hd_motor_unwrap_counts = motor_unwrapped_counts;
+  has_hd_counts = true;
 }
 
 /** 把定点 ×1e6 值格式化为「整数.六位」；<0 视为无数据打印 -1.000000 */
@@ -861,12 +1178,14 @@ void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
   // —— 0° 下扑：两次过 0 点 = 输出盘一整转 ——
   while (hall_dn_irq_seen != dn_irq) {
     hall_dn_irq_seen++;
-    if (hall_dn_count >= 1) {
+    const bool latch_ok = discLatchHallAllowed(0.0f);
+    if (latch_ok && hall_dn_count >= 1) {
       hallMeasureFullTurn(now, last_hd_ms, last_hd_motor_unwrap,
                           last_hd_motor_unwrap_counts, has_hd_counts,
                           &out_hz_meas_dn, &gear_ratio_meas_dn,
                           &out_hz_micro_dn, &gear_micro_dn, 1);
     }
+    if (!latch_ok) continue;  // 抖动沿：吃掉 IRQ，不重复 latch/测比
     hall_dn_count++;
     last_hd_ms = now;
     last_hd_motor_rel = motor_rel;
@@ -875,8 +1194,8 @@ void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
     last_hd_motor_unwrap = motor_unwrapped_deg;
     last_hd_motor_unwrap_counts = motor_unwrapped_counts;
     has_hd_counts = true;
-    flap_zero_motor_unwrap = motor_unwrapped_deg;
-    flap_calibrated = true;
+    // GPIO4 = 物理 0°：绝对复位；此后磁编推算盘相位
+    discLatchHall(0.0f);
     last_hd_disc = 0.0f;
     {
       char b_oh[24], b_g[24], b_d[24];
@@ -885,22 +1204,26 @@ void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
       fmtMicro(b_d, sizeof(b_d), GEAR_DESIGN_MICRO);
       hostPrintf(
           "# HALL DOWN t_ms=%lu motor_rel=%.3f raw=%u "
-          "out_hz=%s gear_meas=%s design=%s src=0deg count=%lu irq_us=%lu\n",
+          "out_hz=%s gear_meas=%s design=%s src=0deg count=%lu irq_us=%lu "
+          "latch_ref=0 motor_cnt=%lld\n",
           (unsigned long)now, (double)motor_rel, (unsigned)raw,
           b_oh, b_g, b_d, (unsigned long)hall_dn_count,
-          (unsigned long)hall_dn_irq_us);
+          (unsigned long)hall_dn_irq_us,
+          (long long)disc_ref_motor_counts);
     }
   }
 
   // —— 180° 上举：两次过 180 点 = 输出盘一整转 ——
   while (hall_up_irq_seen != up_irq) {
     hall_up_irq_seen++;
-    if (hall_up_count >= 1) {
+    const bool latch_ok = discLatchHallAllowed(180.0f);
+    if (latch_ok && hall_up_count >= 1) {
       hallMeasureFullTurn(now, last_hu_ms, last_hu_motor_unwrap,
                           last_hu_motor_unwrap_counts, has_hu_counts,
                           &out_hz_meas_up, &gear_ratio_meas_up,
                           &out_hz_micro_up, &gear_micro_up, 2);
     }
+    if (!latch_ok) continue;
     hall_up_count++;
     last_hu_ms = now;
     last_hu_motor_rel = motor_rel;
@@ -909,7 +1232,10 @@ void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
     last_hu_motor_unwrap = motor_unwrapped_deg;
     last_hu_motor_unwrap_counts = motor_unwrapped_counts;
     has_hu_counts = true;
-    last_hu_disc = discEstFromMotor();
+    // GPIO5 = 物理 180°：绝对复位（纠正仅靠 GPIO4 零点时的 ~180° 错位/漂移）
+    float disc_before = discEstFromMotor();
+    discLatchHall(180.0f);
+    last_hu_disc = 180.0f;
     {
       char b_oh[24], b_g[24], b_d[24];
       fmtMicro(b_oh, sizeof(b_oh), out_hz_micro_up);
@@ -917,10 +1243,13 @@ void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
       fmtMicro(b_d, sizeof(b_d), GEAR_DESIGN_MICRO);
       hostPrintf(
           "# HALL UP t_ms=%lu motor_rel=%.3f raw=%u "
-          "out_hz=%s gear_meas=%s design=%s src=180deg count=%lu irq_us=%lu\n",
+          "out_hz=%s gear_meas=%s design=%s src=180deg count=%lu irq_us=%lu "
+          "latch_ref=180 disc_before=%.2f motor_cnt=%lld\n",
           (unsigned long)now, (double)motor_rel, (unsigned)raw,
           b_oh, b_g, b_d, (unsigned long)hall_up_count,
-          (unsigned long)hall_up_irq_us);
+          (unsigned long)hall_up_irq_us,
+          (double)(isnan(disc_before) ? -1.0f : disc_before),
+          (long long)disc_ref_motor_counts);
     }
   }
 }
@@ -933,19 +1262,30 @@ void hallPrintStatus() {
       hall_up_samp_n ? (100.0f * (float)hall_up_low_n / (float)hall_up_samp_n) : 0.0f;
   hostPrintf(
       "# HALL dn_pin=%d up_pin=%d active=%s irq=%s isr_ok=%d dn_lvl=%u up_lvl=%u "
-      "dn_cnt=%lu up_cnt=%lu irq_dn=%lu irq_up=%lu cal=%d gear=%.6f (59*79)/(12*14)\n",
+      "dn_cnt=%lu up_cnt=%lu irq_dn=%lu irq_up=%lu cal=%d gear=%d/%d=%.6f "
+      "(12*14 / 59*79)\n",
       PIN_HALL_DOWN, PIN_HALL_UP, hall_active_low ? "LOW" : "HIGH",
       "ANYEDGE+SW", hall_gpio_isr_ok ? 1 : 0,
       (unsigned)hall_dn_lvl, (unsigned)hall_up_lvl,
       (unsigned long)hall_dn_count, (unsigned long)hall_up_count,
       (unsigned long)hall_dn_irq_cnt, (unsigned long)hall_up_irq_cnt,
-      flap_calibrated ? 1 : 0, (double)GEAR_RATIO);
+      flap_calibrated ? 1 : 0, (int)GEAR_RATIO_NUM, (int)GEAR_RATIO_DEN,
+      (double)GEAR_RATIO);
   hostPrintf(
       "# HALL SAMP dn_low%%=%.2f (%lu/%lu) up_low%%=%.2f (%lu/%lu) "
       "poll_dn=%lu poll_up=%lu (spinning: low%% should be >0 if DO reaches pad)\n",
       (double)dn_low_pct, (unsigned long)hall_dn_low_n, (unsigned long)hall_dn_samp_n,
       (double)up_low_pct, (unsigned long)hall_up_low_n, (unsigned long)hall_up_samp_n,
       (unsigned long)hall_dn_poll_edge, (unsigned long)hall_up_poll_edge);
+  hostPrintf(
+      "# HALL LATCH ref=%.1f motor_unwrap=%.3f counts=%lld esc_sense=%d | "
+      "last_dn disc=%.3f | last_up disc=%.3f | disc_now=%.3f "
+      "(model: disc=wrap(ref+sense*dmotor/gear); Halls reset, enc continuous)\n",
+      (double)disc_ref_deg, (double)disc_ref_motor_unwrap,
+      (long long)disc_ref_motor_counts, esc_sense,
+      (double)(isnan(last_hd_disc) ? -1.0f : last_hd_disc),
+      (double)(isnan(last_hu_disc) ? -1.0f : last_hu_disc),
+      (double)(isnan(disc) ? -1.0f : disc));
   hostPrintf(
       "# HALL last_dn motor_rel=%.3f disc=%.3f | last_up motor_rel=%.3f disc=%.3f | "
       "disc_now=%.3f\n",
@@ -1180,6 +1520,17 @@ void loadMapsFromNvs() {
   phase_zero_deg = prefs.getFloat("ph0", 0.0f);
   esc_sense = prefs.getInt("esense", 1);
   if (esc_sense != 1 && esc_sense != -1) esc_sense = 1;
+  holdph_lead_deg = prefs.getFloat("hplead", 10.0f);
+  holdph_lead_ms = prefs.getFloat("hpleadt", 100.0f);
+  holdph_lead_rpm_k = prefs.getFloat("hpleadk", 0.03f);
+  disc_phase_offset_deg = prefs.getFloat("hphoff", 0.0f);
+  disc_phase_offset_deg = wrap360(disc_phase_offset_deg);
+  if (holdph_lead_deg < 1.0f) holdph_lead_deg = 1.0f;
+  if (holdph_lead_deg > 60.0f) holdph_lead_deg = 60.0f;
+  if (holdph_lead_ms < 0.0f) holdph_lead_ms = 0.0f;
+  if (holdph_lead_ms > 500.0f) holdph_lead_ms = 500.0f;
+  if (holdph_lead_rpm_k < 0.0f) holdph_lead_rpm_k = 0.0f;
+  if (holdph_lead_rpm_k > 0.2f) holdph_lead_rpm_k = 0.2f;
 }
 
 // ---------------- 分区 PID（GainMap） ----------------
@@ -1260,6 +1611,13 @@ void savePhaseZeroToNvs() {
   prefs.putFloat("ph0", phase_zero_deg);
 }
 
+void saveHoldPhaseLeadToNvs() {
+  prefs.putFloat("hplead", holdph_lead_deg);
+  prefs.putFloat("hpleadt", holdph_lead_ms);
+  prefs.putFloat("hpleadk", holdph_lead_rpm_k);
+  prefs.putFloat("hphoff", disc_phase_offset_deg);
+}
+
 void saveEscSenseToNvs() {
   prefs.putInt("esense", esc_sense);
 }
@@ -1276,6 +1634,398 @@ void clearPid() {
   pid_prev_err = 0.0f;
 }
 
+/** CTRL?/FLIGHT?/HOST? 共用状态串（配置值；FLIGHT/TEST 豁免见 controlTick）。 */
+static const char* hostTimeoutStatusStr() {
+  if (flight_mode) return "disabled(flight)";
+  if (test_active) return "disabled(test)";
+  if (host_timeout_ms == 0) return "disabled(HOST OFF)";
+  static char buf[24];
+  snprintf(buf, sizeof(buf), "%.3fs", (double)host_timeout_ms / 1000.0);
+  return buf;
+}
+
+// ---------------- 板内 TEST 状态机（判定写死；打印仅状态切换，走 async log）----------------
+static float testMedianInplace(float* a, uint8_t n) {
+  if (n == 0) return 0.0f;
+  // 插入排序（n≤64）
+  for (uint8_t i = 1; i < n; ++i) {
+    float v = a[i];
+    int j = (int)i - 1;
+    while (j >= 0 && a[j] > v) {
+      a[j + 1] = a[j];
+      --j;
+    }
+    a[j + 1] = v;
+  }
+  if (n & 1) return a[n / 2];
+  return 0.5f * (a[n / 2 - 1] + a[n / 2]);
+}
+
+static void testSpinReset() {
+  test_spin_n = 0;
+  test_spin_above = 0;
+  test_spin_last_ms = 0;
+  test_hall0_dn = hall_dn_irq_cnt;
+  test_hall0_up = hall_up_irq_cnt;
+}
+
+static void testHoldReset() {
+  test_hold_sum = 0.0f;
+  test_hold_err_sum = 0.0f;
+  test_hold_n = 0;
+  test_pulse_peak = esc_pulse_us;
+  test_pulse_sat = false;
+}
+
+static void testNotePulse() {
+  if (esc_pulse_us > test_pulse_peak) test_pulse_peak = esc_pulse_us;
+  if (esc_pulse_us >= (ESC_PULSE_MAX_US - 2)) test_pulse_sat = true;
+}
+
+static float mapRpmMaxOf(const ThrottleMap& m) {
+  if (!m.valid || m.n < 1) return 0.0f;
+  return m.rpm[m.n - 1];
+}
+
+/** 低优路径打印：TUNE 摘要（mean_err/u/ff/pulse + 一句建议）。 */
+static void tuneEmitSummary(const char* tag) {
+  const TuneStats& t = tuneStats();
+  char hint[96];
+  int code = tuneHint(hint, sizeof(hint));
+  if (t.n < 1) {
+    hostPrintf("# %s n=0 (no closed samples; TUNE REC ON or run CLOSED/TEST)\n",
+               tag ? tag : "TUNE");
+    return;
+  }
+  float inv = 1.0f / (float)t.n;
+  hostPrintf(
+      "# %s n=%lu mean_err=%.1f mean_u=%.1f mean_ff=%.0f mean_pulse=%.0f "
+      "mean_rpm=%.0f mean_tgt=%.0f i_sat=%lu/%lu map_max=%.0f hint=%s code=%d\n",
+      tag ? tag : "TUNE", (unsigned long)t.n, (double)(t.sum_err * inv),
+      (double)(t.sum_u * inv), (double)(t.sum_ff * inv), (double)(t.sum_pulse * inv),
+      (double)(t.sum_rpm * inv), (double)(t.sum_tgt * inv), (unsigned long)t.i_sat_n,
+      (unsigned long)t.n, (double)t.map_rpm_max, hint, code);
+}
+
+static void testEmitDone() {
+  hostPrintf(
+      "# TEST DONE name=%s ok=%d enc_rpm=%.0f target=%.0f pulse=%u err=%.0f "
+      "hall_d=%d sat=%d reason=%s\n",
+      test_name, test_ok ? 1 : 0, (double)test_enc_rpm, (double)test_set_rpm,
+      (unsigned)test_pulse_peak, (double)test_err_mean, test_hall_d,
+      test_pulse_sat ? 1 : 0, test_reason);
+  tuneEmitSummary("TEST LOG");
+  if (test_ok) {
+    hostPrintf("# TEST OK name=%s enc_rpm=%.0f\n", test_name, (double)test_enc_rpm);
+  } else {
+    hostPrintf("# TEST FAIL name=%s reason=%s\n", test_name, test_reason);
+  }
+}
+
+static void testFinish(bool ok, const char* reason) {
+  if (!test_active && !test_finish_pending) return;
+  test_ok = ok;
+  strncpy(test_reason, reason, sizeof(test_reason) - 1);
+  test_reason[sizeof(test_reason) - 1] = '\0';
+  test_active = false;
+  test_finish_pending = false;
+  test_phase = TEST_PH_DONE;
+  // 停油（不走 doStop 以免多余 ACK 淹没摘要；仍清运行态）
+  target_cmd = 0.0f;
+  target_ramped = 0.0f;
+  clearPid();
+  open_pwm_hold = false;
+  if (run_state == RUN_RUNNING) run_state = RUN_IDLE;
+  applyEscPulse(ESC_PULSE_MIN_US);
+  testEmitDone();
+  if (tune_owned_by_test) {
+    tuneRecSet(false);
+    tune_owned_by_test = false;
+  }
+}
+
+static void testAbortQuiet() {
+  // ESTOP 已停油：只收尾 TEST 摘要
+  if (!test_active) return;
+  test_ok = false;
+  strncpy(test_reason, "estop", sizeof(test_reason) - 1);
+  test_reason[sizeof(test_reason) - 1] = '\0';
+  test_active = false;
+  test_phase = TEST_PH_DONE;
+  test_enc_rpm = fabsf(rpm_signed_stable);
+  test_err_mean = fabsf(test_enc_rpm - test_set_rpm);
+  test_hall_d = (int)((hall_dn_irq_cnt - test_hall0_dn) + (hall_up_irq_cnt - test_hall0_up));
+  test_pulse_peak = esc_pulse_us;
+  testEmitDone();
+  if (tune_owned_by_test) {
+    tuneRecSet(false);
+    tune_owned_by_test = false;
+  }
+}
+
+static bool testEvalSpin(float* mean_out, float* med_out, int* hall_d_out, bool* hall_ok_out) {
+  uint8_t n = test_spin_n;
+  float mean = 0.0f;
+  if (n > 0) {
+    float s = 0.0f;
+    for (uint8_t i = 0; i < n; ++i) s += test_spin_buf[i];
+    mean = s / (float)n;
+  }
+  float tmp[TEST_SPIN_MAX_SAMP];
+  for (uint8_t i = 0; i < n; ++i) tmp[i] = test_spin_buf[i];
+  float med = testMedianInplace(tmp, n);
+  float level = (med > 1.0f) ? med : mean;
+  float frac = (n > 0) ? ((float)test_spin_above / (float)n) : 0.0f;
+  bool enc_ok = (n >= 10) && (level > TEST_RPM_SPIN_MIN) && (frac >= TEST_SPIN_FRAC_MIN);
+  int ddn = (int)(hall_dn_irq_cnt - test_hall0_dn);
+  int dup = (int)(hall_up_irq_cnt - test_hall0_up);
+  int hd = ddn + dup;
+  bool hall_ok = (hd >= 1);
+  if (mean_out) *mean_out = mean;
+  if (med_out) *med_out = med;
+  if (hall_d_out) *hall_d_out = hd;
+  if (hall_ok_out) *hall_ok_out = hall_ok;
+  return enc_ok;
+}
+
+static void testArmClosed(float rpm) {
+  if (run_state == RUN_ESTOP) run_state = RUN_IDLE;
+  ctrl_mode = MODE_CLOSED;
+  soft_enable = true;
+  soft_rate_up_rpm_s = TEST_SOFT_RATE_UP;
+  soft_rate_down_rpm_s = TEST_SOFT_RATE_DOWN;
+  soft_rate_rpm_s = TEST_SOFT_RATE_UP;
+  target_rpm_max = TEST_RPMMAX;
+  open_pwm_hold = false;
+  learn_active = false;
+  measure_active = false;
+  target_cmd = rpm;
+  test_set_rpm = rpm;
+  if (!soft_enable) target_ramped = target_cmd;
+  clearPid();
+  run_state = RUN_RUNNING;
+  last_host_ms = millis();
+  host_seen = true;
+  hostPrintf("# TEST ARM name=%s rpm=%.0f mode=CLOSED soft_up=%.0f\n",
+             test_name, (double)rpm, (double)TEST_SOFT_RATE_UP);
+}
+
+static bool testStartByName(const char* name) {
+  if (test_active) {
+    hostPrintln("# ERR TEST busy; TEST STOP first");
+    return false;
+  }
+  TestKind k = TEST_KIND_NONE;
+  if (strcasecmp(name, "smoke2000") == 0) k = TEST_KIND_SMOKE2000;
+  else if (strcasecmp(name, "step7500") == 0) k = TEST_KIND_STEP7500;
+  else if (strcasecmp(name, "idle") == 0) k = TEST_KIND_IDLE;
+  else {
+    hostPrintln("# ERR TEST START smoke2000|step7500|idle");
+    return false;
+  }
+  test_kind = k;
+  strncpy(test_name, name, sizeof(test_name) - 1);
+  test_name[sizeof(test_name) - 1] = '\0';
+  test_reason[0] = '\0';
+  test_ok = false;
+  test_enc_rpm = 0.0f;
+  test_err_mean = 0.0f;
+  test_hall_d = 0;
+  test_pulse_peak = 0;
+  test_pulse_sat = false;
+  test_finish_pending = false;
+  test_active = true;
+  test_phase_t0 = millis();
+  // TEST 段内自动 RAM 记录（不依赖主机保活）；结束打 # TEST LOG
+  tuneSetMapRpmMax(mapRpmMaxOf(activeMap()));
+  if (!tuneRecOn()) {
+    tuneRecSet(true);
+    tune_owned_by_test = true;
+  } else {
+    tuneRecReset();
+    tune_owned_by_test = false;
+  }
+  if (k == TEST_KIND_IDLE) {
+    test_set_rpm = 0.0f;
+    test_err_frac = 0.0f;
+    test_hold_ms = TEST_IDLE_WINDOW_MS;
+    testHoldReset();
+    test_phase = TEST_PH_HOLD;  // 直接采静止窗
+    hostPrintf("# TEST START name=idle hold_ms=%lu\n", (unsigned long)TEST_IDLE_WINDOW_MS);
+  } else if (k == TEST_KIND_SMOKE2000) {
+    test_err_frac = TEST_SMOKE_ERR_FRAC;
+    test_hold_ms = TEST_SMOKE_HOLD_MS;
+    test_phase = TEST_PH_ARM;
+    hostPrintf("# TEST START name=smoke2000 target=%.0f hold_ms=%lu\n",
+               (double)TEST_SMOKE_RPM, (unsigned long)TEST_SMOKE_HOLD_MS);
+  } else {
+    test_err_frac = TEST_STEP_ERR_FRAC;
+    test_hold_ms = TEST_STEP_HOLD_MS;
+    test_phase = TEST_PH_ARM;
+    hostPrintf("# TEST START name=step7500 gate=%.0f then=%.0f hold_ms=%lu\n",
+               (double)TEST_SMOKE_RPM, (double)TEST_STEP_RPM, (unsigned long)TEST_STEP_HOLD_MS);
+  }
+  return true;
+}
+
+static void testStopCmd() {
+  if (!test_active) {
+    hostPrintln("# ACK TEST STOP (idle)");
+    return;
+  }
+  test_enc_rpm = fabsf(rpm_signed_stable);
+  test_err_mean = fabsf(test_enc_rpm - test_set_rpm);
+  test_hall_d = (int)((hall_dn_irq_cnt - test_hall0_dn) + (hall_up_irq_cnt - test_hall0_up));
+  test_pulse_peak = esc_pulse_us;
+  testFinish(false, "host_stop");
+}
+
+static void testStatusCmd() {
+  const char* ph = "?";
+  switch (test_phase) {
+    case TEST_PH_IDLE: ph = "idle"; break;
+    case TEST_PH_ARM: ph = "arm"; break;
+    case TEST_PH_RAMP: ph = "ramp"; break;
+    case TEST_PH_SPIN: ph = "spin"; break;
+    case TEST_PH_HOLD: ph = "hold"; break;
+    case TEST_PH_STEP_RAMP: ph = "step_ramp"; break;
+    case TEST_PH_STEP_SPIN: ph = "step_spin"; break;
+    case TEST_PH_STEP_HOLD: ph = "step_hold"; break;
+    case TEST_PH_STOPPING: ph = "stopping"; break;
+    case TEST_PH_DONE: ph = "done"; break;
+  }
+  hostPrintf(
+      "# TEST active=%d name=%s phase=%s target=%.0f enc=%.0f pulse=%u ok=%d reason=%s\n",
+      test_active ? 1 : 0, test_name[0] ? test_name : "-", ph, (double)test_set_rpm,
+      (double)fabsf(rpm_signed_stable), (unsigned)esc_pulse_us, test_ok ? 1 : 0,
+      test_reason[0] ? test_reason : "-");
+}
+
+/** 400Hz 控制任务内调用：状态切换才 hostPrintf（异步环）。 */
+static void testTick(float rpm_meas) {
+  if (!test_active) return;
+  uint32_t now = millis();
+  float rpm = fabsf(rpm_meas);
+  testNotePulse();
+
+  switch (test_phase) {
+    case TEST_PH_ARM:
+      if (test_kind == TEST_KIND_SMOKE2000 || test_kind == TEST_KIND_STEP7500) {
+        testArmClosed(TEST_SMOKE_RPM);
+        test_phase = TEST_PH_RAMP;
+        test_phase_t0 = now;
+      }
+      break;
+
+    case TEST_PH_RAMP:
+      if (fabsf(target_ramped - test_set_rpm) <= TEST_RAMP_NEAR_RPM ||
+          (now - test_phase_t0) >= TEST_RAMP_TIMEOUT_MS) {
+        testSpinReset();
+        test_phase = TEST_PH_SPIN;
+        test_phase_t0 = now;
+        hostPrintf("# TEST SPIN begin target=%.0f\n", (double)test_set_rpm);
+      }
+      break;
+
+    case TEST_PH_SPIN:
+    case TEST_PH_STEP_SPIN: {
+      if (test_spin_last_ms == 0 || (now - test_spin_last_ms) >= TEST_SPIN_SAMPLE_MS) {
+        test_spin_last_ms = now;
+        if (test_spin_n < TEST_SPIN_MAX_SAMP) {
+          test_spin_buf[test_spin_n++] = rpm;
+          if (rpm > TEST_RPM_SPIN_MIN) test_spin_above++;
+        }
+      }
+      if ((now - test_phase_t0) < TEST_SPIN_WINDOW_MS) break;
+      float mean = 0.0f, med = 0.0f;
+      int hd = 0;
+      bool hall_ok = false;
+      bool enc_ok = testEvalSpin(&mean, &med, &hd, &hall_ok);
+      test_enc_rpm = (med > 1.0f) ? med : mean;
+      test_hall_d = hd;
+      test_err_mean = fabsf(test_enc_rpm - test_set_rpm);
+      hostPrintf("# TEST SPIN enc_ok=%d hall_ok=%d enc=%.0f hall_d=%d\n",
+                 enc_ok ? 1 : 0, hall_ok ? 1 : 0, (double)test_enc_rpm, hd);
+      if (!enc_ok) {
+        testFinish(false, "no_spin");
+        break;
+      }
+      if (test_phase == TEST_PH_SPIN && test_kind == TEST_KIND_STEP7500) {
+        // smoke 门闩通过 → 升 7500
+        target_cmd = TEST_STEP_RPM;
+        test_set_rpm = TEST_STEP_RPM;
+        test_phase = TEST_PH_STEP_RAMP;
+        test_phase_t0 = now;
+        hostPrintf("# TEST GATE ok -> step %.0f\n", (double)TEST_STEP_RPM);
+      } else if (test_phase == TEST_PH_STEP_SPIN) {
+        testHoldReset();
+        test_phase = TEST_PH_STEP_HOLD;
+        test_phase_t0 = now;
+        hostPrintf("# TEST HOLD begin target=%.0f ms=%lu\n",
+                   (double)test_set_rpm, (unsigned long)test_hold_ms);
+      } else {
+        // smoke2000：进入保持
+        testHoldReset();
+        test_phase = TEST_PH_HOLD;
+        test_phase_t0 = now;
+        hostPrintf("# TEST HOLD begin target=%.0f ms=%lu\n",
+                   (double)test_set_rpm, (unsigned long)test_hold_ms);
+      }
+      break;
+    }
+
+    case TEST_PH_STEP_RAMP:
+      if (fabsf(target_ramped - test_set_rpm) <= TEST_RAMP_NEAR_RPM ||
+          (now - test_phase_t0) >= TEST_RAMP_TIMEOUT_MS) {
+        testSpinReset();
+        test_phase = TEST_PH_STEP_SPIN;
+        test_phase_t0 = now;
+        hostPrintf("# TEST SPIN begin target=%.0f\n", (double)test_set_rpm);
+      }
+      break;
+
+    case TEST_PH_HOLD:
+    case TEST_PH_STEP_HOLD: {
+      if (test_kind == TEST_KIND_IDLE) {
+        // 静止确认：不给油
+        if (run_state == RUN_RUNNING) {
+          target_cmd = 0.0f;
+          target_ramped = 0.0f;
+          applyEscPulse(ESC_PULSE_MIN_US);
+          run_state = RUN_IDLE;
+        }
+      }
+      test_hold_sum += rpm;
+      test_hold_err_sum += fabsf(rpm - test_set_rpm);
+      test_hold_n++;
+      if ((now - test_phase_t0) < test_hold_ms) break;
+      float mean = (test_hold_n > 0) ? (test_hold_sum / (float)test_hold_n) : 0.0f;
+      float errm = (test_hold_n > 0) ? (test_hold_err_sum / (float)test_hold_n) : 0.0f;
+      test_enc_rpm = mean;
+      test_err_mean = errm;
+      test_hall_d = (int)((hall_dn_irq_cnt - test_hall0_dn) + (hall_up_irq_cnt - test_hall0_up));
+      if (test_kind == TEST_KIND_IDLE) {
+        bool ok = (mean <= TEST_IDLE_RPM_MAX);
+        testFinish(ok, ok ? "idle_ok" : "not_idle");
+        break;
+      }
+      float lim = test_set_rpm * test_err_frac;
+      if (lim < 150.0f) lim = 150.0f;
+      bool ok = (fabsf(mean - test_set_rpm) <= lim) || (errm <= lim);
+      // pulse 饱和仅记入 sat=，不单独 FAIL
+      if (run_state == RUN_ESTOP) ok = false;
+      testFinish(ok, ok ? "hold_ok" : "hold_err");
+      break;
+    }
+
+    case TEST_PH_STOPPING:
+    case TEST_PH_DONE:
+    case TEST_PH_IDLE:
+    default:
+      break;
+  }
+}
+
 void doEstop(const char* reason) {
   run_state = RUN_ESTOP;
   target_cmd = 0.0f;
@@ -1285,14 +2035,27 @@ void doEstop(const char* reason) {
   measure_active = false;
   open_pwm_hold = false;
   move_active = false;
+  holdph_active = false;
   sense_learn = false;
   esccal_high = false;
   if (ctrl_mode == MODE_LEARN || ctrl_mode == MODE_MEASURE) ctrl_mode = MODE_OPEN;
   applyEscPulse(ESC_PULSE_MIN_US);
+  if (test_active) {
+    test_finish_pending = true;
+    testAbortQuiet();
+  }
   hostPrintf("# ESTOP %s pulse=%u\n", reason, (unsigned)esc_pulse_us);
 }
 
 void doStop(bool immediate) {
+  if (test_active) {
+    test_enc_rpm = fabsf(rpm_signed_stable);
+    test_err_mean = fabsf(test_enc_rpm - test_set_rpm);
+    test_hall_d = (int)((hall_dn_irq_cnt - test_hall0_dn) + (hall_up_irq_cnt - test_hall0_up));
+    test_pulse_peak = esc_pulse_us;
+    testFinish(false, "host_stop");
+    return;
+  }
   target_cmd = 0.0f;
   if (immediate || !soft_enable) {
     target_ramped = 0.0f;
@@ -1304,6 +2067,7 @@ void doStop(bool immediate) {
   measure_active = false;
   open_pwm_hold = false;
   move_active = false;
+  holdph_active = false;
   sense_learn = false;
   if (ctrl_mode == MODE_LEARN || ctrl_mode == MODE_MEASURE) ctrl_mode = MODE_OPEN;
   hostPrintf("# ACK STOP soft=%d pulse=%u\n", soft_enable && !immediate, (unsigned)esc_pulse_us);
@@ -1412,10 +2176,11 @@ uint16_t computePulseClosed(float rpm_tgt, float rpm_meas, float dt) {
       i_lim = adg_i_lim_decel;
     }
   } else {
-    i_lim = 800.0f;
+    // ADG OFF：硬限；7500 实测 u≈60≈ki*800+kp*err 触顶（次因）。治本仍是扩展前馈。
+    i_lim = 1200.0f;
   }
   if (i_lim < 50.0f) i_lim = 50.0f;
-  if (i_lim > 800.0f) i_lim = 800.0f;
+  if (i_lim > 1200.0f) i_lim = 1200.0f;
 
   pid_i += err * dt;
   if (pid_i > i_lim) pid_i = i_lim;
@@ -1425,10 +2190,19 @@ uint16_t computePulseClosed(float rpm_tgt, float rpm_meas, float dt) {
   float u = kp_use * err + ki_use * pid_i + kd_use * derr;
   // S2 加速度前馈：用指令斜坡加速度（非实测 α），单位 ka=us/(rpm/s)
   float uff = ka_us_per_rpms * soft_cmd_accel_rpm_s;
-  long pulse = (long)ff + (long)(u + uff + ((u + uff) >= 0 ? 0.5f : -0.5f));
+  float u_tot = u + uff;
+  long pulse = (long)ff + (long)(u_tot + ((u_tot >= 0) ? 0.5f : -0.5f));
   if (pulse < ESC_PULSE_MIN_US) pulse = ESC_PULSE_MIN_US;
   if (pulse > ESC_PULSE_MAX_US) pulse = ESC_PULSE_MAX_US;
-  return (uint16_t)pulse;
+  uint16_t pout = (uint16_t)pulse;
+  g_closed_err = err;
+  g_closed_ff = (float)ff;
+  g_closed_u = u_tot;
+  // RAM 记录：不依赖主机保活；实时路径禁打印
+  if (tuneRecOn()) {
+    tuneRecPush(err, (float)ff, u_tot, pout, meas, rpm_tgt, pid_i, i_lim);
+  }
+  return pout;
 }
 
 void learnBegin() {
@@ -1916,6 +2690,392 @@ void phaseMoveFinish(const char* why) {
                 why, (double)move_accum_deg, (double)move_target_deg);
 }
 
+void holdPhaseFinish(const char* why) {
+  float disc = discEstFromMotor();
+  uint32_t elapsed = millis() - holdph_t0_ms;
+  uint32_t brake_age =
+      (holdph_brake_ms > 0) ? (millis() - holdph_brake_ms) : 0;
+  uint32_t prof = holdph_profile_ms;
+  uint32_t soft = holdph_soft_ms;
+  float rpm0 = holdph_rpm_start;
+  holdph_active = false;
+  sense_learn = false;
+  move_active = false;
+  target_cmd = 0.0f;
+  target_ramped = 0.0f;
+  soft_cmd_accel_rpm_s = 0.0f;
+  holdph_pulse = ESC_PULSE_MIN_US;
+  holdph_state = HOLDPH_ST_APPROACH;
+  holdph_profile_ms = 0;
+  holdph_soft_ms = 0;
+  holdph_soft_done = false;
+  clearPid();
+  run_state = RUN_IDLE;
+  applyEscPulse(ESC_PULSE_MIN_US);
+  hostPrintf(
+      "# ACK HOLD PHASE DONE reason=%s target=%.1f disc=%.2f lead=%.1f "
+      "hall_confirm=%d pulse=%u elapsed_ms=%lu brake_to_stop_ms=%lu "
+      "profile_ms=%lu soft_ms=%lu rpm0=%.0f\n",
+      why, (double)holdph_target_deg,
+      (double)(isnan(disc) ? -1.0f : disc), (double)holdph_lead_deg,
+      holdph_hall_seen ? 1 : 0, (unsigned)esc_pulse_us,
+      (unsigned long)elapsed, (unsigned long)brake_age,
+      (unsigned long)prof, (unsigned long)soft, (double)rpm0);
+}
+
+/** 有效提前量（盘°）：基础角 + ω·T + k·RPM；单向接近时在「目标前」这么多度切油 */
+static float holdPhaseEffectiveLead(float disc_rate_deg_s, float motor_rpm_abs) {
+  float lead = holdph_lead_deg;
+  if (disc_rate_deg_s > 0.0f && holdph_lead_ms > 0.0f) {
+    lead += disc_rate_deg_s * (holdph_lead_ms * 0.001f);
+  }
+  lead += holdph_lead_rpm_k * motor_rpm_abs;
+  if (lead < 2.0f) lead = 2.0f;
+  if (lead > 80.0f) lead = 80.0f;
+  return lead;
+}
+
+/** 接近段：剩余盘角越大油门越高；近提前区再降速；脉宽夹 holdph_max_pulse */
+static void holdPhaseApplyCrawl(float remain_disc_deg) {
+  float rpm = holdph_crawl_rpm;
+  if (remain_disc_deg < 50.0f) rpm = fminf(rpm, 100.0f);
+  if (remain_disc_deg < 25.0f) rpm = fminf(rpm, 70.0f);
+  if (remain_disc_deg < 15.0f) rpm = fminf(rpm, 55.0f);
+  if (rpm < 40.0f) rpm = 40.0f;
+  target_cmd = rpm;
+  target_ramped = rpm;
+  soft_cmd_accel_rpm_s = 0.0f;
+  uint16_t p = computePulseCrawl(rpm);
+  if (p > holdph_max_pulse) p = holdph_max_pulse;
+  if (p < CRAWL_PULSE_MIN) p = CRAWL_PULSE_MIN;
+  holdph_pulse = p;
+}
+
+/** 软降段：闭环线性 RPM 指令 start→crawl；不夹 max_pulse */
+static void holdPhaseApplySoftDown(uint32_t elapsed_ms, float motor_rpm_abs) {
+  float u = 1.0f;
+  if (holdph_soft_ms > 0) {
+    u = (float)elapsed_ms / (float)holdph_soft_ms;
+    if (u < 0.0f) u = 0.0f;
+    if (u > 1.0f) u = 1.0f;
+  }
+  float rpm_cmd =
+      holdph_rpm_start + (holdph_crawl_rpm - holdph_rpm_start) * u;
+  if (rpm_cmd < holdph_crawl_rpm) rpm_cmd = holdph_crawl_rpm;
+  float dt = 1.0f / (float)CTRL_HZ;
+  float rate = 0.0f;
+  if (holdph_soft_ms > 0) {
+    rate = (holdph_crawl_rpm - holdph_rpm_start) * 1000.0f /
+           (float)holdph_soft_ms;  // 负=减速
+  }
+  soft_cmd_accel_rpm_s = rate;
+  target_cmd = rpm_cmd;
+  target_ramped = rpm_cmd;
+  ctrl_mode = MODE_CLOSED;
+  holdph_pulse = computePulseClosed(rpm_cmd, motor_rpm_abs, dt);
+}
+
+static void holdPhaseEnterBrake(const char* why) {
+  holdph_state = HOLDPH_ST_BRAKE;
+  holdph_brake_ms = millis();
+  target_cmd = 0.0f;
+  target_ramped = 0.0f;
+  soft_cmd_accel_rpm_s = 0.0f;
+  holdph_pulse = ESC_PULSE_MIN_US;
+  applyEscPulse(ESC_PULSE_MIN_US);
+  hostPrintf(
+      "# HOLD PHASE BRAKE reason=%s remain_was=%.2f elapsed_ms=%lu rpm=%.0f\n",
+      why, (double)(isnan(holdph_prev_remain) ? -1.0f : holdph_prev_remain),
+      (unsigned long)(millis() - holdph_t0_ms), (double)fabsf(rpm_signed_stable));
+}
+
+/** stop_ms=0：旧行为立即爬行；stop_ms>0：先闭环软降再爬行+提前制动 */
+bool holdPhaseBegin(float target_disc_deg, float rpm, uint32_t stop_ms) {
+  if (run_state == RUN_ESTOP) {
+    hostPrintln("# ERR clear ESTOP first");
+    return false;
+  }
+  if (ctrl_mode == MODE_LEARN || ctrl_mode == MODE_MEASURE) {
+    hostPrintln("# ERR abort LEARN/MEASURE before HOLD PHASE");
+    return false;
+  }
+  if (test_active) {
+    hostPrintln("# ERR abort TEST before HOLD PHASE");
+    return false;
+  }
+  if (isnan(last_deg)) {
+    hostPrintln("# ERR no angle yet");
+    return false;
+  }
+  // 提前制动依赖编码器盘相位；需至少一次霍尔绝对复位（GPIO4→0° / GPIO5→180° / HALL CAL）
+  if (!flap_calibrated) {
+    hostPrintln(
+        "# ERR HOLD PHASE needs Hall latch (pass GPIO4=0 / GPIO5=180 / HALL CAL) — "
+        "encoder disc phase = wrap(ref + sense*dmotor/gear)");
+    return false;
+  }
+
+  target_disc_deg = wrap360(target_disc_deg);
+  if (rpm < 40.0f) rpm = 40.0f;
+  if (rpm > 400.0f) rpm = 400.0f;
+  if (rpm > target_rpm_max) rpm = target_rpm_max;
+
+  holdph_target_deg = target_disc_deg;
+  holdph_crawl_rpm = rpm;
+  holdph_t0_ms = millis();
+  holdph_brake_ms = 0;
+  holdph_prev_disc = NAN;
+  holdph_prev_remain = NAN;
+  holdph_hall_seen = false;
+  holdph_state = HOLDPH_ST_APPROACH;
+  holdph_dn0 = hall_dn_irq_cnt;
+  holdph_up0 = hall_up_irq_cnt;
+  holdph_rpm_start = fabsf(rpm_signed_stable);
+  if (holdph_rpm_start < rpm) holdph_rpm_start = rpm;
+
+  // 定时软降：默认先试 ~2s；软降占 profile 前 ~75%，余量给爬行+提前制动
+  if (stop_ms > 0) {
+    if (stop_ms < 800) stop_ms = 800;
+    if (stop_ms > 15000) stop_ms = 15000;
+    holdph_profile_ms = stop_ms;
+    holdph_soft_ms = (stop_ms * 3u) / 4u;  // 75%
+    if (holdph_soft_ms < 500) holdph_soft_ms = 500;
+    holdph_soft_done = false;
+  } else {
+    holdph_profile_ms = 0;
+    holdph_soft_ms = 0;
+    holdph_soft_done = true;  // 无软降，直接允许 lead 制动
+  }
+
+  float disc = discEstFromMotor();
+  if (!isnan(disc)) {
+    float remain = discRemainFwd(disc, target_disc_deg);
+    if (remain <= holdph_tol_deg && holdph_rpm_start < 80.0f) {
+      hostPrintf("# ACK HOLD PHASE already at target=%.1f disc=%.2f\n",
+                 (double)target_disc_deg, (double)disc);
+      holdph_active = false;
+      applyEscPulse(ESC_PULSE_MIN_US);
+      run_state = RUN_IDLE;
+      return true;
+    }
+  }
+
+  // 超时：有 profile 时 = profile + 余量；否则按爬行估一盘
+  if (holdph_profile_ms > 0) {
+    holdph_timeout_ms = holdph_profile_ms + 10000;
+    if (holdph_timeout_ms < 12000) holdph_timeout_ms = 12000;
+  } else {
+    float motor_rpm = fmaxf(rpm, 40.0f);
+    float disc_rpm = motor_rpm / fmaxf(GEAR_RATIO, 1.0f);
+    uint32_t est_ms = (uint32_t)((360.0f / fmaxf(disc_rpm, 0.1f)) * (60.0f / 360.0f) *
+                                 1000.0f * 2.5f);
+    if (est_ms < 8000) est_ms = 8000;
+    if (est_ms > 45000) est_ms = 45000;
+    holdph_timeout_ms = est_ms;
+  }
+
+  move_active = false;
+  sense_learn = false;
+  learn_active = false;
+  measure_active = false;
+  stopat_on = false;
+  holdph_active = true;
+  clearPid();
+  run_state = RUN_RUNNING;
+
+  if (holdph_soft_ms > 0 && holdph_rpm_start > holdph_crawl_rpm + 50.0f) {
+    ctrl_mode = MODE_CLOSED;
+    holdPhaseApplySoftDown(0, holdph_rpm_start);
+  } else {
+    holdph_soft_done = true;
+    holdph_soft_ms = 0;
+    ctrl_mode = MODE_OPEN;
+    holdPhaseApplyCrawl(180.0f);
+  }
+  applyEscPulse(holdph_pulse);
+
+  const bool t0 = fabsf(wrap180(target_disc_deg)) <= 0.5f;
+  const bool t180 = fabsf(wrap180(target_disc_deg - 180.0f)) <= 0.5f;
+  const char* marker = t0 ? "GPIO4/0deg" : (t180 ? "GPIO5/180deg" : "synth/enc");
+  hostPrintf(
+      "# ACK HOLD PHASE target=%.1f marker=%s crawl_rpm=%.0f rpm0=%.0f "
+      "profile_ms=%lu soft_ms=%lu max_pulse=%u lead_deg=%.1f lead_ms=%.0f "
+      "lead_k=%.3f timeout_ms=%lu tol=%.1f via=%s "
+      "(soft-down then early-brake BEFORE hall; uni ESC)\n",
+      (double)holdph_target_deg, marker, (double)holdph_crawl_rpm,
+      (double)holdph_rpm_start, (unsigned long)holdph_profile_ms,
+      (unsigned long)holdph_soft_ms, (unsigned)holdph_max_pulse,
+      (double)holdph_lead_deg, (double)holdph_lead_ms,
+      (double)holdph_lead_rpm_k, (unsigned long)holdph_timeout_ms,
+      (double)holdph_tol_deg, esc_sense > 0 ? "CW" : "CCW");
+  return true;
+}
+
+void holdPhaseTick(float ddeg_motor, float motor_rpm_abs) {
+  if (!holdph_active) return;
+
+  uint32_t elapsed = millis() - holdph_t0_ms;
+  if (elapsed > holdph_timeout_ms) {
+    hostPrintf("# ERR HOLD PHASE timeout target=%.1f state=%u — ESTOP\n",
+               (double)holdph_target_deg, (unsigned)holdph_state);
+    doEstop("hold_phase_timeout");
+    return;
+  }
+
+  float disc = discEstFromMotor();
+  if (isnan(disc)) {
+    if (holdph_state == HOLDPH_ST_APPROACH) {
+      if (!holdph_soft_done && holdph_soft_ms > 0)
+        holdPhaseApplySoftDown(elapsed, motor_rpm_abs);
+      else
+        holdPhaseApplyCrawl(90.0f);
+    } else {
+      holdph_pulse = ESC_PULSE_MIN_US;
+    }
+    return;
+  }
+
+  float remain = discRemainFwd(disc, holdph_target_deg);
+  float disc_rate = fabsf(ddeg_motor) * (float)CTRL_HZ / fmaxf(GEAR_RATIO, 1.0f);
+  float lead = holdPhaseEffectiveLead(disc_rate, motor_rpm_abs);
+
+  // 软降未完成：多圈经过目标时不因霍尔/lead 切油（否则高速误刹）
+  // 禁止仅凭瞬时低转速提前结束（测速毛刺会误触发，随后 lead 在高惯量下切油）
+  if (!holdph_soft_done && holdph_soft_ms > 0 &&
+      holdph_state == HOLDPH_ST_APPROACH) {
+    bool soft_time_up = (elapsed >= holdph_soft_ms);
+    bool cmd_low = (target_ramped <= holdph_crawl_rpm + 50.0f);
+    bool meas_low = (motor_rpm_abs <= holdph_crawl_rpm + 120.0f);
+    bool soft_early_ok =
+        (elapsed >= (holdph_soft_ms * 2u) / 3u) && cmd_low && meas_low;
+    if (soft_time_up || soft_early_ok) {
+      holdph_soft_done = true;
+      ctrl_mode = MODE_OPEN;
+      soft_cmd_accel_rpm_s = 0.0f;
+      hostPrintf("# HOLD PHASE SOFTDONE elapsed_ms=%lu rpm=%.0f remain=%.1f\n",
+                 (unsigned long)elapsed, (double)motor_rpm_abs, (double)remain);
+    } else {
+      holdph_prev_remain = remain;
+      holdph_prev_disc = disc;
+      // 仅计霍尔沿作诊断，不制动
+      const bool want0 = fabsf(wrap180(holdph_target_deg)) <= holdph_tol_deg;
+      const bool want180 =
+          fabsf(wrap180(holdph_target_deg - 180.0f)) <= holdph_tol_deg;
+      if (want0 && hall_dn_irq_cnt > holdph_dn0) {
+        holdph_dn0 = hall_dn_irq_cnt;  // 吃掉沿，软降后再确认
+      }
+      if (want180 && hall_up_irq_cnt > holdph_up0) {
+        holdph_up0 = hall_up_irq_cnt;
+      }
+      holdPhaseApplySoftDown(elapsed, motor_rpm_abs);
+      return;
+    }
+  }
+
+  // 软降刚结束但转速仍高：继续闭环压到爬行区，暂不 lead 制动
+  if (holdph_soft_done && holdph_profile_ms > 0 &&
+      holdph_state == HOLDPH_ST_APPROACH &&
+      motor_rpm_abs > holdph_crawl_rpm + 250.0f) {
+    holdph_prev_remain = remain;
+    holdph_prev_disc = disc;
+    const bool want0 = fabsf(wrap180(holdph_target_deg)) <= holdph_tol_deg;
+    const bool want180 =
+        fabsf(wrap180(holdph_target_deg - 180.0f)) <= holdph_tol_deg;
+    if (want0 && hall_dn_irq_cnt > holdph_dn0) holdph_dn0 = hall_dn_irq_cnt;
+    if (want180 && hall_up_irq_cnt > holdph_up0) holdph_up0 = hall_up_irq_cnt;
+    // 继续压转速到爬行
+    float dt = 1.0f / (float)CTRL_HZ;
+    soft_cmd_accel_rpm_s = -soft_rate_down_rpm_s;
+    target_cmd = holdph_crawl_rpm;
+    target_ramped = holdph_crawl_rpm;
+    ctrl_mode = MODE_CLOSED;
+    holdph_pulse = computePulseClosed(holdph_crawl_rpm, motor_rpm_abs, dt);
+    return;
+  }
+
+  // 霍尔仅作确认/诊断：不在此沿上才切油（切油必须发生在 remain<=lead）
+  const bool want0 = fabsf(wrap180(holdph_target_deg)) <= holdph_tol_deg;
+  const bool want180 = fabsf(wrap180(holdph_target_deg - 180.0f)) <= holdph_tol_deg;
+  if (want0 && hall_dn_irq_cnt > holdph_dn0) {
+    holdph_hall_seen = true;
+    holdph_dn0 = hall_dn_irq_cnt;
+    if (holdph_state == HOLDPH_ST_APPROACH) {
+      // 霍尔已到而尚未提前制动 → 提前量不足，紧急切油
+      holdPhaseEnterBrake("hall_dn_before_lead");
+    }
+  }
+  if (want180 && hall_up_irq_cnt > holdph_up0) {
+    holdph_hall_seen = true;
+    holdph_up0 = hall_up_irq_cnt;
+    if (holdph_state == HOLDPH_ST_APPROACH) {
+      holdPhaseEnterBrake("hall_up_before_lead");
+    }
+  }
+
+  if (holdph_state == HOLDPH_ST_APPROACH) {
+    // 预测制动：剩余盘角进入提前窗 → 立刻 1000µs（不等霍尔）
+    if (remain <= lead) {
+      holdph_prev_remain = remain;
+      holdPhaseEnterBrake("lead");
+    } else {
+      holdph_prev_remain = remain;
+      holdph_prev_disc = disc;
+      holdPhaseApplyCrawl(remain);
+    }
+    return;
+  }
+
+  // BRAKE / SETTLE：保持最低油门，等惯量耗尽
+  holdph_pulse = ESC_PULSE_MIN_US;
+  target_cmd = 0.0f;
+  target_ramped = 0.0f;
+  soft_cmd_accel_rpm_s = 0.0f;
+
+  float err = fabsf(wrap180(disc - holdph_target_deg));
+  bool near = err <= holdph_tol_deg;
+  // 单向越过目标后停稳也算成功（提前量略大时停在目标前一点点则靠 near）
+  bool past = false;
+  if (!isnan(holdph_prev_disc)) {
+    float prev_remain = discRemainFwd(holdph_prev_disc, holdph_target_deg);
+    past = (prev_remain > 0.5f) && (remain < 0.5f) && (err <= holdph_tol_deg * 2.0f);
+  }
+  holdph_prev_disc = disc;
+  holdph_prev_remain = remain;
+
+  bool slow = motor_rpm_abs <= holdph_stop_rpm;
+  uint32_t since_brake = millis() - holdph_brake_ms;
+
+  if (holdph_state == HOLDPH_ST_BRAKE) {
+    if (slow || since_brake >= 400) {
+      holdph_state = HOLDPH_ST_SETTLE;
+    }
+    return;
+  }
+
+  // SETTLE
+  if (slow && (near || past || holdph_hall_seen)) {
+    const char* why = holdph_hall_seen ? "settle_hall" : (past ? "settle_past" : "settle_near");
+    holdPhaseFinish(why);
+    return;
+  }
+  if (slow && since_brake >= 1500) {
+    // 已停转但相位偏差大：仍停车，避免空转；报告 miss
+    if (err <= holdph_tol_deg * 3.0f) {
+      holdPhaseFinish("settle_slow");
+    } else {
+      hostPrintf("# ERR HOLD PHASE miss disc=%.2f target=%.1f err=%.1f — ESTOP\n",
+                 (double)disc, (double)holdph_target_deg, (double)err);
+      doEstop("hold_phase_miss");
+    }
+    return;
+  }
+  if (since_brake >= 4000 && !slow) {
+    hostPrintf("# ERR HOLD PHASE coast spin disc=%.2f rpm=%.0f — ESTOP\n",
+               (double)disc, (double)motor_rpm_abs);
+    doEstop("hold_phase_coast");
+  }
+}
+
 /** 单向路径：只沿 esc_sense 转到目标相对角，返回需转过的度数 (0..360] */
 float uniTravelDeg(float from_rel, float to_rel) {
   if (esc_sense > 0) {
@@ -1994,6 +3154,7 @@ bool phaseMoveBegin(int dir, float deg, float rpm) {
   move_crawl_rpm = rpm;
   move_wrong_ms = 0;
   move_active = true;
+  holdph_active = false;
   sense_learn = false;
   learn_active = false;
   measure_active = false;
@@ -2071,6 +3232,11 @@ void phaseTick(float abs_deg, float ddeg) {
     return;
   }
 
+  if (holdph_active) {
+    holdPhaseTick(ddeg, fabsf(rpm_signed_stable));
+    return;
+  }
+
   if (move_active) {
     move_accum_deg += ddeg;
     bool wrong = (move_dir > 0 && ddeg < -0.05f) || (move_dir < 0 && ddeg > 0.05f);
@@ -2119,9 +3285,10 @@ void phaseTick(float abs_deg, float ddeg) {
 }
 
 void controlTick(float rpm_meas, float dt) {
-  // 主机超时：测试态保留；FLIGHT ON 禁用（防空中断连误 ESTOP）
-  if (!flight_mode && host_seen && run_state == RUN_RUNNING && !learn_active) {
-    if ((millis() - last_host_ms) > HOST_TIMEOUT_MS) {
+  // 主机超时：默认 1.5s；FLIGHT / 板内 TEST / LEARN / HOLD PHASE / HOST OFF(ms=0) 禁用
+  if (host_timeout_ms > 0 && !flight_mode && !test_active && host_seen &&
+      run_state == RUN_RUNNING && !learn_active && !holdph_active) {
+    if ((millis() - last_host_ms) > host_timeout_ms) {
       doEstop("host_timeout");
       return;
     }
@@ -2148,6 +3315,11 @@ void controlTick(float rpm_meas, float dt) {
 
   if (sense_learn) {
     applyEscPulse(sense_pulse_us);
+    return;
+  }
+
+  if (holdph_active) {
+    applyEscPulse(holdph_pulse);
     return;
   }
 
@@ -2223,22 +3395,61 @@ void handleCommandLine(char* line) {
     // CTRL? = 输出层：ctrl_out_hz≈400（读最新RPM→PID→ESC）；禁止叫采集/使用
     hostPrintf(
         "# CTRL out_hz=%lu meas_out_hz=%.1f period_us=%lu esc_hz=%lu usb_telem_hz=%lu "
-        "flight=%d ble=%d host_timeout=%s "
+        "flight=%d test=%d ble=%d host_timeout=%s "
         "(输出400; 采集/使用见ENC? 数据流:采集2k→使用2k→输出400)\n",
         (unsigned long)CTRL_HZ, (double)ctrl_out_hz_meas, (unsigned long)CTRL_PERIOD_US,
         (unsigned long)esc_pwm_hz, (unsigned long)USB_TELEM_HZ, flight_mode ? 1 : 0,
-        bleIsEnabled() ? 1 : 0, flight_mode ? "OFF(flight)" : "ON(1.5s)");
+        test_active ? 1 : 0, bleIsEnabled() ? 1 : 0, hostTimeoutStatusStr());
     return;
   }
   if (strcasecmp(line, "TELEM?") == 0 || strcasecmp(line, "TELEM") == 0) {
     // usb_telem_hz = 每秒完整 CSV 帧数（1帧=1行全字段），非「帧内算速次数」
     hostPrintf(
-        "# TELEM usb_telem_hz=%lu (frames/s, 1 frame=1 full CSV line, period=%lums) "
+        "# TELEM usb_telem=%s usb_telem_hz=%lu (frames/s, 1 frame=1 full CSV line, period=%lums) "
         "ble_telem_hz=%u async_log_drop=%lu "
-        "(collect/use=%lu out=%lu; telem only copies latest snapshot)\n",
-        (unsigned long)USB_TELEM_HZ, (unsigned long)(1000UL / USB_TELEM_HZ),
-        (unsigned)bleTelemHz(), (unsigned long)hostAsyncLogDropped(),
-        (unsigned long)ENC_SAMPLE_HZ, (unsigned long)CTRL_HZ);
+        "(collect/use=%lu out=%lu; telem only copies latest snapshot; TELEM ON|OFF)\n",
+        g_usb_telem_on ? "ON" : "OFF", (unsigned long)USB_TELEM_HZ,
+        (unsigned long)(1000UL / USB_TELEM_HZ), (unsigned)bleTelemHz(),
+        (unsigned long)hostAsyncLogDropped(), (unsigned long)ENC_SAMPLE_HZ,
+        (unsigned long)CTRL_HZ);
+    return;
+  }
+  if (strcasecmp(line, "TELEM ON") == 0 || strcasecmp(line, "TELEM 1") == 0) {
+    g_usb_telem_on = true;
+    hostPrintln("# ACK TELEM ON (USB CSV @20Hz)");
+    return;
+  }
+  if (strcasecmp(line, "TELEM OFF") == 0 || strcasecmp(line, "TELEM 0") == 0) {
+    g_usb_telem_on = false;
+    hostPrintln("# ACK TELEM OFF (USB CSV paused; LOAD?/cmds still work)");
+    return;
+  }
+
+  if (strcasecmp(line, "LOAD?") == 0 || strcasecmp(line, "LOAD") == 0) {
+    // 一次打印负载快照：采集回调 / 控制周期 / loop 粗闲 / async drop / 工况开关
+    uint32_t ring_ov = 0;
+#if USE_FIXED_POINT
+    ring_ov = enc_ring_overruns(&g_enc_ring);
+#endif
+    hostPrintf(
+        "# LOAD enc_busy_avg_us=%.1f enc_busy_max_us=%lu enc_cpu%%=%.2f meas_hz=%.1f "
+        "ctrl_expect_us=%lu ctrl_period_avg_us=%.1f ctrl_period_max_us=%lu "
+        "ctrl_busy_avg_us=%.1f ctrl_busy_max_us=%lu ctrl_overrun=%lu meas_out_hz=%.1f "
+        "loop_hz=%.0f async_log_drop=%lu "
+        "fixed=%d usb_telem=%s ble=%d flight=%d enc_ring_overrun=%lu "
+        "(LOAD RESET clears max/overrun/drop)\n",
+        (double)enc_busy_avg_us, (unsigned long)enc_busy_max_us, (double)enc_cpu_pct,
+        (double)enc_sample_hz_meas, (unsigned long)CTRL_PERIOD_US, (double)ctrl_period_avg_us,
+        (unsigned long)ctrl_period_max_us, (double)ctrl_busy_avg_us,
+        (unsigned long)ctrl_busy_max_us, (unsigned long)ctrl_overrun_cnt,
+        (double)ctrl_out_hz_meas, (double)loop_hz_meas, (unsigned long)hostAsyncLogDropped(),
+        USE_FIXED_POINT, g_usb_telem_on ? "ON" : "OFF", bleIsEnabled() ? 1 : 0,
+        flight_mode ? 1 : 0, (unsigned long)ring_ov);
+    return;
+  }
+  if (strcasecmp(line, "LOAD RESET") == 0) {
+    loadStatsReset();
+    hostPrintln("# ACK LOAD RESET (max/overrun/async_log_drop cleared)");
     return;
   }
 
@@ -2248,7 +3459,49 @@ void handleCommandLine(char* line) {
                (unsigned)ENC_RING_CAP, (unsigned long)enc_ring_count(&g_enc_ring),
                (unsigned long)enc_ring_overruns(&g_enc_ring));
 #else
-    hostPrintf("# FIXED use_fixed_point=0 (float main; enable with USE_FIXED_POINT=1)\n");
+    hostPrintf("# FIXED use_fixed_point=0 shadow_q16=%d (float main; enable with USE_FIXED_POINT=1)\n",
+               Q16_SHADOW_COMPARE);
+#endif
+    return;
+  }
+  if (strcasecmp(line, "Q16CMP?") == 0 || strcasecmp(line, "Q16CMP") == 0) {
+#if Q16_SHADOW_COMPARE
+    uint32_t n;
+    double sum;
+    float mx, lf, lq;
+    portENTER_CRITICAL(&g_q16cmp_mux);
+    n = q16cmp_n;
+    sum = q16cmp_sum_abs;
+    mx = q16cmp_max_abs;
+    lf = q16cmp_last_f;
+    lq = q16cmp_last_q;
+    portEXIT_CRITICAL(&g_q16cmp_mux);
+    double mean = (n > 0) ? (sum / (double)n) : 0.0;
+    hostPrintf(
+        "# Q16CMP shadow=1 n=%lu mean_abs=%.6f max_abs=%.6f rpm_f=%.3f rpm_q=%.3f "
+        "(same-sample float vs Q16; NOT dual-flash tracking)\n",
+        (unsigned long)n, mean, (double)mx, (double)lf, (double)lq);
+#else
+    hostPrintln("# Q16CMP shadow=0 (compile with Q16_SHADOW_COMPARE=1 on float path)");
+#endif
+    return;
+  }
+  if (strcasecmp(line, "Q16CMP RESET") == 0) {
+#if Q16_SHADOW_COMPARE
+    // 只清统计，不清影子 EMA（避免与浮点状态失步造成假尖刺）
+    q16cmpStatsReset();
+    hostPrintln("# ACK Q16CMP RESET (stats only; shadow EMA kept)");
+#else
+    hostPrintln("# ACK Q16CMP RESET (shadow disabled)");
+#endif
+    return;
+  }
+  if (strcasecmp(line, "Q16CMP FULL RESET") == 0) {
+#if Q16_SHADOW_COMPARE
+    q16cmpFullReset();
+    hostPrintln("# ACK Q16CMP FULL RESET (stats+shadow EMA)");
+#else
+    hostPrintln("# ACK Q16CMP FULL RESET (shadow disabled)");
 #endif
     return;
   }
@@ -2277,7 +3530,7 @@ void handleCommandLine(char* line) {
   if (strcasecmp(line, "FLIGHT?") == 0) {
     hostPrintf("# FLIGHT=%s ble=%s host_timeout=%s wifi=off mode=%s\n",
                flight_mode ? "ON" : "OFF", bleIsEnabled() ? "on" : "off",
-               flight_mode ? "disabled" : "1.5s", flight_mode ? "FLIGHT" : "TEST");
+               hostTimeoutStatusStr(), flight_mode ? "FLIGHT" : "TEST");
     return;
   }
   if (strcasecmp(line, "FLIGHT ON") == 0) {
@@ -2288,7 +3541,92 @@ void handleCommandLine(char* line) {
   }
   if (strcasecmp(line, "FLIGHT OFF") == 0) {
     flight_mode = false;
-    hostPrintln("# ACK FLIGHT OFF host_timeout=1.5s (BLE unchanged; use BLE ON to re-enable)");
+    hostPrintf("# ACK FLIGHT OFF host_timeout=%s (BLE unchanged; use BLE ON to re-enable)\n",
+               hostTimeoutStatusStr());
+    return;
+  }
+  if (strcasecmp(line, "HOST?") == 0 || strcasecmp(line, "HOST") == 0) {
+    hostPrintf("# HOST timeout=%s cfg_ms=%lu default_ms=%lu flight=%d test=%d learn=%d\n",
+               hostTimeoutStatusStr(), (unsigned long)host_timeout_ms,
+               (unsigned long)HOST_TIMEOUT_DEFAULT_MS, flight_mode ? 1 : 0,
+               test_active ? 1 : 0, learn_active ? 1 : 0);
+    return;
+  }
+  if (strcasecmp(line, "HOST OFF") == 0 || strcasecmp(line, "HOST TO OFF") == 0) {
+    host_timeout_ms = 0;
+    hostPrintln("# ACK HOST OFF timeout=disabled (bench)");
+    return;
+  }
+  if (strcasecmp(line, "HOST ON") == 0) {
+    host_timeout_ms = HOST_TIMEOUT_DEFAULT_MS;
+    hostPrintf("# ACK HOST ON timeout=%.3fs\n",
+               (double)HOST_TIMEOUT_DEFAULT_MS / 1000.0);
+    return;
+  }
+  if (strncasecmp(line, "HOST TO", 7) == 0) {
+    char* p = line + 7;
+    while (*p == ' ' || *p == '\t' || *p == '=' || *p == ':') ++p;
+    if (*p == '\0') {
+      hostPrintln("# ERR HOST TO <sec>|OFF");
+      return;
+    }
+    if (strcasecmp(p, "OFF") == 0) {
+      host_timeout_ms = 0;
+      hostPrintln("# ACK HOST OFF timeout=disabled (bench)");
+      return;
+    }
+    float sec = (float)atof(p);
+    if (!(sec >= 0.0f) || sec > 120.0f) {
+      hostPrintln("# ERR HOST TO <sec> range 0..120 (0=OFF)");
+      return;
+    }
+    if (sec == 0.0f) {
+      host_timeout_ms = 0;
+      hostPrintln("# ACK HOST OFF timeout=disabled (bench)");
+      return;
+    }
+    host_timeout_ms = (uint32_t)(sec * 1000.0f + 0.5f);
+    if (host_timeout_ms < 200) host_timeout_ms = 200;  // 过短易误触发
+    hostPrintf("# ACK HOST TO timeout=%.3fs (%lu ms)\n",
+               (double)host_timeout_ms / 1000.0, (unsigned long)host_timeout_ms);
+    return;
+  }
+  if (strcasecmp(line, "TUNE?") == 0 || strcasecmp(line, "TUNE") == 0) {
+    tuneSetMapRpmMax(mapRpmMaxOf(activeMap()));
+    hostPrintf("# TUNE rec=%s ring=%u last_err=%.1f last_ff=%.0f last_u=%.1f last_pulse=%u "
+               "last_rpm=%.0f last_tgt=%.0f i=%.0f/%.0f\n",
+               tuneRecOn() ? "ON" : "OFF", (unsigned)tuneRingCount(),
+               (double)tuneStats().last_err, (double)tuneStats().last_ff,
+               (double)tuneStats().last_u, (unsigned)tuneStats().last_pulse,
+               (double)tuneStats().last_rpm, (double)tuneStats().last_tgt,
+               (double)tuneStats().last_pid_i, (double)tuneStats().last_i_lim);
+    tuneEmitSummary("TUNE");
+    return;
+  }
+  if (strcasecmp(line, "TUNE REC ON") == 0 || strcasecmp(line, "TUNE ON") == 0) {
+    tune_owned_by_test = false;
+    tuneSetMapRpmMax(mapRpmMaxOf(activeMap()));
+    tuneRecSet(true);
+    hostPrintln("# ACK TUNE REC ON (RAM ring; no print in ctrl path)");
+    return;
+  }
+  if (strcasecmp(line, "TUNE REC OFF") == 0 || strcasecmp(line, "TUNE OFF") == 0) {
+    tune_owned_by_test = false;
+    tuneRecSet(false);
+    hostPrintln("# ACK TUNE REC OFF");
+    return;
+  }
+  if (strcasecmp(line, "TUNE DUMP") == 0) {
+    uint16_t nring = tuneRingCount();
+    hostPrintf("# TUNE DUMP begin n=%u (sparse every 10th of ring)\n", (unsigned)nring);
+    for (uint16_t i = 0; i < nring; i += 10) {
+      TuneSample s;
+      if (!tuneRingAt(i, &s)) break;
+      hostPrintf("# TUNE S i=%u err=%.1f ff=%.0f u=%.1f pulse=%u rpm=%.0f tgt=%.0f iacc=%.0f sat=%u\n",
+                 (unsigned)i, (double)s.err, (double)s.ff, (double)s.u, (unsigned)s.pulse,
+                 (double)s.rpm, (double)s.target, (double)s.pid_i, (unsigned)s.i_sat);
+    }
+    hostPrintln("# TUNE DUMP end");
     return;
   }
   if (strncasecmp(line, "BLE RATE", 8) == 0) {
@@ -2310,6 +3648,24 @@ void handleCommandLine(char* line) {
       return;
     }
     hostPrintf("# ACK BLE LITE=%s\n", bleLiteOn() ? "ON" : "OFF");
+    return;
+  }
+  if (strcasecmp(line, "TEST?") == 0 || strcasecmp(line, "TEST") == 0) {
+    testStatusCmd();
+    return;
+  }
+  if (strcasecmp(line, "TEST STOP") == 0) {
+    testStopCmd();
+    return;
+  }
+  if (strncasecmp(line, "TEST START", 10) == 0) {
+    char* p = line + 10;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') {
+      hostPrintln("# ERR TEST START smoke2000|step7500|idle");
+      return;
+    }
+    testStartByName(p);
     return;
   }
   if (strcasecmp(line, "START") == 0) {
@@ -2438,9 +3794,9 @@ void handleCommandLine(char* line) {
     float d = strtof(p, &p);
     float a = strtof(p, &p);
     if (d < 50.0f) d = 50.0f;
-    if (d > 800.0f) d = 800.0f;
+    if (d > 1200.0f) d = 1200.0f;
     adg_i_lim_decel = d;
-    if (a >= 50.0f && a <= 800.0f) adg_i_lim_accel = a;
+    if (a >= 50.0f && a <= 1200.0f) adg_i_lim_accel = a;
     hostPrintf("# ACK ADG ILIM decel=%.0f accel=%.0f\n",
                   (double)adg_i_lim_decel, (double)adg_i_lim_accel);
     return;
@@ -2580,8 +3936,11 @@ void handleCommandLine(char* line) {
   }
   if (strcasecmp(line, "HALL CAL") == 0) {
     hallCalibrateNow();
-    hostPrintf("# ACK HALL CAL disc0 at motor_unwrap=%.3f gear=%.4f\n",
-               (double)flap_zero_motor_unwrap, (double)GEAR_RATIO);
+    hostPrintf(
+        "# ACK HALL CAL disc_ref=0 at motor_unwrap=%.3f counts=%lld "
+        "gear=%d/%d=%.6f (physical 0°=GPIO4; then enc-only until next Hall)\n",
+        (double)disc_ref_motor_unwrap, (long long)disc_ref_motor_counts,
+        (int)GEAR_RATIO_NUM, (int)GEAR_RATIO_DEN, (double)GEAR_RATIO);
     return;
   }
   if (strncasecmp(line, "HALL ACTIVE", 11) == 0) {
@@ -2614,12 +3973,115 @@ void handleCommandLine(char* line) {
     hostPrintf("# ACK PHASE ZERO abs=%.3f -> rel=0  (saved)\n", (double)phase_zero_deg);
     return;
   }
+  if (strcasecmp(line, "PHASE LEAD?") == 0 || strcasecmp(line, "PHASE LEAD") == 0) {
+    hostPrintf(
+        "# ACK PHASE LEAD deg=%.2f ms=%.0f k=%.4f offset=%.1f  "
+        "(eff=lead_deg + w_disc*ms/1000 + k*|rpm|; NVS hplead/hpleadt/hpleadk/hphoff)\n",
+        (double)holdph_lead_deg, (double)holdph_lead_ms, (double)holdph_lead_rpm_k,
+        (double)disc_phase_offset_deg);
+    return;
+  }
+  if (strncasecmp(line, "PHASE LEAD SAVE", 15) == 0) {
+    saveHoldPhaseLeadToNvs();
+    hostPrintf("# ACK PHASE LEAD SAVE deg=%.2f ms=%.0f k=%.4f offset=%.1f\n",
+               (double)holdph_lead_deg, (double)holdph_lead_ms,
+               (double)holdph_lead_rpm_k, (double)disc_phase_offset_deg);
+    return;
+  }
+  if (strncasecmp(line, "PHASE OFFSET", 12) == 0) {
+    char* p = line + 12;
+    while (*p == ' ' || *p == '=' || *p == ':') ++p;
+    if (*p == '\0' || strcasecmp(p, "?") == 0) {
+      hostPrintf("# ACK PHASE OFFSET deg=%.1f (NVS hphoff; wrap into disc_est)\n",
+                 (double)disc_phase_offset_deg);
+      return;
+    }
+    if (strcasecmp(p, "SAVE") == 0) {
+      prefs.putFloat("hphoff", disc_phase_offset_deg);
+      hostPrintf("# ACK PHASE OFFSET SAVE deg=%.1f\n", (double)disc_phase_offset_deg);
+      return;
+    }
+    float off = strtof(p, &p);
+    disc_phase_offset_deg = wrap360(off);
+    hostPrintf("# ACK PHASE OFFSET deg=%.1f (RAM; PHASE OFFSET SAVE or PHASE LEAD SAVE → NVS)\n",
+               (double)disc_phase_offset_deg);
+    return;
+  }
+  if (strncasecmp(line, "PHASE LEAD ", 11) == 0) {
+    char* p = line + 11;
+    while (*p == ' ') ++p;
+    if (*p == '\0') {
+      hostPrintln("# ERR PHASE LEAD <deg> [ms] [k] | PHASE LEAD SAVE | PHASE LEAD?");
+      return;
+    }
+    float d = strtof(p, &p);
+    while (*p == ' ') ++p;
+    float ms = (*p != '\0') ? strtof(p, &p) : holdph_lead_ms;
+    while (*p == ' ') ++p;
+    float k = (*p != '\0') ? strtof(p, &p) : holdph_lead_rpm_k;
+    if (d < 1.0f) d = 1.0f;
+    if (d > 60.0f) d = 60.0f;
+    if (ms < 0.0f) ms = 0.0f;
+    if (ms > 500.0f) ms = 500.0f;
+    if (k < 0.0f) k = 0.0f;
+    if (k > 0.2f) k = 0.2f;
+    holdph_lead_deg = d;
+    holdph_lead_ms = ms;
+    holdph_lead_rpm_k = k;
+    hostPrintf("# ACK PHASE LEAD deg=%.2f ms=%.0f k=%.4f (RAM; PHASE LEAD SAVE → NVS)\n",
+               (double)holdph_lead_deg, (double)holdph_lead_ms,
+               (double)holdph_lead_rpm_k);
+    return;
+  }
+  if (strncasecmp(line, "PHASE HOLD ", 11) == 0 || strncasecmp(line, "HOLD PHASE ", 11) == 0) {
+    char* p = line + 11;
+    while (*p == ' ') ++p;
+    float tgt = strtof(p, &p);
+    while (*p == ' ') ++p;
+    float rpm = holdph_crawl_rpm;
+    uint32_t stop_ms = 0;
+    if (*p != '\0') {
+      rpm = strtof(p, &p);
+      while (*p == ' ') ++p;
+      if (*p != '\0') stop_ms = (uint32_t)strtoul(p, nullptr, 10);
+    }
+    holdPhaseBegin(tgt, rpm, stop_ms);
+    return;
+  }
+  // 简写：PHASE 0|90|180 [rpm] [stop_ms]（扑翼盘相位；勿与电机 PHASE ZERO 混淆）
+  if (strncasecmp(line, "PHASE ", 6) == 0) {
+    char* p = line + 6;
+    while (*p == ' ') ++p;
+    if ((*p >= '0' && *p <= '9') || *p == '+' || *p == '-') {
+      float tgt = strtof(p, &p);
+      while (*p == ' ') ++p;
+      float rpm = holdph_crawl_rpm;
+      uint32_t stop_ms = 0;
+      if (*p != '\0') {
+        rpm = strtof(p, &p);
+        while (*p == ' ') ++p;
+        if (*p != '\0') stop_ms = (uint32_t)strtoul(p, nullptr, 10);
+      }
+      holdPhaseBegin(tgt, rpm, stop_ms);
+      return;
+    }
+  }
   if (strcasecmp(line, "PHASE?") == 0 || strcasecmp(line, "PHASE") == 0) {
     float absd = isnan(last_deg) ? 0.0f : last_deg;
     float rel = phaseRelFromAbs(absd);
-    hostPrintf("# ACK PHASE abs=%.3f rel=%.3f zero=%.3f esc_sense=%d stopat=%s/%.1f move=%d\n",
-                  (double)absd, (double)rel, (double)phase_zero_deg, esc_sense,
-                  stopat_on ? "ON" : "OFF", (double)stopat_deg, move_active ? 1 : 0);
+    float disc = discEstFromMotor();
+    hostPrintf(
+        "# ACK PHASE motor_abs=%.3f motor_rel=%.3f zero=%.3f esc_sense=%d "
+        "disc_deg=%.2f disc_ref=%.1f offset=%.1f cal=%d holdph=%d state=%u target=%.1f "
+        "lead=%.1f/%.0fms gear=%d/%d stopat=%s/%.1f move=%d "
+        "(disc=wrap(ref+sense*dmotor/gear+offset); Hall latch, enc continuous)\n",
+        (double)absd, (double)rel, (double)phase_zero_deg, esc_sense,
+        (double)(isnan(disc) ? -1.0f : disc), (double)disc_ref_deg,
+        (double)disc_phase_offset_deg, flap_calibrated ? 1 : 0,
+        holdph_active ? 1 : 0, (unsigned)holdph_state, (double)holdph_target_deg,
+        (double)holdph_lead_deg, (double)holdph_lead_ms,
+        (int)GEAR_RATIO_NUM, (int)GEAR_RATIO_DEN,
+        stopat_on ? "ON" : "OFF", (double)stopat_deg, move_active ? 1 : 0);
     return;
   }
   if (strncasecmp(line, "SENSE", 5) == 0) {
@@ -3029,6 +4491,19 @@ static void motorControlTask(void* /*arg*/) {
     if (g_ctrl_sem) xSemaphoreTake(g_ctrl_sem, portMAX_DELAY);
     else vTaskDelay(1);
 
+    uint32_t t0 = micros();
+    // 控制周期：期望 CTRL_PERIOD_US(2500)；实测间隔与 overrun
+    if (g_ctrl_last_wake_us != 0) {
+      uint32_t period = t0 - g_ctrl_last_wake_us;
+      g_ctrl_period_acc_us += period;
+      g_ctrl_period_n++;
+      portENTER_CRITICAL(&g_load_mux);
+      if (period > ctrl_period_max_us) ctrl_period_max_us = period;
+      if (period > (CTRL_PERIOD_US + CTRL_OVERRUN_SLACK_US)) ctrl_overrun_cnt++;
+      portEXIT_CRITICAL(&g_load_mux);
+    }
+    g_ctrl_last_wake_us = t0;
+
     uint32_t now = millis();
     EncShared snap;
     encGetSnapshot(&snap);
@@ -3061,6 +4536,14 @@ static void motorControlTask(void* /*arg*/) {
     phaseTick(abs_deg, ddeg);
     hallPoll(now, deg, abs_deg, raw);
     controlTick(rpm_mag, dt);  // 输出：读使用层最新 |rpm| → PID → ESC
+    testTick(rpm_mag);         // 板内 TEST（状态切换才打印）
+
+    uint32_t busy = micros() - t0;
+    g_ctrl_busy_acc_us += busy;
+    g_ctrl_busy_n++;
+    portENTER_CRITICAL(&g_load_mux);
+    if (busy > ctrl_busy_max_us) ctrl_busy_max_us = busy;
+    portEXIT_CRITICAL(&g_load_mux);
 
     g_ctrl_tick_cnt++;
     ctrl_stat_ticks++;
@@ -3070,6 +4553,16 @@ static void motorControlTask(void* /*arg*/) {
     } else if ((now - ctrl_stat_ms) >= 500) {
       uint32_t dms = now - ctrl_stat_ms;
       ctrl_out_hz_meas = (float)ctrl_stat_ticks * 1000.0f / (float)dms;
+      if (g_ctrl_period_n > 0) {
+        ctrl_period_avg_us = (float)g_ctrl_period_acc_us / (float)g_ctrl_period_n;
+      }
+      if (g_ctrl_busy_n > 0) {
+        ctrl_busy_avg_us = (float)g_ctrl_busy_acc_us / (float)g_ctrl_busy_n;
+      }
+      g_ctrl_period_acc_us = 0;
+      g_ctrl_period_n = 0;
+      g_ctrl_busy_acc_us = 0;
+      g_ctrl_busy_n = 0;
       ctrl_stat_ms = now;
       ctrl_stat_ticks = 0;
     }
@@ -3100,18 +4593,57 @@ static void telemTask(void* /*arg*/) {
   uint32_t next_telem_ms = 0;
   uint32_t stat_prev_ms = 0;
   uint32_t stat_prev_seq = 0;
+  uint32_t stat_prev_loop = 0;
   for (;;) {
     hostDrainAsyncLog();
 
     uint32_t now = millis();
+    // 负载统计窗：即使 TELEM OFF 也跑（便于对比负担）
+    EncShared snap;
+    encGetSnapshot(&snap);
+    if (stat_prev_ms == 0) {
+      stat_prev_ms = now;
+      stat_prev_seq = snap.seq;
+      stat_prev_loop = g_loop_iters;
+      g_telem_iters = 0;
+    } else if ((now - stat_prev_ms) >= 500) {
+      uint32_t dms = now - stat_prev_ms;
+      enc_sample_hz_meas = (float)(snap.seq - stat_prev_seq) * 1000.0f / (float)dms;
+      enc_loop_hz = (float)g_telem_iters * 1000.0f / (float)dms;  // 实际 USB 帧率粗估
+      uint32_t loop_now = g_loop_iters;
+      loop_hz_meas = (float)(loop_now - stat_prev_loop) * 1000.0f / (float)dms;
+      uint32_t bacc, bcnt, bmx;
+      encTakeBusy(&bacc, &bcnt, &bmx);
+      if (bcnt > 0) {
+        float avg_us = (float)bacc / (float)bcnt;
+        enc_busy_avg_us = avg_us;
+        enc_cpu_pct = avg_us * enc_sample_hz_meas / 10000.0f;
+      }
+      enc_busy_max_window_us = bmx;
+      portENTER_CRITICAL(&g_load_mux);
+      if (bmx > enc_busy_max_us) enc_busy_max_us = bmx;
+      portEXIT_CRITICAL(&g_load_mux);
+      stat_prev_ms = now;
+      stat_prev_seq = snap.seq;
+      stat_prev_loop = loop_now;
+      g_telem_iters = 0;
+    }
+
     if ((int32_t)(now - next_telem_ms) < 0) {
       vTaskDelay(1);
       continue;
     }
     next_telem_ms = now + (1000UL / USB_TELEM_HZ);
 
-    EncShared snap;
-    encGetSnapshot(&snap);
+    if (!g_usb_telem_on) {
+      // 仍跑 BLE lite（若开）与统计；仅暂停 USB CSV
+      float oh = isnan(out_hz_meas) ? -1.0f : out_hz_meas;
+      float gm = isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas;
+      bleEmitTelemLite(now, rpm_signed_stable, esc_pulse_us, target_ramped, (int)ctrl_mode,
+                       (int)run_state, oh, gm);
+      vTaskDelay(1);
+      continue;
+    }
 
     uint16_t raw = snap.raw;
     float abs_deg = (float)raw * ENC_DEG_PER_COUNT;
@@ -3119,24 +4651,6 @@ static void telemTask(void* /*arg*/) {
     float rad = deg * (TWO_PI_F / 360.0f);
 
     g_telem_iters++;
-    if (stat_prev_ms == 0) {
-      stat_prev_ms = now;
-      stat_prev_seq = snap.seq;
-      g_telem_iters = 0;
-    } else if ((now - stat_prev_ms) >= 500) {
-      uint32_t dms = now - stat_prev_ms;
-      enc_sample_hz_meas = (float)(snap.seq - stat_prev_seq) * 1000.0f / (float)dms;
-      enc_loop_hz = (float)g_telem_iters * 1000.0f / (float)dms;
-      uint32_t bacc, bcnt;
-      encTakeBusy(&bacc, &bcnt);
-      if (bcnt > 0) {
-        float avg_us = (float)bacc / (float)bcnt;
-        enc_cpu_pct = avg_us * enc_sample_hz_meas / 10000.0f;
-      }
-      stat_prev_ms = now;
-      stat_prev_seq = snap.seq;
-      g_telem_iters = 0;
-    }
 
     int mode_i = (int)ctrl_mode;
     int run_i = (int)run_state;
@@ -3148,15 +4662,16 @@ static void telemTask(void* /*arg*/) {
     float oh = isnan(out_hz_meas) ? -1.0f : out_hz_meas;
     float gm = isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas;
 
-    char line[320];
+    char line[360];
     int n = snprintf(
         line, sizeof(line),
-        "%lu,%u,%.3f,%.6f,%.2f,%u,%u,%u,%u,%u,%.1f,%d,%.4f,%.4f,%.4f,%d,%d,%u,%u,%.3f,%.3f,%.3f,%.5f,%.5f,%.1f\n",
+        "%lu,%u,%.3f,%.6f,%.2f,%u,%u,%u,%u,%u,%.1f,%d,%.4f,%.4f,%.4f,%d,%d,%u,%u,%.3f,%.3f,%.3f,%.5f,%.5f,%.1f,%.1f,%.0f,%.1f\n",
         (unsigned long)now, (unsigned)raw, deg, rad, rpm_signed_stable, (unsigned)snap.ef,
         (unsigned)snap.agc, (unsigned)snap.mag_low, (unsigned)snap.mag_high,
         (unsigned)esc_pulse_us, (double)target_ramped, mode_i, (double)kp, (double)ki, (double)kd,
         prof_i, run_i, (unsigned)hall_dn_lvl, (unsigned)hall_up_lvl, (double)disc_out,
-        (double)hd_m, (double)hu_m, (double)oh, (double)gm, (double)enc_sample_hz_meas);
+        (double)hd_m, (double)hu_m, (double)oh, (double)gm, (double)enc_sample_hz_meas,
+        (double)g_closed_err, (double)g_closed_ff, (double)g_closed_u);
     if (n > 0) {
       if (n >= (int)sizeof(line)) n = (int)sizeof(line) - 1;
       Serial.write((const uint8_t*)line, (size_t)n);
@@ -3217,11 +4732,13 @@ void setup() {
   hostPrintf("# GAIN schedule=%s points=%d | rpm_max=%.0f | ESC min=%uus profile=%s\n",
              gain_schedule_on ? "ON" : "OFF", activeGainMap().n, (double)target_rpm_max,
              (unsigned)ESC_PULSE_MIN_US, profileName());
-  hostPrintln("# cmds: PING ENC? CTRL? TELEM? CORE? BLE ON|OFF FLIGHT ON|OFF START STOP RPM FREQ ...");
+  hostPrintln("# cmds: PING ENC? CTRL? TELEM? LOAD? CORE? FIXED? BLE|FLIGHT|HOST|TUNE|TEST START|STOP|?");
+  hostPrintln("# TEST: smoke2000|step7500|idle (onboard; host only START/STOP; no keepalive)");
 }
 
 void loop() {
   g_loop_core_id = (uint32_t)xPortGetCoreID();
+  g_loop_iters++;
   pollSerialCommands();
   hostDrainAsyncLog();  // 命令侧旁路再排一拍；主遥测在 telemTask
   vTaskDelay(1);

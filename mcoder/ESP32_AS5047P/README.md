@@ -80,6 +80,26 @@ t_ms,raw,deg,rad,rpm,ef,agc,magL,magH,pulse_us,target_rpm,mode,kp,ki,kd,profile,
 | `PID <kp> <ki> <kd>` / `PID SAVE` | 热改 / 存 NVS |
 | `ADAPT ON\|OFF` | 有界 Kp 自适应 |
 | `PING` | 心跳（PC 约 0.5 s 一次，防主机超时急停） |
+| `TEST START smoke2000\|step7500\|idle` | **板内分段测试**（判定在固件；禁 HOST_TIMEOUT） |
+| `TEST STOP` / `TEST?` | 中止 / 查状态 |
+| `HOLD PHASE <deg> [rpm]` / `PHASE 0\|90\|180` | **扑翼盘相位停机**（提前制动；见 `相位停机说明_2026-07-22.md`） |
+| `PHASE LEAD <deg> [ms] [k]` / `SAVE` / `?` | 提前量（盘° / 时间 / RPM 系数；NVS） |
+| 板端摘要 | `# TEST DONE name=… ok=0\|1 enc_rpm=… target=… pulse=… err=… hall_d=… sat=… reason=…` |
+
+板内 TEST（最小通讯，无需每 0.5s 刷 RPM）:
+
+```powershell
+cd E:\OEZCON\mcoder\ESP32_AS5047P\pc
+python test_onboard.py --port COM10 --name smoke2000
+```
+
+| 段名 | 行为（写死） |
+|------|----------------|
+| `smoke2000` | CLOSED→2000，窗内判转，再稳 ~12s，停车；\|err\|/2000&lt;15% → OK |
+| `step7500` | 先 smoke 门闩，再 7500 稳 20s；饱和只记 `sat=` |
+| `idle` | 确认 rpm≈0 |
+
+在转门闩（固件）：\|rpm\| 中位/均值 &gt; 90 且占比 ≥70%；霍尔 irq 增量作辅判写入 `hall_d`。
 
 ---
 

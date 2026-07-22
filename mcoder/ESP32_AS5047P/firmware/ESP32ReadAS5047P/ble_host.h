@@ -40,6 +40,8 @@ void hostExitRealtimeCb();
 /** 低优路径（loop）排出异步日志；每拍可多行。 */
 void hostDrainAsyncLog();
 uint32_t hostAsyncLogDropped();
+/** 清零 async_log_drop 计数（LOAD RESET）。 */
+void hostAsyncLogDropReset();
 
 void hostPrintln(const char* s);
 void hostPrintf(const char* fmt, ...);

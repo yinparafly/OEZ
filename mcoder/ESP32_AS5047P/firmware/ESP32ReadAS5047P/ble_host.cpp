@@ -53,6 +53,11 @@ void hostForbidPrintFromTask(TaskHandle_t t) { g_forbid_print_task = t; }
 void hostEnterRealtimeCb() { g_in_realtime_cb = true; }
 void hostExitRealtimeCb() { g_in_realtime_cb = false; }
 uint32_t hostAsyncLogDropped() { return g_async_drop; }
+void hostAsyncLogDropReset() {
+  portENTER_CRITICAL(&g_async_mux);
+  g_async_drop = 0;
+  portEXIT_CRITICAL(&g_async_mux);
+}
 
 static bool hostMustDeferPrint() {
   if (g_in_realtime_cb) return true;
