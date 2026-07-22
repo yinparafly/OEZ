@@ -1,36 +1,32 @@
 /************************************************
  * ESP32-S3：AS5047P + 航模电调转速控制
  *
- * 电调：GPIO9，默认 50Hz，脉宽 1000~2000us（上电先最低油门）
- *   FREQ <50..600> 可改刷新率（测完请回 50；>500Hz 周期<2000μs，高油门夹断）
+ * 【钉死术语 — 禁止写「取用」】
+ *   采集数据（采集频率）= SPI 读编码器角度入缓冲/解缠          → 目标 2000 Hz
+ *   使用数据（使用频率）= 用采集点求速度（差分/窗口），与采集同层全用
+ *                       → 目标 2000 Hz（采了 2k、用 2k；≥方案建议 1200）
+ *   输出数据（输出频率）= PID → 写 ESC/PWM 的控制输出           → 目标 400 Hz
+ *   硬约束【实时路径禁打印】：2kHz encSampleCb / 400Hz motorControlTask 内
+ *     禁止 Serial.print / hostPrintf 阻塞写出；若调用则入异步日志环，由低优 telemTask 排出。
+ *   数据流：采集2k → 使用2k(求速全用) → 输出400(最新RPM→ESC)
+ *   禁止把 400 叫采集/使用；勿把使用频率擅自降到 1200（除非用户另说）。
+ *
+ * 电调：GPIO9，默认 FREQ 400（与输出同相），脉宽 1000~2000us（上电先最低油门）
+ *   FREQ <50..600> 可改刷新率（>500Hz 周期<2000μs，高油门夹断）
  * 扑翼霍尔（YL-57 / LM393+A3144，VCC=5V）：
- *   厂商 51 样例以 DO==0 为触发（低有效）；商家文案写反时以样例+实测为准
  *   GPIO4 = 输出盘 0°（下扑）DO；GPIO5 = ~180°（上举）DO
- *   DO 高电平可能近 5V → 须分压/电平转换到 3.3V，勿直灌 ESP32
- * 减速比：小齿 12、14 → 大齿 59、79；总比 (59×79)/(12×14)=4661/168≈27.744
- *   （与 (59/12)×(79/14) 代数相同）
- * 策略：台阶辨识前馈图 f_inv + PI；profile: noload / flap
+ * 减速比：(59×79)/(12×14)=4661/168≈27.744
  *
- * 指令（行末 \n）：
- *   START | STOP | ESTOP | PING
- *   RPM <0..6000> | RPMMAX <rpm> | SOFT ON|OFF | SOFT RATE <rpm/s>
- *   SOFT RATE UP|DOWN <rpm/s> | SOFT?     （升/降斜坡可不同，见惯量备忘 S1）
- *   KA <us/(rpm/s)> | KA?                 （加速度前馈，备忘 S2）
- *   ADG ON|OFF|? | ADG KI_SCALE|KP_SCALE|ILIM | ADG DUAL|ACCEL|DECEL|SAVE  （S3）
- *   MODE OPEN|CLOSED|LEARN|SAFE
- *   PROFILE noload|flap
- *   LEARN START | LEARN RAMP | LEARN ABORT | LEARN MAXUS <us>
- *   MEASURE AUTO | MEASURE RAMP （同 LEARN START / LEARN RAMP）
- *   PID <kp> <ki> <kd> | PID? | PID SAVE
- *   GAIN ON|OFF | GAIN? | GAIN SAVE   （转速分区 PID 表，插值替代全局 PID）
- *   PHASE ZERO | PHASE? | MOVE CW|CCW <deg> [rpm]
- *   STOPAT <deg>|OFF | GOTO <deg> [CW|CCW|AUTO] [rpm]
- *   HALL? | HALL CAL | HALL ACTIVE LOW|HIGH
- *   ADAPT ON|OFF | PWM <1000..2000>
- *   PROTO PWM|DSHOT|? | DSHOTRATE 150|300|600|? | DSHOT <0..2047>
- *   BLE? | BLE RATE <5..50> | BLE LITE ON|OFF   （蓝牙遥测降频/瘦身）
+ * 调度（阶段 A/B）：
+ *   采集+使用：esp_timer @2000Hz → encSampleCb（SPI+解缠+窗差分+EMA）→ EncShared；零打印
+ *   输出：esp_timer @400Hz → 信号量 → motorControlTask@Core1（只读快照/PID/ESC；零直打串口）
+ *   telemTask@Core0 低优：USB 遥测≤20Hz（Serial.write 批量）+ hostDrainAsyncLog
+ *   loop：仅命令解析 + 轻量 drain
+ *   阶段 D/E 预留：enc_ring / Q16.16（本轮不做）
  *
- * 蓝牙：设备名 OEZ-RPM（Nordic UART）；USB 仍 250Hz 全速；BLE 默认 20Hz 瘦身行
+ * 指令：START STOP ESTOP PING | ENC? CTRL? TELEM? CORE? | BLE ON|OFF|? | FLIGHT ON|OFF|?
+ *   RPM / MODE / FREQ / BLE RATE|LITE …
+ * 蓝牙：OEZ-RPM；测试默认 ON；FLIGHT ON → 关 BLE + 禁主机超时 ESTOP
  ************************************************/
 #include <SPI.h>
 #include <Preferences.h>
@@ -39,8 +35,16 @@
 #include <string.h>
 #include "driver/gpio.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esc_dshot.h"
 #include "ble_host.h"
+
+// 测试固件默认开 BLE；飞行构建可改为 0（不 bleBegin）
+#ifndef FEATURE_BLE_DEFAULT
+#define FEATURE_BLE_DEFAULT 1
+#endif
 // ---- 引脚 ----
 static const int PIN_CS   = 10;
 static const int PIN_SCLK = 12;
@@ -62,48 +66,49 @@ static const float GEAR_RATIO =
 
 // ---- 时序 ----
 static const uint32_t SERIAL_BAUD = 921600;
-// 控制环仍 250Hz；编码器角度采样/测速已解耦到 ENC_SAMPLE_HZ（esp_timer，见下），
-// 差分解缠在高频侧完成，Nyquist 由采样率决定：@2kHz ≈0.5rev/样本 → 60000RPM，远够 12000。
-static const uint32_t CTRL_HZ = 250;
-static const uint32_t CTRL_MS = 1000 / CTRL_HZ;
-static const uint32_t HOST_TIMEOUT_MS = 1500;
+// 输出频率 400Hz（≠采集/使用）。周期 2500µs；esp_timer→信号量唤醒 Core1（µs 级），
+// 避免 vTaskDelayUntil(2.5ms) 在 tick=1ms 时落成 2~3ms。见总纲 §6.1。
+static const uint32_t CTRL_HZ = 400;                              // 输出频率 Hz
+static const uint32_t CTRL_PERIOD_US = 1000000UL / CTRL_HZ;       // 2500
+// USB 遥测帧率：每秒发送多少「完整 CSV 遥测行」（一帧=一行全字段），不是一帧内算 N 次。
+// 旧稿「100Hz」=每秒 100 帧；现默认 20Hz=每秒 20 帧（周期 50ms），每拍最多 1 行。
+static const uint32_t USB_TELEM_HZ = 20;
+static const uint32_t HOST_TIMEOUT_MS = 1500;                     // 测试态保活；FLIGHT ON 禁用
 
-// ---- 高频编码器采样（与控制环解耦）----
-// esp_timer 周期回调（运行于 esp_timer 任务上下文，非 ISR，可安全同步 SPI 读）。
-// 每拍读 ANGLECOM，整型差分解缠累加到 g_enc.counts；测速用累加计数做窗口差分
-// （累加已解缠，窗口差分不再受 Nyquist 折叠限制），滤波后喂 250Hz 控制环/遥测。
-static const uint32_t ENC_SAMPLE_HZ = 2000;                       // 目标采样率（1–2kHz）
+// ---- 采集+使用：高频编码器（与输出解耦）----
+// 采集=SPI+解缠 @2k；使用=窗差分求速同回调 @2k（采了 2k、用 2k）。
+// 方案原文使用频率建议≥1200；本工程保持 2000，勿降到 1200/400。
+// Nyquist @2k ≈0.5rev/样本 → 60000RPM。
+static const uint32_t ENC_SAMPLE_HZ = 2000;                       // 采集/使用目标 Hz
 static const uint32_t ENC_SAMPLE_PERIOD_US = 1000000UL / ENC_SAMPLE_HZ;
-static const uint32_t ENC_SPI_HZ = 8000000;                       // AS5047P 支持到 10MHz
-static const int      ENC_HIST = 16;                              // counts 历史环形长度
-static const int      ENC_VEL_WINDOW = 8;                         // 测速窗口样本数(@2kHz=4ms)
-static const uint32_t ENC_DIAG_DIV = 100;                         // 每 N 采样读一次 DIAAGC
-static const uint32_t ENC_SIGN_FLIP_SAMPLES = ENC_SAMPLE_HZ / 12; // 反向持续 ~83ms 才翻符号
+static const uint32_t ENC_SPI_HZ = 8000000;
+static const int      ENC_HIST = 16;
+static const int      ENC_VEL_WINDOW = 8;                         // 使用侧测速窗(@2kHz=4ms)
+static const uint32_t ENC_DIAG_DIV = 100;
+static const uint32_t ENC_SIGN_FLIP_SAMPLES = ENC_SAMPLE_HZ / 12;
+// 阶段 D 预留 enc_ring；阶段 E 预留 Q16——本轮仍 portMUX 快照 + 浮点 PID。
 
-// 共享快照结构：采样回调写、loop 读，portMUX 保护（提前声明，规避 .ino 原型顺序问题）。
+// 共享快照：采集/使用回调写、输出任务读，portMUX 保护。
 struct EncShared {
-  int64_t counts;      // 解缠累加编码器计数（Nyquist 由 ENC_SAMPLE_HZ 决定）
-  uint16_t raw;        // 最新 raw 角度
-  bool ef;             // ANGLECOM 错误标志位
+  int64_t counts;
+  uint16_t raw;
+  bool ef;
   uint8_t agc;
   bool mag_low;
   bool mag_high;
-  float rpm_signed;    // 滤波+符号锁定后的带符号 rpm
-  uint32_t t_us;       // 最新采样时间戳
-  uint32_t seq;        // 采样序号（用于测实际采样率）
-  uint32_t busy_acc;   // 采样耗时累计(µs)
-  uint32_t busy_cnt;   // 对应样本数
+  float rpm_signed;    // 使用层滤波后带符号 rpm
+  uint32_t t_us;
+  uint32_t seq;        // 采集序号 → ENC? meas_hz
+  uint32_t busy_acc;
+  uint32_t busy_cnt;
 };
 
-// ---- 电调 PWM（默认 50Hz，可用 FREQ 改到 600；高刷新时脉宽不得超过周期）----
-static const uint32_t ESC_PWM_HZ_DEFAULT = 50;
+// ---- 电调 PWM（默认与输出同相 400Hz；FREQ 可改 50..600）----
+static const uint32_t ESC_PWM_HZ_DEFAULT = 400;
 static const uint32_t ESC_PWM_HZ_MAX = 600;
 static const uint16_t ESC_PULSE_MIN_US = 1000;
 static const uint16_t ESC_PULSE_MAX_US = 2000;
 static const uint8_t  ESC_PWM_RES_BITS = 14;
-// 电机允许最大转速：放开到 12000（目标/超速/学习截止均按 target_rpm_max 比例，不写死）。
-// 注意：CTRL_HZ=250 时角度差分 Nyquist ≈0.5rev/样本 → 测速上限≈7500RPM；超过会折叠，
-// 需 >400Hz 才能可靠测 12000。高速段以此为准，测到折叠即为编码器采样极限。
 static const float    MOTOR_RPM_ABS_MAX = 12000.0f;
 static const float    TARGET_RPM_MAX_DEFAULT = 12000.0f;
 
@@ -262,6 +267,17 @@ static const uint16_t CRAWL_PULSE_MIN = 1250;  // 开环爬行最低脉宽，保
 
 uint32_t last_host_ms = 0;
 bool host_seen = false;
+bool flight_mode = false;  // FLIGHT ON：关 BLE + 禁用主机超时 ESTOP
+
+// 输出任务 / 核诊断
+static SemaphoreHandle_t g_ctrl_sem = nullptr;
+static esp_timer_handle_t g_ctrl_timer = nullptr;
+static TaskHandle_t g_ctrl_task = nullptr;
+static volatile uint32_t g_ctrl_core_id = 0;
+static volatile uint32_t g_enc_cb_core_id = 0;
+static volatile uint32_t g_loop_core_id = 0;
+float ctrl_out_hz_meas = 0.0f;  // 实测输出频率（CTRL?）
+static volatile uint32_t g_ctrl_tick_cnt = 0;
 
 // ---- 扑翼霍尔 / 输出盘相位（相对电机编码器反算）----
 // GPIO4/5：ESP32-S3 DevKit 丝印 IO4/IO5 = Arduino GPIO4/5；非 USB(19/20)/UART0(43/44)/strapping
@@ -433,8 +449,10 @@ static inline void encReadDiagInline() {
   }
 }
 
-// esp_timer 周期回调（ESP_TIMER_TASK 分发，任务上下文，可安全同步 SPI）
+// esp_timer 周期回调（采集+使用同层；ESP_TIMER_TASK；禁止 Serial/hostPrintf）
 static void encSampleCb(void* /*arg*/) {
+  hostEnterRealtimeCb();
+  g_enc_cb_core_id = (uint32_t)xPortGetCoreID();
   uint32_t t0 = micros();
 
   if (++enc_cb_diag_div >= ENC_DIAG_DIV) {
@@ -518,6 +536,7 @@ static void encSampleCb(void* /*arg*/) {
   g_enc.busy_acc += busy;
   g_enc.busy_cnt++;
   portEXIT_CRITICAL(&g_enc_mux);
+  hostExitRealtimeCb();
 }
 
 // 读快照（loop 侧调用）
@@ -1996,7 +2015,7 @@ void phaseTick(float abs_deg, float ddeg) {
     move_accum_deg += ddeg;
     bool wrong = (move_dir > 0 && ddeg < -0.05f) || (move_dir < 0 && ddeg > 0.05f);
     if (wrong) {
-      move_wrong_ms += CTRL_MS;
+      move_wrong_ms += (CTRL_PERIOD_US / 1000);
       if (move_wrong_ms > 800) {
         // 自动纠正电调方向并重试剩余角度
         float remain = move_target_deg - fabsf(move_accum_deg);
@@ -2040,8 +2059,8 @@ void phaseTick(float abs_deg, float ddeg) {
 }
 
 void controlTick(float rpm_meas, float dt) {
-  // 主机超时（学习中不因超时急停，避免油门被拉回 1000 再爬升）
-  if (host_seen && run_state == RUN_RUNNING && !learn_active) {
+  // 主机超时：测试态保留；FLIGHT ON 禁用（防空中断连误 ESTOP）
+  if (!flight_mode && host_seen && run_state == RUN_RUNNING && !learn_active) {
     if ((millis() - last_host_ms) > HOST_TIMEOUT_MS) {
       doEstop("host_timeout");
       return;
@@ -2128,20 +2147,77 @@ void handleCommandLine(char* line) {
   if (strcasecmp(line, "ENC?") == 0 || strcasecmp(line, "ENC") == 0) {
     EncShared snap;
     encGetSnapshot(&snap);
+    // ENC? = 采集/使用层：enc_sample_hz≈2000（采了2k、用2k求速）
     hostPrintf(
-        "# ENC target_hz=%lu meas_hz=%.1f cpu%%=%.2f loop_hz=%.0f window=%d spi_hz=%lu "
-        "nyquist_rpm=%lu counts=%lld raw=%u rpm=%.1f ef=%u agc=%u seq=%lu\n",
-        (unsigned long)ENC_SAMPLE_HZ, (double)enc_sample_hz_meas, (double)enc_cpu_pct,
-        (double)enc_loop_hz, ENC_VEL_WINDOW, (unsigned long)ENC_SPI_HZ,
-        (unsigned long)(ENC_SAMPLE_HZ * 30UL), (long long)snap.counts, (unsigned)snap.raw,
-        (double)snap.rpm_signed, (unsigned)snap.ef, (unsigned)snap.agc,
+        "# ENC collect_hz=%lu use_hz=%lu meas_hz=%.1f cpu%%=%.2f loop_hz=%.0f window=%d "
+        "spi_hz=%lu nyquist_rpm=%lu counts=%lld raw=%u rpm=%.1f ef=%u agc=%u seq=%lu "
+        "(采集+使用同层全用@2k; 输出见CTRL?)\n",
+        (unsigned long)ENC_SAMPLE_HZ, (unsigned long)ENC_SAMPLE_HZ,
+        (double)enc_sample_hz_meas, (double)enc_cpu_pct, (double)enc_loop_hz, ENC_VEL_WINDOW,
+        (unsigned long)ENC_SPI_HZ, (unsigned long)(ENC_SAMPLE_HZ * 30UL), (long long)snap.counts,
+        (unsigned)snap.raw, (double)snap.rpm_signed, (unsigned)snap.ef, (unsigned)snap.agc,
         (unsigned long)snap.seq);
     return;
   }
+  if (strcasecmp(line, "CTRL?") == 0 || strcasecmp(line, "CTRL") == 0) {
+    // CTRL? = 输出层：ctrl_out_hz≈400（读最新RPM→PID→ESC）；禁止叫采集/使用
+    hostPrintf(
+        "# CTRL out_hz=%lu meas_out_hz=%.1f period_us=%lu esc_hz=%lu usb_telem_hz=%lu "
+        "flight=%d ble=%d host_timeout=%s "
+        "(输出400; 采集/使用见ENC? 数据流:采集2k→使用2k→输出400)\n",
+        (unsigned long)CTRL_HZ, (double)ctrl_out_hz_meas, (unsigned long)CTRL_PERIOD_US,
+        (unsigned long)esc_pwm_hz, (unsigned long)USB_TELEM_HZ, flight_mode ? 1 : 0,
+        bleIsEnabled() ? 1 : 0, flight_mode ? "OFF(flight)" : "ON(1.5s)");
+    return;
+  }
+  if (strcasecmp(line, "TELEM?") == 0 || strcasecmp(line, "TELEM") == 0) {
+    // usb_telem_hz = 每秒完整 CSV 帧数（1帧=1行全字段），非「帧内算速次数」
+    hostPrintf(
+        "# TELEM usb_telem_hz=%lu (frames/s, 1 frame=1 full CSV line, period=%lums) "
+        "ble_telem_hz=%u async_log_drop=%lu "
+        "(collect/use=%lu out=%lu; telem only copies latest snapshot)\n",
+        (unsigned long)USB_TELEM_HZ, (unsigned long)(1000UL / USB_TELEM_HZ),
+        (unsigned)bleTelemHz(), (unsigned long)hostAsyncLogDropped(),
+        (unsigned long)ENC_SAMPLE_HZ, (unsigned long)CTRL_HZ);
+    return;
+  }
+  if (strcasecmp(line, "CORE?") == 0 || strcasecmp(line, "CORE") == 0) {
+    hostPrintf("# CORE ctrl=%lu enc_cb=%lu loop=%lu (ctrl pin Core1; enc_cb 随调度)\n",
+               (unsigned long)g_ctrl_core_id, (unsigned long)g_enc_cb_core_id,
+               (unsigned long)g_loop_core_id);
+    return;
+  }
   if (strcasecmp(line, "BLE?") == 0) {
-    hostPrintf("# BLE conn=%d rate=%u lite=%d name=%s\n",
-               bleConnected() ? 1 : 0, (unsigned)bleTelemHz(), bleLiteOn() ? 1 : 0,
-               BLE_DEVICE_NAME);
+    hostPrintf("# BLE enabled=%d conn=%d rate=%u lite=%d name=%s flight=%d wifi=off\n",
+               bleIsEnabled() ? 1 : 0, bleConnected() ? 1 : 0, (unsigned)bleTelemHz(),
+               bleLiteOn() ? 1 : 0, BLE_DEVICE_NAME, flight_mode ? 1 : 0);
+    return;
+  }
+  if (strcasecmp(line, "BLE ON") == 0 || strcasecmp(line, "BLE 1") == 0) {
+    bleSetEnabled(true);
+    hostPrintf("# ACK BLE ON enabled=%d\n", bleIsEnabled() ? 1 : 0);
+    return;
+  }
+  if (strcasecmp(line, "BLE OFF") == 0 || strcasecmp(line, "BLE 0") == 0) {
+    bleSetEnabled(false);
+    hostPrintf("# ACK BLE OFF enabled=%d\n", bleIsEnabled() ? 1 : 0);
+    return;
+  }
+  if (strcasecmp(line, "FLIGHT?") == 0) {
+    hostPrintf("# FLIGHT=%s ble=%s host_timeout=%s wifi=off mode=%s\n",
+               flight_mode ? "ON" : "OFF", bleIsEnabled() ? "on" : "off",
+               flight_mode ? "disabled" : "1.5s", flight_mode ? "FLIGHT" : "TEST");
+    return;
+  }
+  if (strcasecmp(line, "FLIGHT ON") == 0) {
+    flight_mode = true;
+    bleSetEnabled(false);
+    hostPrintln("# ACK FLIGHT ON ble=off host_timeout=disabled wifi=off");
+    return;
+  }
+  if (strcasecmp(line, "FLIGHT OFF") == 0) {
+    flight_mode = false;
+    hostPrintln("# ACK FLIGHT OFF host_timeout=1.5s (BLE unchanged; use BLE ON to re-enable)");
     return;
   }
   if (strncasecmp(line, "BLE RATE", 8) == 0) {
@@ -2149,8 +2225,8 @@ void handleCommandLine(char* line) {
     while (*p == ' ' || *p == '=' || *p == ':') ++p;
     int hz = atoi(p);
     bleSetRate((uint16_t)hz);
-    hostPrintf("# ACK BLE RATE=%u Hz (USB telem still %lu Hz)\n",
-               (unsigned)bleTelemHz(), (unsigned long)CTRL_HZ);
+    hostPrintf("# ACK BLE RATE=%u Hz (USB telem %lu Hz; ctrl_out %lu Hz)\n",
+               (unsigned)bleTelemHz(), (unsigned long)USB_TELEM_HZ, (unsigned long)CTRL_HZ);
     return;
   }
   if (strncasecmp(line, "BLE LITE", 8) == 0) {
@@ -2864,6 +2940,165 @@ void pollSerialCommands() {
   }
 }
 
+// ---------------- 输出任务 @400Hz（esp_timer → 信号量 → Core1）----------------
+// 只读 EncShared 最新 RPM；禁止在此做 SPI。采集/使用仍在 encSampleCb @2k。
+static void ctrlTimerCb(void* /*arg*/) {
+  // ESP_TIMER_TASK 上下文（非硬 ISR）→ 普通 Give
+  if (g_ctrl_sem) xSemaphoreGive(g_ctrl_sem);
+}
+
+static void motorControlTask(void* /*arg*/) {
+  g_ctrl_core_id = (uint32_t)xPortGetCoreID();
+  static bool have_last_counts = false;
+  static int64_t last_ctrl_counts = 0;
+  static uint32_t ctrl_stat_ms = 0;
+  static uint32_t ctrl_stat_ticks = 0;
+
+  for (;;) {
+    if (g_ctrl_sem) xSemaphoreTake(g_ctrl_sem, portMAX_DELAY);
+    else vTaskDelay(1);
+
+    uint32_t now = millis();
+    EncShared snap;
+    encGetSnapshot(&snap);
+
+    uint16_t raw = snap.raw;
+    float abs_deg = (float)raw * ENC_DEG_PER_COUNT;
+    float deg = phaseRelFromAbs(abs_deg);
+
+    motor_unwrapped_counts = snap.counts;
+    motor_unwrapped_deg = (float)snap.counts * ENC_DEG_PER_COUNT;
+    rpm_signed_stable = snap.rpm_signed;
+    rpm_filt = snap.rpm_signed;
+    float rpm_mag = fabsf(snap.rpm_signed);
+
+    float ddeg = 0.0f;
+    if (have_last_counts) {
+      ddeg = (float)(snap.counts - last_ctrl_counts) * ENC_DEG_PER_COUNT;
+    }
+    last_ctrl_counts = snap.counts;
+    have_last_counts = true;
+
+    float dt = (float)CTRL_PERIOD_US * 1.0e-6f;
+    if (last_ms != 0 && now > last_ms) {
+      float d = (now - last_ms) * 0.001f;
+      if (d > 0.0005f && d < 0.05f) dt = d;
+    }
+    if (snap.seq > 0) last_deg = abs_deg;
+    last_ms = now;
+
+    phaseTick(abs_deg, ddeg);
+    hallPoll(now, deg, abs_deg, raw);
+    controlTick(rpm_mag, dt);  // 输出：读使用层最新 |rpm| → PID → ESC
+
+    g_ctrl_tick_cnt++;
+    ctrl_stat_ticks++;
+    if (ctrl_stat_ms == 0) {
+      ctrl_stat_ms = now;
+      ctrl_stat_ticks = 0;
+    } else if ((now - ctrl_stat_ms) >= 500) {
+      uint32_t dms = now - ctrl_stat_ms;
+      ctrl_out_hz_meas = (float)ctrl_stat_ticks * 1000.0f / (float)dms;
+      ctrl_stat_ms = now;
+      ctrl_stat_ticks = 0;
+    }
+  }
+}
+
+static void controlOutputBegin() {
+  g_ctrl_sem = xSemaphoreCreateBinary();
+  xTaskCreatePinnedToCore(motorControlTask, "motorCtrl", 6144, nullptr, 5, &g_ctrl_task, 1);
+  hostForbidPrintFromTask(g_ctrl_task);  // 控制任务内 hostPrintf → 异步环
+  const esp_timer_create_args_t args = {
+      .callback = &ctrlTimerCb,
+      .arg = nullptr,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "ctrl_out",
+      .skip_unhandled_events = true,
+  };
+  if (esp_timer_create(&args, &g_ctrl_timer) == ESP_OK) {
+    esp_timer_start_periodic(g_ctrl_timer, CTRL_PERIOD_US);
+  }
+}
+
+// ---------------- 低优遥测任务（Core0 prio=1；勿堵 2k/400 实时路径）----------------
+static TaskHandle_t g_telem_task = nullptr;
+static uint32_t g_telem_iters = 0;
+
+static void telemTask(void* /*arg*/) {
+  uint32_t next_telem_ms = 0;
+  uint32_t stat_prev_ms = 0;
+  uint32_t stat_prev_seq = 0;
+  for (;;) {
+    hostDrainAsyncLog();
+
+    uint32_t now = millis();
+    if ((int32_t)(now - next_telem_ms) < 0) {
+      vTaskDelay(1);
+      continue;
+    }
+    next_telem_ms = now + (1000UL / USB_TELEM_HZ);
+
+    EncShared snap;
+    encGetSnapshot(&snap);
+
+    uint16_t raw = snap.raw;
+    float abs_deg = (float)raw * ENC_DEG_PER_COUNT;
+    float deg = phaseRelFromAbs(abs_deg);
+    float rad = deg * (TWO_PI_F / 360.0f);
+
+    g_telem_iters++;
+    if (stat_prev_ms == 0) {
+      stat_prev_ms = now;
+      stat_prev_seq = snap.seq;
+      g_telem_iters = 0;
+    } else if ((now - stat_prev_ms) >= 500) {
+      uint32_t dms = now - stat_prev_ms;
+      enc_sample_hz_meas = (float)(snap.seq - stat_prev_seq) * 1000.0f / (float)dms;
+      enc_loop_hz = (float)g_telem_iters * 1000.0f / (float)dms;
+      uint32_t bacc, bcnt;
+      encTakeBusy(&bacc, &bcnt);
+      if (bcnt > 0) {
+        float avg_us = (float)bacc / (float)bcnt;
+        enc_cpu_pct = avg_us * enc_sample_hz_meas / 10000.0f;
+      }
+      stat_prev_ms = now;
+      stat_prev_seq = snap.seq;
+      g_telem_iters = 0;
+    }
+
+    int mode_i = (int)ctrl_mode;
+    int run_i = (int)run_state;
+    int prof_i = (int)profile_id;
+    float disc_est = discEstFromMotor();
+    float hd_m = isnan(last_hd_motor_rel) ? -1.0f : last_hd_motor_rel;
+    float hu_m = isnan(last_hu_motor_rel) ? -1.0f : last_hu_motor_rel;
+    float disc_out = isnan(disc_est) ? -1.0f : disc_est;
+    float oh = isnan(out_hz_meas) ? -1.0f : out_hz_meas;
+    float gm = isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas;
+
+    char line[320];
+    int n = snprintf(
+        line, sizeof(line),
+        "%lu,%u,%.3f,%.6f,%.2f,%u,%u,%u,%u,%u,%.1f,%d,%.4f,%.4f,%.4f,%d,%d,%u,%u,%.3f,%.3f,%.3f,%.5f,%.5f,%.1f\n",
+        (unsigned long)now, (unsigned)raw, deg, rad, rpm_signed_stable, (unsigned)snap.ef,
+        (unsigned)snap.agc, (unsigned)snap.mag_low, (unsigned)snap.mag_high,
+        (unsigned)esc_pulse_us, (double)target_ramped, mode_i, (double)kp, (double)ki, (double)kd,
+        prof_i, run_i, (unsigned)hall_dn_lvl, (unsigned)hall_up_lvl, (double)disc_out,
+        (double)hd_m, (double)hu_m, (double)oh, (double)gm, (double)enc_sample_hz_meas);
+    if (n > 0) {
+      if (n >= (int)sizeof(line)) n = (int)sizeof(line) - 1;
+      Serial.write((const uint8_t*)line, (size_t)n);
+    }
+    bleEmitTelemLite(now, rpm_signed_stable, esc_pulse_us, target_ramped, mode_i, run_i, oh, gm);
+    (void)prof_i;
+  }
+}
+
+static void telemBegin() {
+  xTaskCreatePinnedToCore(telemTask, "telem", 6144, nullptr, 1, &g_telem_task, 0);
+}
+
 // ---------------- setup / loop ----------------
 void setup() {
   setupEscPwmMinFirst();
@@ -2875,9 +3110,12 @@ void setup() {
 
   Serial.begin(SERIAL_BAUD);
   delay(200);
-  // BLE 需在 Serial 就绪后初始化；NUS 服务必须 create→start→advertise
+#if FEATURE_BLE_DEFAULT
   bleBegin();
   delay(50);
+#else
+  hostPrintln("# BLE skipped (FEATURE_BLE_DEFAULT=0)");
+#endif
 
   prefs.begin("escctl", false);
   loadMapsFromNvs();
@@ -2887,150 +3125,32 @@ void setup() {
   spi->beginTransaction(SPISettings(ENC_SPI_HZ, MSBFIRST, SPI_MODE1));
   spiFrame(buildReadCmd(REG_ERRFL));
   spiFrame(buildReadCmd(REG_NOP));
-  // 启动高频编码器采样任务（esp_timer），控制环从此只取最新快照
+  // 采集+使用 @2k；输出任务只读快照；遥测低优异步
   encoderBegin();
+  controlOutputBegin();
+  telemBegin();
 
   hostPrintln("# AS5047P + ESC Ready (ESP32-S3)");
-  hostPrintf("# enc_sample_hz=%lu (target) ctrl_hz=%lu baud=%lu esc_pwm_hz=%lu pin=%d spi_hz=%lu\n",
-                (unsigned long)ENC_SAMPLE_HZ, (unsigned long)CTRL_HZ,
-                (unsigned long)SERIAL_BAUD, (unsigned long)esc_pwm_hz, PIN_ESC_PWM,
-                (unsigned long)ENC_SPI_HZ);
-  hostPrintf("# ENC decoupled sampling: esp_timer @%luHz, vel=window-diff(counts), Nyquist~%luRPM (ENC? for live)\n",
-                (unsigned long)ENC_SAMPLE_HZ, (unsigned long)(ENC_SAMPLE_HZ * 30UL));
-  hostPrintf("# BLE name=%s NUS rate_default=%uHz lite=1 (cmds: BLE? BLE RATE BLE LITE)\n",
-             BLE_DEVICE_NAME, (unsigned)BLE_TELEM_HZ_DEFAULT);
-  hostPrintln("# format: t_ms,raw,deg(rel),rad,rpm,...,run,hall_dn,hall_up,disc_est,hd_mdeg,hu_mdeg,out_hz_meas,gear_meas");
-  hostPrintln("# BLE lite: B,t_ms,motor_rpm,pulse,target,mode,run,out_hz_meas,gear_meas");
-  hostPrintln("# MEAS: out_hz from HALL DOWN period; gear_meas=motor_revs/disc_rev; design=(59*79)/(12*14)");
-  hostPrintln("# cmds: START STOP ESTOP RPM PHASE MOVE STOPAT GOTO LEARN MEASURE GAIN HALL ...");
-  hostPrintln("# PHASE: ZERO; MOVE CW/CCW auto→uni path; SENSE AUTO detect ESC dir");
-  hostPrintln("# HALL: GPIO4=下扑0° GPIO5=上举~180° IDF gpio_isr ANYEDGE+SW; HALL? HALL CAL HALL ACTIVE LOW|HIGH");
-  hostPrintln("# LEARN START=step, LEARN RAMP=slope; GAIN ON|OFF|?|SAVE; KA <us/(rpm/s)>|KA?");
-  hostPrintf("# GAIN schedule=%s points=%d valid=%d\n",
-                gain_schedule_on ? "ON" : "OFF", activeGainMap().n, activeGainMap().valid ? 1 : 0);
-  hostPrintf("# phase_zero=%.3f esc_sense=%d rpm_max=%.0f\n",
-                (double)phase_zero_deg, esc_sense, (double)target_rpm_max);
-  hostPrintf("# ENC AS5047P cpr=%u deg/count=%.6f | rpm=(dcount/cpr)/dt*60\n",
-                (unsigned)ENC_CPR, (double)ENC_DEG_PER_COUNT);
-  hostPrintf("# HALL pins dn=%d up=%d gear=(%g*%g)/(%g*%g)=%.6f (=4661/168) active=LOW\n",
-                PIN_HALL_DOWN, PIN_HALL_UP,
-                (double)GEAR_TEETH_WHEEL1, (double)GEAR_TEETH_WHEEL2,
-                (double)GEAR_TEETH_PINION1, (double)GEAR_TEETH_PINION2,
-                (double)GEAR_RATIO);
-  hostPrintln("# cmds: START STOP ESTOP RPM ... PROTO PWM|DSHOT DSHOTRATE DSHOT PWM FREQ");
-  hostPrintf("# ESC min=%uus armed low | profile=%s | proto=PWM\n",
-                (unsigned)ESC_PULSE_MIN_US, profileName());
+  hostPrintf("# mode=%s ble=%s wifi=off\n",
+             flight_mode ? "FLIGHT" : "TEST", bleIsEnabled() ? "on" : "off");
+  hostPrintln("# 数据流: 采集2k → 使用2k(求速全用) → 输出400(最新RPM→ESC)");
+  hostPrintln("# HARD: no Serial/hostPrintf in 2k encSampleCb or 400Hz motorCtrl (async log + telemTask)");
+  hostPrintf("# collect/use_hz=%lu out_hz=%lu esc_pwm_hz=%lu usb_telem_hz=%lu (frames/s) baud=%lu pin=%d\n",
+             (unsigned long)ENC_SAMPLE_HZ, (unsigned long)CTRL_HZ, (unsigned long)esc_pwm_hz,
+             (unsigned long)USB_TELEM_HZ, (unsigned long)SERIAL_BAUD, PIN_ESC_PWM);
+  hostPrintf("# 采集+使用: esp_timer @%luHz; 输出: Core1 @%luHz; USB telemTask %luHz Serial.write\n",
+             (unsigned long)ENC_SAMPLE_HZ, (unsigned long)CTRL_HZ, (unsigned long)USB_TELEM_HZ);
+  hostPrintf("# BLE name=%s enabled=%d rate=%u (BLE/FLIGHT/CORE/TELEM?)\n",
+             BLE_DEVICE_NAME, bleIsEnabled() ? 1 : 0, (unsigned)BLE_TELEM_HZ_DEFAULT);
+  hostPrintf("# GAIN schedule=%s points=%d | rpm_max=%.0f | ESC min=%uus profile=%s\n",
+             gain_schedule_on ? "ON" : "OFF", activeGainMap().n, (double)target_rpm_max,
+             (unsigned)ESC_PULSE_MIN_US, profileName());
+  hostPrintln("# cmds: PING ENC? CTRL? TELEM? CORE? BLE ON|OFF FLIGHT ON|OFF START STOP RPM FREQ ...");
 }
 
 void loop() {
+  g_loop_core_id = (uint32_t)xPortGetCoreID();
   pollSerialCommands();
-
-  static uint32_t loop_iters = 0;
-  loop_iters++;  // 主循环空转计数（CPU 空闲粗估）
-
-  static uint32_t next_ms = 0;
-  uint32_t now = millis();
-  if ((int32_t)(now - next_ms) < 0) return;
-  next_ms = now + CTRL_MS;
-
-  // —— 取高频采样最新快照（与控制环解耦；测速/解缠已在 esp_timer 侧完成）——
-  EncShared snap;
-  encGetSnapshot(&snap);
-
-  uint16_t raw = snap.raw;
-  float abs_deg = (float)raw * ENC_DEG_PER_COUNT;
-  float deg = phaseRelFromAbs(abs_deg);  // 遥测 deg = 用户相对相位（零点后）
-  float rad = deg * (TWO_PI_F / 360.0f);
-
-  // 定点累计计数/展开角由采样侧维护，这里只镜像给既有逻辑（hall/相位）
-  motor_unwrapped_counts = snap.counts;
-  motor_unwrapped_deg = (float)snap.counts * ENC_DEG_PER_COUNT;
-  rpm_signed_stable = snap.rpm_signed;
-  rpm_filt = snap.rpm_signed;  // measureHold 用 rpm_filt
-  float rpm_mag = fabsf(snap.rpm_signed);
-
-  // 本控制拍相对上一拍的角度增量（由已解缠累加计数得出，高速也不折叠）
-  static bool have_last_counts = false;
-  static int64_t last_loop_counts = 0;
-  float ddeg = 0.0f;
-  if (have_last_counts) {
-    ddeg = (float)(snap.counts - last_loop_counts) * ENC_DEG_PER_COUNT;
-  }
-  last_loop_counts = snap.counts;
-  have_last_counts = true;
-
-  float dt = CTRL_MS * 0.001f;
-  if (last_ms != 0 && now > last_ms) {
-    float d = (now - last_ms) * 0.001f;
-    if (d > 0.0005f) dt = d;
-  }
-  if (snap.seq > 0) last_deg = abs_deg;  // 有真实采样后才认为角度有效
-  last_ms = now;
-
-  phaseTick(abs_deg, ddeg);
-  hallPoll(now, deg, abs_deg, raw);
-  controlTick(rpm_mag, dt);  // 闭环用转速大小（≥0）
-
-  // —— 实测采样率 / CPU 占用估计 / 主循环空转频率（每 ~500ms 更新）——
-  static uint32_t stat_prev_ms = 0;
-  static uint32_t stat_prev_seq = 0;
-  if (stat_prev_ms == 0) {
-    stat_prev_ms = now;
-    stat_prev_seq = snap.seq;
-    loop_iters = 0;
-  } else if ((now - stat_prev_ms) >= 500) {
-    uint32_t dms = now - stat_prev_ms;
-    enc_sample_hz_meas = (float)(snap.seq - stat_prev_seq) * 1000.0f / (float)dms;
-    enc_loop_hz = (float)loop_iters * 1000.0f / (float)dms;
-    uint32_t bacc, bcnt;
-    encTakeBusy(&bacc, &bcnt);
-    if (bcnt > 0) {
-      float avg_us = (float)bacc / (float)bcnt;         // 每样本采样耗时
-      enc_cpu_pct = avg_us * enc_sample_hz_meas / 10000.0f;  // 占空比(%)
-    }
-    stat_prev_ms = now;
-    stat_prev_seq = snap.seq;
-    loop_iters = 0;
-  }
-
-  int mode_i = (int)ctrl_mode;
-  int run_i = (int)run_state;
-  int prof_i = (int)profile_id;
-  float disc_est = discEstFromMotor();
-  float hd_m = isnan(last_hd_motor_rel) ? -1.0f : last_hd_motor_rel;
-  float hu_m = isnan(last_hu_motor_rel) ? -1.0f : last_hu_motor_rel;
-  float disc_out = isnan(disc_est) ? -1.0f : disc_est;
-  float oh = isnan(out_hz_meas) ? -1.0f : out_hz_meas;
-  float gm = isnan(gear_ratio_meas) ? -1.0f : gear_ratio_meas;
-
-  // USB：全速完整遥测；BLE：限速瘦身（hostPrintf 对数字开头行不转发 BLE）
-  // 末尾追加 enc_sample_hz（实测采样率），旧列位置不变，解析器按前置索引读取兼容
-  hostPrintf("%lu,%u,%.3f,%.6f,%.2f,%u,%u,%u,%u,%u,%.1f,%d,%.4f,%.4f,%.4f,%d,%d,%u,%u,%.3f,%.3f,%.3f,%.5f,%.5f,%.1f\n",
-                (unsigned long)now,
-                (unsigned)raw,
-                deg,
-                rad,
-                rpm_signed_stable,
-                (unsigned)snap.ef,
-                (unsigned)snap.agc,
-                (unsigned)snap.mag_low,
-                (unsigned)snap.mag_high,
-                (unsigned)esc_pulse_us,
-                (double)target_ramped,
-                mode_i,
-                (double)kp,
-                (double)ki,
-                (double)kd,
-                prof_i,
-                run_i,
-                (unsigned)hall_dn_lvl,
-                (unsigned)hall_up_lvl,
-                (double)disc_out,
-                (double)hd_m,
-                (double)hu_m,
-                (double)oh,
-                (double)gm,
-                (double)enc_sample_hz_meas);
-  bleEmitTelemLite(now, rpm_signed_stable, esc_pulse_us, target_ramped, mode_i, run_i, oh, gm);
-  (void)prof_i;
+  hostDrainAsyncLog();  // 命令侧旁路再排一拍；主遥测在 telemTask
+  vTaskDelay(1);
 }

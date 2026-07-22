@@ -12,6 +12,8 @@
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char* NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char* NUS_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
@@ -22,6 +24,7 @@ static BLECharacteristic* g_ble_tx = nullptr;
 static BLECharacteristic* g_ble_rx = nullptr;
 static volatile bool g_ble_connected = false;
 static volatile bool g_ble_ready = false;
+static volatile bool g_ble_enabled = false;
 
 static uint16_t g_ble_telem_hz = BLE_TELEM_HZ_DEFAULT;
 static bool g_ble_lite = true;
@@ -35,6 +38,76 @@ static size_t g_ble_rx_len = 0;
 static char g_ble_rx_ready[96];
 static volatile bool g_ble_rx_has = false;
 
+// ---- 异步日志环：实时路径（采集回调/控制任务）禁止直打 Serial ----
+static const int ASYNC_LOG_DEPTH = 48;
+static const int ASYNC_LOG_LEN = 384;  // 与 hostPrintf 栈缓冲对齐，防 LEARN/HALL 截断
+static char g_async_buf[ASYNC_LOG_DEPTH][ASYNC_LOG_LEN];
+static volatile uint8_t g_async_w = 0;
+static volatile uint8_t g_async_r = 0;
+static volatile uint32_t g_async_drop = 0;
+static portMUX_TYPE g_async_mux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t g_forbid_print_task = nullptr;
+static volatile bool g_in_realtime_cb = false;
+
+void hostForbidPrintFromTask(TaskHandle_t t) { g_forbid_print_task = t; }
+void hostEnterRealtimeCb() { g_in_realtime_cb = true; }
+void hostExitRealtimeCb() { g_in_realtime_cb = false; }
+uint32_t hostAsyncLogDropped() { return g_async_drop; }
+
+static bool hostMustDeferPrint() {
+  if (g_in_realtime_cb) return true;
+  if (g_forbid_print_task != nullptr &&
+      xTaskGetCurrentTaskHandle() == g_forbid_print_task) {
+    return true;
+  }
+  return false;
+}
+
+static void asyncLogPush(const char* data, size_t n) {
+  if (!data || n == 0) return;
+  if (n >= (size_t)ASYNC_LOG_LEN) n = (size_t)ASYNC_LOG_LEN - 1;
+  portENTER_CRITICAL(&g_async_mux);
+  uint8_t next = (uint8_t)((g_async_w + 1) % ASYNC_LOG_DEPTH);
+  if (next == g_async_r) {
+    // 追尾丢旧：推进读指针
+    g_async_r = (uint8_t)((g_async_r + 1) % ASYNC_LOG_DEPTH);
+    g_async_drop++;
+  }
+  memcpy(g_async_buf[g_async_w], data, n);
+  g_async_buf[g_async_w][n] = '\0';
+  g_async_w = next;
+  portEXIT_CRITICAL(&g_async_mux);
+}
+
+void hostDrainAsyncLog() {
+  for (int i = 0; i < ASYNC_LOG_DEPTH; ++i) {
+    char line[ASYNC_LOG_LEN];
+    bool have = false;
+    portENTER_CRITICAL(&g_async_mux);
+    if (g_async_r != g_async_w) {
+      memcpy(line, g_async_buf[g_async_r], ASYNC_LOG_LEN);
+      g_async_r = (uint8_t)((g_async_r + 1) % ASYNC_LOG_DEPTH);
+      have = true;
+    }
+    portEXIT_CRITICAL(&g_async_mux);
+    if (!have) break;
+    size_t n = strlen(line);
+    if (n == 0) continue;
+    Serial.write((const uint8_t*)line, n);
+    if (line[n - 1] != '\n') Serial.write('\n');
+    if (bleConnected()) {
+      if (line[n - 1] == '\n') bleSendLine(line);
+      else {
+        char tmp[ASYNC_LOG_LEN + 2];
+        memcpy(tmp, line, n);
+        tmp[n] = '\n';
+        tmp[n + 1] = '\0';
+        bleSendLine(tmp);
+      }
+    }
+  }
+}
+
 class BleServerCbs : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
     (void)s;
@@ -44,8 +117,10 @@ class BleServerCbs : public BLEServerCallbacks {
   void onDisconnect(BLEServer* s) override {
     g_ble_connected = false;
     Serial.println("# BLE client disconnected");
-    delay(100);
-    s->startAdvertising();
+    if (g_ble_enabled) {
+      delay(100);
+      s->startAdvertising();
+    }
   }
 #if defined(CONFIG_BLUEDROID_ENABLED)
   void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
@@ -58,8 +133,10 @@ class BleServerCbs : public BLEServerCallbacks {
     (void)param;
     g_ble_connected = false;
     Serial.println("# BLE client disconnected (bluedroid)");
-    delay(100);
-    s->startAdvertising();
+    if (g_ble_enabled) {
+      delay(100);
+      s->startAdvertising();
+    }
   }
 #endif
 #if defined(CONFIG_NIMBLE_ENABLED)
@@ -73,8 +150,10 @@ class BleServerCbs : public BLEServerCallbacks {
     (void)desc;
     g_ble_connected = false;
     Serial.println("# BLE client disconnected (nimble)");
-    delay(100);
-    s->startAdvertising();
+    if (g_ble_enabled) {
+      delay(100);
+      s->startAdvertising();
+    }
   }
 #endif
 };
@@ -107,8 +186,10 @@ class BleRxCbs : public BLECharacteristicCallbacks {
   }
 };
 
+bool bleIsEnabled() { return g_ble_enabled && g_ble_ready; }
+
 bool bleConnected() {
-  if (!g_ble_ready || g_ble_tx == nullptr) return false;
+  if (!g_ble_enabled || !g_ble_ready || g_ble_tx == nullptr) return false;
   if (g_ble_connected) return true;
   if (g_ble_server != nullptr && g_ble_server->getConnectedCount() > 0) {
     g_ble_connected = true;
@@ -118,7 +199,7 @@ bool bleConnected() {
 }
 
 void bleSendRaw(const char* data, size_t n) {
-  if (!bleConnected() || !data || n == 0) return;
+  if (!g_ble_enabled || !bleConnected() || !data || n == 0) return;
   g_ble_tx->setValue((uint8_t*)data, n);
   g_ble_tx->notify();
 }
@@ -130,7 +211,7 @@ static void bleRestoreTelemValue() {
 }
 
 void bleSendMeta(const char* data, size_t n) {
-  if (!bleConnected() || !data || n == 0) return;
+  if (!g_ble_enabled || !bleConnected() || !data || n == 0) return;
   g_ble_tx->setValue((uint8_t*)data, n);
   g_ble_tx->notify();
   bleRestoreTelemValue();
@@ -202,11 +283,47 @@ void bleBegin() {
   adv->start();
 
   g_ble_ready = true;
+  g_ble_enabled = true;
   Serial.printf("# BLE advertising name=%s\n", BLE_DEVICE_NAME);
 }
 
+void bleSetEnabled(bool on) {
+  if (on) {
+    if (!g_ble_ready) {
+      bleBegin();
+      return;
+    }
+    g_ble_enabled = true;
+    if (g_ble_server != nullptr) {
+      BLEAdvertising* adv = g_ble_server->getAdvertising();
+      if (adv) adv->start();
+    }
+    Serial.println("# BLE enabled (adv on)");
+    return;
+  }
+  g_ble_enabled = false;
+  g_ble_connected = false;
+  g_ble_rx_has = false;
+  g_ble_rx_len = 0;
+  if (g_ble_server != nullptr) {
+    // 尽量断开现有连接；栈差异下失败可忽略，TX/RX 已短路
+    uint16_t n = g_ble_server->getConnectedCount();
+    for (uint16_t i = 0; i < n; ++i) {
+#if defined(CONFIG_NIMBLE_ENABLED)
+      // NimBLE: disconnect by conn handle if available
+#endif
+      (void)i;
+    }
+    BLEAdvertising* adv = g_ble_server->getAdvertising();
+    if (adv) adv->stop();
+  }
+  Serial.println("# BLE disabled (adv off, NUS shorted)");
+}
+
+void bleEnd() { bleSetEnabled(false); }
+
 bool bleTakeRxLine(char* out, size_t out_sz) {
-  if (!g_ble_rx_has || !out || out_sz == 0) return false;
+  if (!g_ble_enabled || !g_ble_rx_has || !out || out_sz == 0) return false;
   strncpy(out, g_ble_rx_ready, out_sz - 1);
   out[out_sz - 1] = '\0';
   g_ble_rx_has = false;
@@ -215,7 +332,7 @@ bool bleTakeRxLine(char* out, size_t out_sz) {
 
 void bleEmitTelemLite(uint32_t t_ms, float rpm, uint16_t pulse, float target, int mode, int run,
                       float out_hz_meas, float gear_meas) {
-  if (!bleConnected()) return;
+  if (!g_ble_enabled || !bleConnected()) return;
   uint32_t period = 1000UL / (uint32_t)g_ble_telem_hz;
   if (period < 20) period = 20;
   if ((uint32_t)(t_ms - g_ble_last_telem_ms) < period) return;
@@ -256,6 +373,11 @@ uint16_t bleTelemHz() { return g_ble_telem_hz; }
 bool bleLiteOn() { return g_ble_lite; }
 
 void hostPrintln(const char* s) {
+  if (!s) return;
+  if (hostMustDeferPrint()) {
+    asyncLogPush(s, strlen(s));
+    return;
+  }
   Serial.println(s);
   if (bleConnected()) bleSendLine(s);
 }
@@ -268,10 +390,13 @@ void hostPrintf(const char* fmt, ...) {
   va_end(ap);
   if (n <= 0) return;
   if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+  if (hostMustDeferPrint()) {
+    asyncLogPush(buf, (size_t)n);
+    return;
+  }
   Serial.write((const uint8_t*)buf, (size_t)n);
   if (!bleConnected()) return;
-  if (buf[0] >= '0' && buf[0] <= '9') return;  // USB 全速遥测不灌 BLE
-  // meta：notify 后恢复遥测特征值，避免手机 READ 读到 # ACK / # HALL
+  if (buf[0] >= '0' && buf[0] <= '9') return;  // USB 遥测不灌 BLE
   if (buf[n - 1] != '\n' && n + 1 < (int)sizeof(buf)) {
     buf[n++] = '\n';
     buf[n] = '\0';

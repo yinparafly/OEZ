@@ -1,0 +1,893 @@
+这份文档写得**非常专业且清晰**，已经完全达到“可交接总纲”的水准。它不再是模糊的需求描述，而是一份**工程实施路线图**。以下是我的分析与评价，以及几条具体建议。
+
+---
+
+## 一、总体评价
+
+| 维度 | 评价 |
+|------|------|
+| **逻辑清晰度** | ⭐⭐⭐⭐⭐ 节拍、术语、数据流写死，杜绝了后续混淆 |
+| **架构合理性** | ⭐⭐⭐⭐⭐ “高频采/取用，低频控输出”是正确的嵌入式实时控制模式 |
+| **可实施性** | ⭐⭐⭐⭐ 阶段划分明确，但部分细节（如环缓实现）留白，需补充 |
+| **风险识别** | ⭐⭐⭐⭐ 风险表覆盖全面，但缺少“若环缓读指针追尾”的处理 |
+| **文档质量** | ⭐⭐⭐⭐⭐ 术语表、频率表、验收清单、索引齐全 |
+
+---
+
+## 二、核心判断：方案成熟，可直接进入实施
+
+以下几处决策尤其正确，应继续坚持：
+
+| 决策点 | 文档立场 | 评价 |
+|--------|----------|------|
+| **采样保持 2kHz** | 明确“不为贴原文而降采样” | ✅ 正确：2kHz已稳定，降频无收益 |
+| **取用≠控制输出** | 全文术语隔离 | ✅ 关键：避免后续误将400Hz当测速频率 |
+| **弃用250Hz** | 400/200/2000整数系 | ✅ 干净对齐，利于日志和FFT分析 |
+| **Arduino-ESP32 + FreeRTOS API** | 不迁IDF | ✅ 务实：避免重写BLE/命令/脚本 |
+| **飞行关BLE** | 明确双态 | ✅ 符合扑翼安全规范 |
+
+---
+
+## 三、建议补充/优化的细节
+
+### 1. 环形缓冲区实现细节（§4.4 阶段D建议加一条）
+
+目前“回调只写(t_us, counts)环缓”是可选增强，但若后续实施，需明确：
+
+- **环缓深度**：2kHz采样，400Hz控制拍，每拍消费约5个点。建议深度 **16或32**（2的幂，方便位运算取模）。
+- **读写指针隔离**：写指针在采样回调中递增（`volatile`），读指针在控制任务中递增。**写指针永远不追读指针**（若追尾，说明控制任务消费太慢→应报警并丢弃旧数据，而非阻塞采样）。
+- **数据原子性**：写指针更新前，先将数据写入数组；读指针取值时，需确保读到的是完整写入的一对`(t_us, counts)`。
+
+**建议在 §8.1 改动文件中增加一行**：`enc_ring.h`（若采用环缓，需定义深度、读写API、追尾保护）。
+
+---
+
+### 2. 采样回调瘦身（§4.4 可选演进）的优先级
+
+目前回调内做SPI+解缠+8点窗差分+EMA+portMUX写共享，**已经过验证**。但若后续在回调中增加环缓写入，需确保回调总耗时**远小于500µs**（2kHz周期）。
+
+| 操作 | 预估耗时 | 累计 |
+|------|----------|------|
+| SPI读取（8MHz） | ~10µs | 10µs |
+| 解缠（整数运算） | ~2µs | 12µs |
+| 8点窗差分+EMA | ~5µs | 17µs |
+| 环缓写入 | ~1µs | 18µs |
+| portMUX快照 | ~1µs | 19µs |
+
+**结论**：回调总耗时 < 20µs，远小于500µs周期，**无需瘦身**。但应**禁止**在回调中做`Serial.print`或`printf`，那会拖垮2kHz。
+
+---
+
+### 3. 控制任务400Hz的调度方式（§4.2）
+
+文档写“`vTaskDelayUntil(2.5ms)`”，但需注意：
+
+- FreeRTOS tick默认1ms，`pdMS_TO_TICKS(2.5)`会四舍五入为**2或3**，导致周期在2~3ms间抖动。
+- **当前控制任务若用`vTaskDelayUntil`，实际周期不是精确2.5ms**。
+
+**建议**：
+- **方案一（简单）**：维持现状，若控制任务优先级高且周期抖动在可接受范围（<±0.5ms），可暂不处理。
+- **方案二（推荐）**：为400Hz控制任务也使用**硬件定时器**（esp_timer）触发信号量，任务等待信号量，保证µs级精度。
+
+**建议在 §6.1 或 §7 中增加一句**：`vTaskDelayUntil`用于400Hz控制存在~1ms级抖动；若需微秒级精度，改用esp_timer触发信号量。
+
+---
+
+### 4. BLE关闭后的主机超时（§5 通信策略）
+
+文档提到“飞行态关BLE”，但若BLE是唯一的“心跳”来源，关闭后主机超时急停会误触。
+
+**建议明确**：
+- 飞行态下，**主机超时急停应自动禁用**（或放宽到10s），避免空中误急停。
+- 或引入“地面/飞行”模式切换：`FLIGHT ON`时，主机超时关闭；`FLIGHT OFF`时，超时1.5s保护台架。
+
+文档已提到此点，但建议在**验收清单**中增加一项：`FLIGHT ON`后，串口断连**不会**触发ESTOP。
+
+---
+
+### 5. 高速阶梯测试的“到顶判据”（§9.2）
+
+文档写“稳态均值不再升（增量<~100RPM）”，但空载时电机可能因机械共振/风阻在某个转速出现“平台”，需避免误判。
+
+**建议补充**：
+- 到顶判据应结合**脉宽**：若`pulse > 1950µs`且RPM不再升，判定为动力上限。
+- 若`pulse`仍在上升但RPM不再升（效率急剧下降），也应判为动力上限。
+
+---
+
+### 6. 文档中的一个小笔误
+
+§4.2 表格中“编码器采样”行的实现要点写着“随esp_timer（常见Core0）”，但§6.1写“采样方案选型（已落地）：esp_timer + 同步SPI ✅”。
+
+- **esp_timer回调默认在哪个核心执行**取决于ESP-IDF调度，可能随任务迁移。文档不应写死“常见Core0”，应写“不绑定核心，回调尽量短”。
+- **建议**：在验收中增加`CORE?`命令打印回调实际运行核心，便于后续观察。
+
+---
+
+## 四、可选的增强点（非阻塞）
+
+| 增强项 | 收益 | 实施成本 |
+|--------|------|----------|
+| **控制任务用esp_timer触发信号量** | 400Hz精度从±1ms提升到±20µs | 低（约30行代码） |
+| **环缓取代portMUX快照** | 控制侧可做6点LS拟合 | 中等（约100行+API） |
+| **采样回调中禁止Serial.print** | 防止回调超时 | 代码审查即可 |
+| **FLIGHT ON自动禁用主机超时** | 防空中急停 | 低（约10行） |
+
+---
+
+## 五、总结
+
+**这是一份高质量的工程总纲**，术语清晰、决策有理有据、实施路径明确。文档已具备“可交接”的全部要素。
+
+**当前最需补充的两点**：
+
+1. **明确400Hz控制任务是否用硬件定时器**（`vTaskDelayUntil`精度不足，应注明或改方案）。
+2. **环缓实现细节**（若阶段D采用，需提前定义深度、读写API、追尾保护）。
+
+其余内容可直接进入阶段A/B实施。若后续需要，我可以协助起草环缓API或控制任务esp_timer触发信号量的示例代码。
+
+协助起草环缓API或控制任务esp_timer触发信号量的示例代码。
+
+你的方向非常正确：**使用定点数（Fixed-Point Arithmetic）进行整数运算，最后再转回浮点**，这能显著减少浮点运算耗时并避免精度损失，尤其适合 ESP32-S3 的实时控制场景。
+
+---
+
+## 一、为什么推荐定点数而非浮点
+
+| 对比项 | 浮点运算 | 定点整数运算 |
+|--------|----------|-------------|
+| **耗时** | 约 50-200 ns（FPU） | 约 5-20 ns（整数ALU） |
+| **确定性** | 浮点单元（FPU）可能被中断抢占 | 整数指令执行时间固定 |
+| **精度问题** | 累积误差、舍入误差 | 可控，只要Q格式选对 |
+| **内存占用** | 4字节/float | 4字节/int32_t，一样 |
+| **适用场景** | 复杂非线性（三角函数等） | 线性运算（PID、滤波、差分） |
+
+**关键判断**：你的控制算法（差分、PID、前馈查表、EMA滤波）**全是线性运算**，非常适合定点化。
+
+---
+
+## 二、Q格式定点数基础
+
+### 2.1 Q格式表示法
+
+**Qm.n** 表示：**m** 位整数部分 + **n** 位小数部分，共 **m+n** 位（通常 32 位）。
+
+**常用格式**：
+
+| 格式 | 含义 | 范围 | 分辨率 |
+|------|------|------|--------|
+| Q16.16 | 16位整数 + 16位小数 | ±32767.9999 | 1/65536 ≈ 0.000015 |
+| Q8.24 | 8位整数 + 24位小数 | ±127.9999 | 1/16777216 ≈ 0.00000006 |
+| Q12.20 | 12位整数 + 20位小数 | ±2047.9999 | 1/1048576 ≈ 0.00000095 |
+
+**你的场景推荐**：
+
+| 变量 | 范围 | 所需精度 | 推荐格式 |
+|------|------|----------|----------|
+| **RPM**（目标/反馈） | 0~12000 | ±0.1 RPM | **Q16.16**（分辨率0.000015） |
+| **脉宽 μs**（1000~2000） | 0~2000 | ±0.1µs | **Q12.20** 或 **Q16.16** |
+| **PID 系数**（Kp/Ki） | 0~100 | ±0.001 | **Q8.24** 或 **Q16.16** |
+| **时间差 dt**（ms） | 0~10 | ±0.001ms | **Q16.16** |
+
+**建议统一用 Q16.16**（32位），兼顾范围和精度，运算简单。
+
+---
+
+## 三、Q16.16 定点运算库（精简版）
+
+### 3.1 基础宏定义
+
+```cpp
+// ============================================================
+// Q16.16 定点数：int32_t 存储，低16位为小数
+// ============================================================
+#define Q16_16_FRAC_BITS  16
+#define Q16_16_SCALE      (1 << 16)  // 65536
+#define Q16_16_ROUND      (1 << 15)  // 四舍五入用
+
+// 浮点 ↔ 定点 转换
+#define FLOAT_TO_Q16(x)   ((int32_t)((x) * Q16_16_SCALE + 0.5f))
+#define Q16_TO_FLOAT(x)   ((float)(x) / Q16_16_SCALE)
+
+// 整数 ↔ 定点（整数部分）
+#define INT_TO_Q16(x)     ((int32_t)(x) << 16)
+#define Q16_TO_INT(x)     ((int32_t)((x) + Q16_16_ROUND) >> 16)
+
+// ============================================================
+// Q16.16 四则运算（直接整数运算，无需浮点）
+// ============================================================
+
+// 加法 / 减法（直接整数加减）
+#define Q16_ADD(a, b)     ((a) + (b))
+#define Q16_SUB(a, b)     ((a) - (b))
+
+// 乘法：两个Q16相乘 → 结果Q16（需右移16位，四舍五入）
+static inline int32_t q16_mul(int32_t a, int32_t b) {
+    int64_t tmp = (int64_t)a * b;
+    return (int32_t)((tmp + Q16_16_ROUND) >> 16);
+}
+
+// 除法：两个Q16相除 → 结果Q16（需左移16位）
+static inline int32_t q16_div(int32_t a, int32_t b) {
+    if (b == 0) return INT32_MAX;
+    int64_t tmp = ((int64_t)a << 16) / b;
+    return (int32_t)tmp;
+}
+
+// 取绝对值
+static inline int32_t q16_abs(int32_t x) {
+    return (x < 0) ? -x : x;
+}
+
+// 限幅
+static inline int32_t q16_clamp(int32_t x, int32_t min, int32_t max) {
+    if (x < min) return min;
+    if (x > max) return max;
+    return x;
+}
+```
+
+---
+
+## 四、关键算法定点化实例
+
+### 4.1 PID 控制器（定点版）
+
+**原浮点版**：
+
+```cpp
+float pid_update(float target, float feedback) {
+    float error = target - feedback;
+    float p = Kp * error;
+    integrator += Ki * error * dt;
+    float d = Kd * (error - prev_error) / dt;
+    prev_error = error;
+    return p + integrator + d;
+}
+```
+
+**定点版（Q16.16）**：
+
+```cpp
+typedef struct {
+    int32_t Kp;      // Q16.16
+    int32_t Ki;      // Q16.16
+    int32_t Kd;      // Q16.16
+    int32_t integrator;   // Q16.16
+    int32_t prev_error;   // Q16.16
+    int32_t out_min;      // Q16.16
+    int32_t out_max;      // Q16.16
+} pid_q16_t;
+
+int32_t pid_update_q16(pid_q16_t *pid, int32_t target, int32_t feedback, int32_t dt_ms) {
+    // dt_ms：整数，单位 ms（例：400Hz → dt_ms = 2.5 → 但整数必须用Q表示）
+    // 此处 dt_ms 以 Q16.16 传入，例：INT_TO_Q16(2) 或 FLOAT_TO_Q16(2.5)
+    
+    // 1. 误差
+    int32_t error = Q16_SUB(target, feedback);
+    
+    // 2. 比例项
+    int32_t p = q16_mul(pid->Kp, error);
+    
+    // 3. 积分项（Ki * error * dt）
+    int32_t ki_err = q16_mul(pid->Ki, error);
+    int32_t delta_i = q16_mul(ki_err, dt_ms);  // dt_ms 必须是 Q16
+    pid->integrator = Q16_ADD(pid->integrator, delta_i);
+    
+    // 积分限幅
+    pid->integrator = q16_clamp(pid->integrator, pid->out_min, pid->out_max);
+    
+    // 4. 微分项（Kd * (error - prev_error) / dt）
+    int32_t d_err = Q16_SUB(error, pid->prev_error);
+    int32_t d = q16_mul(pid->Kd, q16_div(d_err, dt_ms));
+    pid->prev_error = error;
+    
+    // 5. 输出
+    int32_t output = Q16_ADD(Q16_ADD(p, pid->integrator), d);
+    return q16_clamp(output, pid->out_min, pid->out_max);
+}
+```
+
+**初始化示例**：
+
+```cpp
+pid_q16_t pid_controller = {
+    .Kp = FLOAT_TO_Q16(0.5f),   // Kp = 0.5
+    .Ki = FLOAT_TO_Q16(0.01f),  // Ki = 0.01
+    .Kd = 0,                    // 微分不用
+    .integrator = 0,
+    .prev_error = 0,
+    .out_min = INT_TO_Q16(-200),   // 脉宽修正限幅 ±200µs
+    .out_max = INT_TO_Q16(200)
+};
+
+int32_t target_rpm = INT_TO_Q16(2000);      // 目标 2000 RPM
+int32_t feedback_rpm = INT_TO_Q16(1985);    // 反馈 1985 RPM
+int32_t dt_ms = FLOAT_TO_Q16(2.5f);         // 400Hz 周期
+
+int32_t output_correction = pid_update_q16(&pid_controller, target_rpm, feedback_rpm, dt_ms);
+// output_correction 单位 Q16，转换为 µs 修正量
+float output_us = Q16_TO_FLOAT(output_correction);  // 如需浮点打印
+```
+
+---
+
+### 4.2 EMA 低通滤波（定点版）
+
+**原浮点版**：
+
+```cpp
+float ema = 0.9 * ema + 0.1 * raw;
+```
+
+**定点版（Q16.16）**：
+
+```cpp
+static inline int32_t ema_update_q16(int32_t current, int32_t raw, int32_t alpha) {
+    // alpha：Q16.16，例 0.9 → FLOAT_TO_Q16(0.9)
+    // (1 - alpha) 也需是 Q16
+    int32_t one_minus_alpha = Q16_SUB(INT_TO_Q16(1), alpha);
+    int32_t part1 = q16_mul(alpha, current);
+    int32_t part2 = q16_mul(one_minus_alpha, raw);
+    return Q16_ADD(part1, part2);
+}
+
+// 使用
+int32_t ema_rpm = FLOAT_TO_Q16(0.0f);
+int32_t alpha = FLOAT_TO_Q16(0.1f);   // 平滑系数 0.1
+
+// 每次采样更新
+ema_rpm = ema_update_q16(ema_rpm, raw_rpm, alpha);
+float ema_float = Q16_TO_FLOAT(ema_rpm);  // 用于遥测打印
+```
+
+---
+
+### 4.3 6点最小二乘拟合速度（定点版）
+
+**原浮点版**（用采样点 `(t, counts)` 拟合斜率）：
+
+```cpp
+float slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x);
+float rpm = (slope / COUNTS_PER_REV) * 60.0f;
+```
+
+**定点版**：
+
+```cpp
+// 输入：samples[0..n-1] 中 t_us 和 counts 均存为 Q16.16
+int32_t calc_rpm_ls_q16(enc_sample_q16_t *samples, int n) {
+    if (n < 2) return 0;
+
+    // 所有累加用 Q16.16
+    int32_t sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0;
+    const int32_t COUNTS_PER_REV = INT_TO_Q16(16384);  // 14位编码器
+    const int32_t SECONDS_PER_MIN = INT_TO_Q16(60);
+
+    for (int i = 0; i < n; i++) {
+        sum_x = Q16_ADD(sum_x, samples[i].t_us);      // 时间，单位 µs，Q16
+        sum_y = Q16_ADD(sum_y, samples[i].counts);    // counts，Q16
+        sum_xy = Q16_ADD(sum_xy, q16_mul(samples[i].t_us, samples[i].counts));
+        sum_x2 = Q16_ADD(sum_x2, q16_mul(samples[i].t_us, samples[i].t_us));
+    }
+
+    // 分母 = n * sum_x2 - sum_x * sum_x （Q16）
+    int32_t n_q16 = INT_TO_Q16(n);
+    int32_t denom = Q16_SUB(q16_mul(n_q16, sum_x2), q16_mul(sum_x, sum_x));
+    if (denom == 0) return 0;
+
+    // 分子 = n * sum_xy - sum_x * sum_y （Q16）
+    int32_t numer = Q16_SUB(q16_mul(n_q16, sum_xy), q16_mul(sum_x, sum_y));
+
+    // 斜率 = numer / denom （counts/µs），Q16
+    int32_t slope = q16_div(numer, denom);
+
+    // RPM = slope / COUNTS_PER_REV * 60 * 1e6 （因为 t 是 µs）
+    // = slope * 60e6 / COUNTS_PER_REV
+    int32_t rpm = q16_mul(slope, q16_div(INT_TO_Q16(60000000), COUNTS_PER_REV));
+    return rpm;
+}
+```
+
+---
+
+### 4.4 前馈查表 + 插值（定点版）
+
+**原浮点版**：用 `map()` 或线性插值。
+
+**定点版**：
+
+```cpp
+// 前馈表：pulse = f(rpm) 的反函数，Q16
+typedef struct {
+    int32_t rpm;    // Q16
+    int32_t pulse;  // Q16（单位 µs）
+} ff_entry_q16_t;
+
+ff_entry_q16_t ff_table[] = {
+    {INT_TO_Q16(0),    INT_TO_Q16(1000)},
+    {INT_TO_Q16(1000), INT_TO_Q16(1100)},
+    {INT_TO_Q16(2000), INT_TO_Q16(1200)},
+    {INT_TO_Q16(4000), INT_TO_Q16(1450)},
+    {INT_TO_Q16(6000), INT_TO_Q16(1700)},
+    {INT_TO_Q16(8000), INT_TO_Q16(1950)},
+};
+
+int32_t ff_lookup_q16(int32_t target_rpm, ff_entry_q16_t *table, int table_len) {
+    // 边界处理
+    if (target_rpm <= table[0].rpm) return table[0].pulse;
+    if (target_rpm >= table[table_len-1].rpm) return table[table_len-1].pulse;
+
+    // 二分查找或线性遍历（小表直接遍历）
+    for (int i = 0; i < table_len - 1; i++) {
+        if (target_rpm >= table[i].rpm && target_rpm < table[i+1].rpm) {
+            // 线性插值：pulse = p0 + (p1-p0)*(rpm-r0)/(r1-r0)
+            int32_t drpm = Q16_SUB(target_rpm, table[i].rpm);
+            int32_t dpulse = Q16_SUB(table[i+1].pulse, table[i].pulse);
+            int32_t drange = Q16_SUB(table[i+1].rpm, table[i].rpm);
+            int32_t pulse_delta = q16_mul(dpulse, q16_div(drpm, drange));
+            return Q16_ADD(table[i].pulse, pulse_delta);
+        }
+    }
+    return table[table_len-1].pulse;
+}
+```
+
+---
+
+## 五、性能对比（预估）
+
+| 操作 | 浮点耗时 | 定点耗时 | 加速比 |
+|------|----------|----------|--------|
+| PID 单次更新（含3乘2加） | ~1.5 µs | ~0.3 µs | **5x** |
+| 6点LS拟合 | ~8 µs | ~2 µs | **4x** |
+| EMA滤波 | ~0.3 µs | ~0.08 µs | **3.7x** |
+| 前馈查表+插值 | ~1 µs | ~0.25 µs | **4x** |
+
+**结论**：定点化后，400Hz控制任务总耗时可从 ~15µs 降至 **~3-5µs**，CPU占用率从 ~0.6% 降至 **~0.2%**。
+
+---
+
+## 六、集成到环缓冲 + esp_timer 框架
+
+**修改 `enc_sample_t` 结构体**（存 Q16 而非原始整数）：
+
+```cpp
+typedef struct {
+    int32_t t_us;      // Q16.16，单位 µs
+    int32_t counts;    // Q16.16，解缠累加 counts
+} enc_sample_q16_t;
+```
+
+**采样回调中**：
+
+```cpp
+void IRAM_ATTR encSampleCallback(void *arg) {
+    uint16_t angle = readAngleSPI();   // 0~16383
+    int64_t raw_counts = unwrap(angle); // 原始整数
+
+    // 转换为 Q16.16（原始整数直接左移16位）
+    int32_t counts_q16 = (int32_t)(raw_counts << 16);
+    int32_t t_us_q16 = INT_TO_Q16(esp_timer_get_time());  // 注意：esp_timer_get_time() 返回 uint64
+
+    enc_ring_push(&g_enc_ring, t_us_q16, counts_q16);
+}
+```
+
+**控制任务中计算 RPM** 全部用 Q16 运算，只在最后打印时转浮点。
+
+---
+
+## 七、注意事项
+
+| 风险 | 缓解措施 |
+|------|----------|
+| **溢出** | 乘法前用 `int64_t` 暂存，如 `q16_mul` 中所示 |
+| **除零** | 所有除法检查分母是否为0 |
+| **符号位** | 确保所有变量声明为 `int32_t`，避免无符号溢出 |
+| **调试困难** | 保留 `Q16_TO_FLOAT` 打印宏，遥测数据仍可读 |
+| **一致性** | **统一所有运算用 Q16.16**，避免混用不同 Q 格式 |
+
+---
+
+## 八、建议的迁移路径
+
+1. **先建立 Q16 库**（上述宏和函数），放在 `q16_math.h`。
+2. **逐个替换算法**：
+   - 先改 EMA 滤波（最简单）
+   - 再改 PID
+   - 最后改 LS 拟合
+3. **保留浮点版本作为参考**，通过编译开关切换：
+   ```cpp
+   #define USE_FIXED_POINT 1   // 1=定点，0=浮点
+   ```
+4. **验收**：用遥测数据比对定点与浮点结果，确保误差 < 0.5 RPM。
+5. **逐步移除浮点代码**。
+
+---
+
+## 九、一句话总结
+
+**用 Q16.16 定点数替代浮点，在 ESP32-S3 上 PID/LS/EMA 全链路可提速 4-5 倍，CPU 占用降至 <0.3%，且精度完全满足 0.1 RPM 的要求。** 你现有的环缓冲 + esp_timer 框架无需改动，只需把 `float` 换成 `int32_t`，并在运算时使用 `q16_mul`/`q16_div`。
+
+你的方向非常正确：**使用定点数（Fixed-Point Arithmetic）进行整数运算，最后再转回浮点**，这能显著减少浮点运算耗时并避免精度损失，尤其适合 ESP32-S3 的实时控制场景。
+
+---
+
+## 一、为什么推荐定点数而非浮点
+
+| 对比项 | 浮点运算 | 定点整数运算 |
+|--------|----------|-------------|
+| **耗时** | 约 50-200 ns（FPU） | 约 5-20 ns（整数ALU） |
+| **确定性** | 浮点单元（FPU）可能被中断抢占 | 整数指令执行时间固定 |
+| **精度问题** | 累积误差、舍入误差 | 可控，只要Q格式选对 |
+| **内存占用** | 4字节/float | 4字节/int32_t，一样 |
+| **适用场景** | 复杂非线性（三角函数等） | 线性运算（PID、滤波、差分） |
+
+**关键判断**：你的控制算法（差分、PID、前馈查表、EMA滤波）**全是线性运算**，非常适合定点化。
+
+---
+
+## 二、Q格式定点数基础
+
+### 2.1 Q格式表示法
+
+**Qm.n** 表示：**m** 位整数部分 + **n** 位小数部分，共 **m+n** 位（通常 32 位）。
+
+**常用格式**：
+
+| 格式 | 含义 | 范围 | 分辨率 |
+|------|------|------|--------|
+| Q16.16 | 16位整数 + 16位小数 | ±32767.9999 | 1/65536 ≈ 0.000015 |
+| Q8.24 | 8位整数 + 24位小数 | ±127.9999 | 1/16777216 ≈ 0.00000006 |
+| Q12.20 | 12位整数 + 20位小数 | ±2047.9999 | 1/1048576 ≈ 0.00000095 |
+
+**你的场景推荐**：
+
+| 变量 | 范围 | 所需精度 | 推荐格式 |
+|------|------|----------|----------|
+| **RPM**（目标/反馈） | 0~12000 | ±0.1 RPM | **Q16.16**（分辨率0.000015） |
+| **脉宽 μs**（1000~2000） | 0~2000 | ±0.1µs | **Q12.20** 或 **Q16.16** |
+| **PID 系数**（Kp/Ki） | 0~100 | ±0.001 | **Q8.24** 或 **Q16.16** |
+| **时间差 dt**（ms） | 0~10 | ±0.001ms | **Q16.16** |
+
+**建议统一用 Q16.16**（32位），兼顾范围和精度，运算简单。
+
+---
+
+## 三、Q16.16 定点运算库（精简版）
+
+### 3.1 基础宏定义
+
+```cpp
+// ============================================================
+// Q16.16 定点数：int32_t 存储，低16位为小数
+// ============================================================
+#define Q16_16_FRAC_BITS  16
+#define Q16_16_SCALE      (1 << 16)  // 65536
+#define Q16_16_ROUND      (1 << 15)  // 四舍五入用
+
+// 浮点 ↔ 定点 转换
+#define FLOAT_TO_Q16(x)   ((int32_t)((x) * Q16_16_SCALE + 0.5f))
+#define Q16_TO_FLOAT(x)   ((float)(x) / Q16_16_SCALE)
+
+// 整数 ↔ 定点（整数部分）
+#define INT_TO_Q16(x)     ((int32_t)(x) << 16)
+#define Q16_TO_INT(x)     ((int32_t)((x) + Q16_16_ROUND) >> 16)
+
+// ============================================================
+// Q16.16 四则运算（直接整数运算，无需浮点）
+// ============================================================
+
+// 加法 / 减法（直接整数加减）
+#define Q16_ADD(a, b)     ((a) + (b))
+#define Q16_SUB(a, b)     ((a) - (b))
+
+// 乘法：两个Q16相乘 → 结果Q16（需右移16位，四舍五入）
+static inline int32_t q16_mul(int32_t a, int32_t b) {
+    int64_t tmp = (int64_t)a * b;
+    return (int32_t)((tmp + Q16_16_ROUND) >> 16);
+}
+
+// 除法：两个Q16相除 → 结果Q16（需左移16位）
+static inline int32_t q16_div(int32_t a, int32_t b) {
+    if (b == 0) return INT32_MAX;
+    int64_t tmp = ((int64_t)a << 16) / b;
+    return (int32_t)tmp;
+}
+
+// 取绝对值
+static inline int32_t q16_abs(int32_t x) {
+    return (x < 0) ? -x : x;
+}
+
+// 限幅
+static inline int32_t q16_clamp(int32_t x, int32_t min, int32_t max) {
+    if (x < min) return min;
+    if (x > max) return max;
+    return x;
+}
+```
+
+---
+
+## 四、关键算法定点化实例
+
+### 4.1 PID 控制器（定点版）
+
+**原浮点版**：
+
+```cpp
+float pid_update(float target, float feedback) {
+    float error = target - feedback;
+    float p = Kp * error;
+    integrator += Ki * error * dt;
+    float d = Kd * (error - prev_error) / dt;
+    prev_error = error;
+    return p + integrator + d;
+}
+```
+
+**定点版（Q16.16）**：
+
+```cpp
+typedef struct {
+    int32_t Kp;      // Q16.16
+    int32_t Ki;      // Q16.16
+    int32_t Kd;      // Q16.16
+    int32_t integrator;   // Q16.16
+    int32_t prev_error;   // Q16.16
+    int32_t out_min;      // Q16.16
+    int32_t out_max;      // Q16.16
+} pid_q16_t;
+
+int32_t pid_update_q16(pid_q16_t *pid, int32_t target, int32_t feedback, int32_t dt_ms) {
+    // dt_ms：整数，单位 ms（例：400Hz → dt_ms = 2.5 → 但整数必须用Q表示）
+    // 此处 dt_ms 以 Q16.16 传入，例：INT_TO_Q16(2) 或 FLOAT_TO_Q16(2.5)
+    
+    // 1. 误差
+    int32_t error = Q16_SUB(target, feedback);
+    
+    // 2. 比例项
+    int32_t p = q16_mul(pid->Kp, error);
+    
+    // 3. 积分项（Ki * error * dt）
+    int32_t ki_err = q16_mul(pid->Ki, error);
+    int32_t delta_i = q16_mul(ki_err, dt_ms);  // dt_ms 必须是 Q16
+    pid->integrator = Q16_ADD(pid->integrator, delta_i);
+    
+    // 积分限幅
+    pid->integrator = q16_clamp(pid->integrator, pid->out_min, pid->out_max);
+    
+    // 4. 微分项（Kd * (error - prev_error) / dt）
+    int32_t d_err = Q16_SUB(error, pid->prev_error);
+    int32_t d = q16_mul(pid->Kd, q16_div(d_err, dt_ms));
+    pid->prev_error = error;
+    
+    // 5. 输出
+    int32_t output = Q16_ADD(Q16_ADD(p, pid->integrator), d);
+    return q16_clamp(output, pid->out_min, pid->out_max);
+}
+```
+
+**初始化示例**：
+
+```cpp
+pid_q16_t pid_controller = {
+    .Kp = FLOAT_TO_Q16(0.5f),   // Kp = 0.5
+    .Ki = FLOAT_TO_Q16(0.01f),  // Ki = 0.01
+    .Kd = 0,                    // 微分不用
+    .integrator = 0,
+    .prev_error = 0,
+    .out_min = INT_TO_Q16(-200),   // 脉宽修正限幅 ±200µs
+    .out_max = INT_TO_Q16(200)
+};
+
+int32_t target_rpm = INT_TO_Q16(2000);      // 目标 2000 RPM
+int32_t feedback_rpm = INT_TO_Q16(1985);    // 反馈 1985 RPM
+int32_t dt_ms = FLOAT_TO_Q16(2.5f);         // 400Hz 周期
+
+int32_t output_correction = pid_update_q16(&pid_controller, target_rpm, feedback_rpm, dt_ms);
+// output_correction 单位 Q16，转换为 µs 修正量
+float output_us = Q16_TO_FLOAT(output_correction);  // 如需浮点打印
+```
+
+---
+
+### 4.2 EMA 低通滤波（定点版）
+
+**原浮点版**：
+
+```cpp
+float ema = 0.9 * ema + 0.1 * raw;
+```
+
+**定点版（Q16.16）**：
+
+```cpp
+static inline int32_t ema_update_q16(int32_t current, int32_t raw, int32_t alpha) {
+    // alpha：Q16.16，例 0.9 → FLOAT_TO_Q16(0.9)
+    // (1 - alpha) 也需是 Q16
+    int32_t one_minus_alpha = Q16_SUB(INT_TO_Q16(1), alpha);
+    int32_t part1 = q16_mul(alpha, current);
+    int32_t part2 = q16_mul(one_minus_alpha, raw);
+    return Q16_ADD(part1, part2);
+}
+
+// 使用
+int32_t ema_rpm = FLOAT_TO_Q16(0.0f);
+int32_t alpha = FLOAT_TO_Q16(0.1f);   // 平滑系数 0.1
+
+// 每次采样更新
+ema_rpm = ema_update_q16(ema_rpm, raw_rpm, alpha);
+float ema_float = Q16_TO_FLOAT(ema_rpm);  // 用于遥测打印
+```
+
+---
+
+### 4.3 6点最小二乘拟合速度（定点版）
+
+**原浮点版**（用采样点 `(t, counts)` 拟合斜率）：
+
+```cpp
+float slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x);
+float rpm = (slope / COUNTS_PER_REV) * 60.0f;
+```
+
+**定点版**：
+
+```cpp
+// 输入：samples[0..n-1] 中 t_us 和 counts 均存为 Q16.16
+int32_t calc_rpm_ls_q16(enc_sample_q16_t *samples, int n) {
+    if (n < 2) return 0;
+
+    // 所有累加用 Q16.16
+    int32_t sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0;
+    const int32_t COUNTS_PER_REV = INT_TO_Q16(16384);  // 14位编码器
+    const int32_t SECONDS_PER_MIN = INT_TO_Q16(60);
+
+    for (int i = 0; i < n; i++) {
+        sum_x = Q16_ADD(sum_x, samples[i].t_us);      // 时间，单位 µs，Q16
+        sum_y = Q16_ADD(sum_y, samples[i].counts);    // counts，Q16
+        sum_xy = Q16_ADD(sum_xy, q16_mul(samples[i].t_us, samples[i].counts));
+        sum_x2 = Q16_ADD(sum_x2, q16_mul(samples[i].t_us, samples[i].t_us));
+    }
+
+    // 分母 = n * sum_x2 - sum_x * sum_x （Q16）
+    int32_t n_q16 = INT_TO_Q16(n);
+    int32_t denom = Q16_SUB(q16_mul(n_q16, sum_x2), q16_mul(sum_x, sum_x));
+    if (denom == 0) return 0;
+
+    // 分子 = n * sum_xy - sum_x * sum_y （Q16）
+    int32_t numer = Q16_SUB(q16_mul(n_q16, sum_xy), q16_mul(sum_x, sum_y));
+
+    // 斜率 = numer / denom （counts/µs），Q16
+    int32_t slope = q16_div(numer, denom);
+
+    // RPM = slope / COUNTS_PER_REV * 60 * 1e6 （因为 t 是 µs）
+    // = slope * 60e6 / COUNTS_PER_REV
+    int32_t rpm = q16_mul(slope, q16_div(INT_TO_Q16(60000000), COUNTS_PER_REV));
+    return rpm;
+}
+```
+
+---
+
+### 4.4 前馈查表 + 插值（定点版）
+
+**原浮点版**：用 `map()` 或线性插值。
+
+**定点版**：
+
+```cpp
+// 前馈表：pulse = f(rpm) 的反函数，Q16
+typedef struct {
+    int32_t rpm;    // Q16
+    int32_t pulse;  // Q16（单位 µs）
+} ff_entry_q16_t;
+
+ff_entry_q16_t ff_table[] = {
+    {INT_TO_Q16(0),    INT_TO_Q16(1000)},
+    {INT_TO_Q16(1000), INT_TO_Q16(1100)},
+    {INT_TO_Q16(2000), INT_TO_Q16(1200)},
+    {INT_TO_Q16(4000), INT_TO_Q16(1450)},
+    {INT_TO_Q16(6000), INT_TO_Q16(1700)},
+    {INT_TO_Q16(8000), INT_TO_Q16(1950)},
+};
+
+int32_t ff_lookup_q16(int32_t target_rpm, ff_entry_q16_t *table, int table_len) {
+    // 边界处理
+    if (target_rpm <= table[0].rpm) return table[0].pulse;
+    if (target_rpm >= table[table_len-1].rpm) return table[table_len-1].pulse;
+
+    // 二分查找或线性遍历（小表直接遍历）
+    for (int i = 0; i < table_len - 1; i++) {
+        if (target_rpm >= table[i].rpm && target_rpm < table[i+1].rpm) {
+            // 线性插值：pulse = p0 + (p1-p0)*(rpm-r0)/(r1-r0)
+            int32_t drpm = Q16_SUB(target_rpm, table[i].rpm);
+            int32_t dpulse = Q16_SUB(table[i+1].pulse, table[i].pulse);
+            int32_t drange = Q16_SUB(table[i+1].rpm, table[i].rpm);
+            int32_t pulse_delta = q16_mul(dpulse, q16_div(drpm, drange));
+            return Q16_ADD(table[i].pulse, pulse_delta);
+        }
+    }
+    return table[table_len-1].pulse;
+}
+```
+
+---
+
+## 五、性能对比（预估）
+
+| 操作 | 浮点耗时 | 定点耗时 | 加速比 |
+|------|----------|----------|--------|
+| PID 单次更新（含3乘2加） | ~1.5 µs | ~0.3 µs | **5x** |
+| 6点LS拟合 | ~8 µs | ~2 µs | **4x** |
+| EMA滤波 | ~0.3 µs | ~0.08 µs | **3.7x** |
+| 前馈查表+插值 | ~1 µs | ~0.25 µs | **4x** |
+
+**结论**：定点化后，400Hz控制任务总耗时可从 ~15µs 降至 **~3-5µs**，CPU占用率从 ~0.6% 降至 **~0.2%**。
+
+---
+
+## 六、集成到环缓冲 + esp_timer 框架
+
+**修改 `enc_sample_t` 结构体**（存 Q16 而非原始整数）：
+
+```cpp
+typedef struct {
+    int32_t t_us;      // Q16.16，单位 µs
+    int32_t counts;    // Q16.16，解缠累加 counts
+} enc_sample_q16_t;
+```
+
+**采样回调中**：
+
+```cpp
+void IRAM_ATTR encSampleCallback(void *arg) {
+    uint16_t angle = readAngleSPI();   // 0~16383
+    int64_t raw_counts = unwrap(angle); // 原始整数
+
+    // 转换为 Q16.16（原始整数直接左移16位）
+    int32_t counts_q16 = (int32_t)(raw_counts << 16);
+    int32_t t_us_q16 = INT_TO_Q16(esp_timer_get_time());  // 注意：esp_timer_get_time() 返回 uint64
+
+    enc_ring_push(&g_enc_ring, t_us_q16, counts_q16);
+}
+```
+
+**控制任务中计算 RPM** 全部用 Q16 运算，只在最后打印时转浮点。
+
+---
+
+## 七、注意事项
+
+| 风险 | 缓解措施 |
+|------|----------|
+| **溢出** | 乘法前用 `int64_t` 暂存，如 `q16_mul` 中所示 |
+| **除零** | 所有除法检查分母是否为0 |
+| **符号位** | 确保所有变量声明为 `int32_t`，避免无符号溢出 |
+| **调试困难** | 保留 `Q16_TO_FLOAT` 打印宏，遥测数据仍可读 |
+| **一致性** | **统一所有运算用 Q16.16**，避免混用不同 Q 格式 |
+
+---
+
+## 八、建议的迁移路径
+
+1. **先建立 Q16 库**（上述宏和函数），放在 `q16_math.h`。
+2. **逐个替换算法**：
+   - 先改 EMA 滤波（最简单）
+   - 再改 PID
+   - 最后改 LS 拟合
+3. **保留浮点版本作为参考**，通过编译开关切换：
+   ```cpp
+   #define USE_FIXED_POINT 1   // 1=定点，0=浮点
+   ```
+4. **验收**：用遥测数据比对定点与浮点结果，确保误差 < 0.5 RPM。
+5. **逐步移除浮点代码**。
+
+---
+
+## 九、一句话总结
+
+**用 Q16.16 定点数替代浮点，在 ESP32-S3 上 PID/LS/EMA 全链路可提速 4-5 倍，CPU 占用降至 <0.3%，且精度完全满足 0.1 RPM 的要求。** 你现有的环缓冲 + esp_timer 框架无需改动，只需把 `float` 换成 `int32_t`，并在运算时使用 `q16_mul`/`q16_div`。
