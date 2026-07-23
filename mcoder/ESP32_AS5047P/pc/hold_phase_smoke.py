@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Minimal HOLD PHASE host usage (COM10). Early-brake disc stop: 0 / 90 / 180.
+"""Minimal HOLD PHASE host usage (COM10). Early-brake + optional Hall REFINE: 0 / 90 / 180.
 
 Example:
   python hold_phase_smoke.py --port COM10 --target 0 --rpm 80 --dry-run
   python hold_phase_smoke.py --port COM10 --target 90 --rpm 80
+  python hold_phase_smoke.py --port COM10 --target 0 --rpm 80 --refine on --tol 5
 """
 from __future__ import annotations
 
@@ -50,7 +51,19 @@ def main() -> int:
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--target", type=float, default=0.0, help="disc deg: 0/90/180/…")
     ap.add_argument("--rpm", type=float, default=80.0, help="motor crawl RPM")
-    ap.add_argument("--timeout", type=float, default=40.0)
+    ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument(
+        "--tol",
+        type=float,
+        default=5.0,
+        help="PHASE TOL deg (pass band)",
+    )
+    ap.add_argument(
+        "--refine",
+        choices=("on", "off", "leave"),
+        default="on",
+        help="PHASE REFINE for 0/180 Hall crawl after first settle",
+    )
     ap.add_argument(
         "--dry-run",
         action="store_true",
@@ -79,12 +92,24 @@ def main() -> int:
         read_for(ser, 0.8)
         send(ser, "PHASE LEAD?")
         read_for(ser, 0.6)
+        send(ser, f"PHASE TOL {args.tol:g}")
+        read_for(ser, 0.5, lambda s: "PHASE TOL" in s)
+        if args.refine != "leave":
+            send(ser, f"PHASE REFINE {args.refine.upper()}")
+            read_for(ser, 0.5, lambda s: "PHASE REFINE" in s)
+        send(ser, "PHASE REFINE?")
+        read_for(ser, 0.5)
+        send(ser, "PHASE TOL?")
+        read_for(ser, 0.5)
 
         if args.dry_run:
             print("--- dry-run: not starting HOLD PHASE ---")
             print("Usage when ready:")
+            print(f"  PHASE TOL {args.tol:g}")
+            print(f"  PHASE REFINE {args.refine.upper() if args.refine != 'leave' else 'ON'}")
             print(f"  HOLD PHASE {args.target:g} {args.rpm:g}")
             print("If cal=0: pass GPIO4 once, or: HALL CAL  then HOLD PHASE …")
+            print("0/180: first settle miss → REFINE crawl to Hall; 90°: enc-only")
             return 0
 
         cal_ok = any("cal=1" in s for s in hall_lines)
@@ -125,6 +150,8 @@ def main() -> int:
         )
         if "DONE" in last:
             print("PASS:", last)
+            if "refine=1" in last or "refine_hall" in last:
+                print("  (Hall REFINE path used)")
             return 0
         print("FAIL:", last)
         send(ser, "ESTOP")

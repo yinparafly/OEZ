@@ -36,7 +36,11 @@
  *   TUNE REC ON|OFF | TUNE? | TUNE DUMP     （板载整定环形记录，见 tune_rec.h）
  *   HOLD PHASE <deg> [crawl_rpm] [stop_ms] | PHASE HOLD … | PHASE <0|90|180> …
  *     扑翼盘相位保持：0°=霍尔 GPIO4 下扑；180°=GPIO5 上举；90°=半行程（编码器/减速比反算）
- *     stop_ms>0：从当前转速闭环软降→爬行，再提前制动；壁钟≈stop_ms（如 3000）
+ *     APPROACH=在线速度规划（est_brake=k·rpm²；remain≤est+margin→切油；else CLOSED 跟 desired_rpm）
+ *     stop_ms>0：高速软降仅作斜坡限幅，非主刹停律；主律按剩余盘角规划
+ *     首停若 |err|>tol 或无 hall_confirm：0/180 可低速 REFINE 爬至目标霍尔再停（90° 无霍尔，不 refine）
+ *   PHASE REFINE ON|OFF|? | PHASE TOL <deg>|?   （霍尔二次对准 / 容差）
+ *   PHASE PLAN? | PHASE PLAN TC <s> | PHASE BRAKEK [k]|SAVE|?  （制动距离模型）
  *   RPM / MODE / FREQ / BLE RATE|LITE …
  * 蓝牙：OEZ-RPM；测试默认 ON；FLIGHT ON → 关 BLE + 禁主机超时 ESTOP
  * TEST 运行中同样禁用 HOST_TIMEOUT ESTOP；段内自判在转（enc+hall），主机只发 START/STOP。
@@ -282,14 +286,16 @@ bool stopat_on = false;
 float stopat_deg = 0.0f;
 float stopat_tol_deg = 4.0f;
 float stopat_prev_rel = NAN;
-// 扑翼盘相位保持：单向爬行 + 提前提前制动（不可等霍尔沿再停，惯量会冲过）
+// 扑翼盘相位保持：单向接近 + 切油滑行（不可等霍尔沿再停，惯量会冲过）
 // 0°=GPIO4 下扑；180°=GPIO5 上举；90°=盘上合成（编码器/减速比，无专用霍尔）
+// APPROACH：在线速度规划（est_brake≈k·rpm²；remain≤est+margin→BRAKE；else CLOSED 跟 desired_rpm）
+// BRAKE/SETTLE：禁误差→油门反馈（无主动刹）；REFINE：0/180 末段霍尔爬行救场
 bool holdph_active = false;
 float holdph_target_deg = 0.0f;       // 盘相位目标 [0,360)
-float holdph_tol_deg = 5.0f;          // 到位容差（盘°）
-float holdph_crawl_rpm = 120.0f;      // 电机轴爬行 RPM（盘更慢 ≈ rpm/GEAR）
+float holdph_tol_deg = 5.0f;          // 到位容差 / 切油余量（盘°）；PHASE TOL
+float holdph_crawl_rpm = 120.0f;      // 电机轴爬行/规划 RPM 上限（盘更慢 ≈ rpm/GEAR）
 uint16_t holdph_pulse = ESC_PULSE_MIN_US;
-uint16_t holdph_max_pulse = 1450;     // 接近段油门上限（仅爬行）
+uint16_t holdph_max_pulse = 1450;     // 接近段油门上限（规划/爬行）
 uint32_t holdph_t0_ms = 0;
 uint32_t holdph_timeout_ms = 30000;   // 总超时 → ESTOP 1000µs
 uint32_t holdph_brake_ms = 0;         // 进入制动的时刻
@@ -297,21 +303,36 @@ uint32_t holdph_dn0 = 0;
 uint32_t holdph_up0 = 0;
 float holdph_prev_disc = NAN;
 float holdph_prev_remain = NAN;
-bool holdph_hall_seen = false;        // 制动后霍尔确认（非停机触发）
-// 提前量：effective_lead = lead_deg + ω_disc*lead_ms/1000 + k*|rpm_motor|
+bool holdph_hall_seen = false;        // 本段见过目标侧霍尔（确认/诊断）
+bool holdph_refine_en = true;         // PHASE REFINE ON|OFF；仅 0°/180° 目标启用
+float holdph_refine_rpm = 50.0f;      // REFINE 极低速电机 RPM
+float holdph_refine_travel = 0.0f;    // 本段已爬盘角 °
+float holdph_refine_max_disc = 370.0f; // 超过约 1 盘转 → ESTOP
+bool holdph_refine_used = false;      // 本 HOLD 已进入过 REFINE
+bool holdph_refine_hit = false;       // REFINE 段内已碰到目标霍尔
+// 旧 lead：作 max(est_brake+margin, lead_eff) 安全二次触发（主律=距离规划）
 float holdph_lead_deg = 10.0f;        // 基础提前盘角 °（NVS hplead）
 float holdph_lead_ms = 100.0f;        // 按当前盘角速度折算的提前时间 ms（NVS hpleadt）
 float holdph_lead_rpm_k = 0.03f;      // 额外盘° / 电机RPM（NVS hpleadk）
 float holdph_stop_rpm = 40.0f;        // 判停电机 RPM 阈值
-// 定时软降：HOLD PHASE <deg> [crawl] [stop_ms]；stop_ms=0 → 旧爬行
-uint32_t holdph_profile_ms = 0;       // 期望壁钟停机时间（软降+爬行接近）
+// 制动距离模型 Scheme B：est_brake_disc_deg ≈ k · rpm_motor²（NVS hpbk）
+float holdph_brake_k = 0.0008f;       // 默认≈100RPM→8°；成功 settle 后 EMA 更新
+float holdph_plan_tc_s = 1.5f;        // 规划时间常数 s：desired≈(remain/tc)·gear/6（NVS hptc）
+float holdph_desired_rpm = 0.0f;      // 本拍规划目标电机 RPM（诊断）
+float holdph_est_brake_deg = 0.0f;    // 本拍预估滑行盘角（诊断）
+float holdph_brake_rpm = NAN;         // 切入 BRAKE 时 |RPM|（学习用）
+float holdph_brake_disc = NAN;        // 切入 BRAKE 时盘角（学习用）
+uint16_t holdph_brake_learn_n = 0;    // 已学习次数（诊断）
+// 定时软降：HOLD PHASE <deg> [crawl] [stop_ms]；仅作高速→规划区斜坡限幅
+uint32_t holdph_profile_ms = 0;       // 期望壁钟软降轮廓（非主刹停律）
 uint32_t holdph_soft_ms = 0;          // 软降段时长（profile 的前段）
 float holdph_rpm_start = 0.0f;        // 进入时电机 |RPM|
-bool holdph_soft_done = false;        // 软降结束 → 允许 lead 提前制动
+bool holdph_soft_done = false;        // 软降结束 → 允许距离规划切油
 enum HoldPhState : uint8_t {
-  HOLDPH_ST_APPROACH = 0,  // 单向软接近（含可选软降）
-  HOLDPH_ST_BRAKE = 1,     // 已切 1000µs，惯量滑行
-  HOLDPH_ST_SETTLE = 2     // 低速确认到位
+  HOLDPH_ST_APPROACH = 0,  // 在线速度规划（含可选软降限幅）
+  HOLDPH_ST_BRAKE = 1,     // 已切 1000µs，惯量滑行（无误差→油门）
+  HOLDPH_ST_SETTLE = 2,    // 低速确认到位
+  HOLDPH_ST_REFINE = 3     // 极低速爬至目标霍尔沿（绝对 latch）
 };
 uint8_t holdph_state = HOLDPH_ST_APPROACH;
 // 自动辨识转向（用固定脉宽，避免 RPM→脉宽在未学习时过低转不动）
@@ -460,7 +481,8 @@ static uint32_t hall_up_poll_edge = 0;
 static bool hall_gpio_isr_ok = false;
 float motor_unwrapped_deg = 0.0f;  // 累计电机角（°），用于盘相位
 // —— 盘相位：霍尔绝对复位 + 磁编连续推算 ——
-// 过 GPIO4/5（或 HALL CAL）时 latch；之后仅靠编码器积分，霍尔再过时纠正。
+// 质数/互质齿(12,14,59,79)：磁编绝对零与霍尔零的相对关系每圈漂移 → 禁止一次性首锁永用。
+// 每次 GPIO4/5 有效沿必须重锁 disc_ref∈{0,180} + disc_ref_motor_counts；之后仅用末次 latch 积分。
 bool flap_calibrated = false;
 float disc_ref_deg = 0.0f;              // 上次霍尔绝对盘角：0°(GPIO4) 或 180°(GPIO5)
 float disc_ref_motor_unwrap = 0.0f;     // latch 时电机展开角 °
@@ -498,7 +520,7 @@ static const int64_t ENC_CPR_I = 16384;
 // round(4661/168 * 1e6) = round(27744047.619…) = 27744048
 static const int64_t GEAR_DESIGN_MICRO =
     (GEAR_RATIO_NUM * 1000000LL + GEAR_RATIO_DEN / 2) / GEAR_RATIO_DEN;
-int64_t motor_unwrapped_counts = 0;   // 整型累计编码器计数（raw 差分 ±8192 环绕已处理）
+int64_t motor_unwrapped_counts = 0;   // STACKED multi-turn counts (=enc_cb_counts); Δdisc uses this, never raw
 int last_raw_i = -1;                   // 上拍 raw（<0=未初始化）
 int64_t last_hd_motor_unwrap_counts = 0;
 int64_t last_hu_motor_unwrap_counts = 0;
@@ -979,9 +1001,11 @@ float phaseRelFromAbs(float abs_deg) {
 }
 
 float discEstFromMotor() {
-  // 传感模型：霍尔 latch 绝对盘角 + 磁编连续推算
-  //   disc = wrap( disc_ref + esc_sense * (motor_now − motor_at_hall) / gear + offset )
-  // gear = 4661/168；esc_sense 使盘角随驱动方向递增；offset 修 0↔180 标反
+  // Disc phase = last Hall absolute mark + stacked motor delta (NOT single-turn raw).
+  // 盘相位：末次霍尔绝对角 + 堆叠电机计数差（禁止 raw_now-raw_hall，磁编过零会炸）
+  //   disc = wrap( disc_ref + esc_sense * Δcounts/CPR/gear*360 + offset )
+  //   Δcounts = motor_unwrapped_counts - disc_ref_motor_counts  // stacked / multi-turn
+  // gear=4661/168；互质齿→每霍尔沿必须 discLatchHall 刷新参考
   if (!flap_calibrated || GEAR_RATIO < 1.0f) return NAN;
   float d_motor =
       (float)(motor_unwrapped_counts - disc_ref_motor_counts) * ENC_DEG_PER_COUNT;
@@ -996,14 +1020,15 @@ static float discRemainFwd(float disc, float target) {
 }
 
 /**
- * 霍尔（或 HALL CAL）绝对复位：记下 disc_ref 与当时电机计数。
- * 之后盘相位只靠磁编；再过霍尔时再次调用纠正漂移。
+ * Hall absolute re-latch (call on EVERY valid Hall edge — coprime gears).
+ * 霍尔绝对重锁：存 disc_ref∈{0,180} + 当时堆叠坐标 disc_ref_motor_counts(=motor_unwrapped_counts)。
+ * 互质齿禁止首锁永用；Δmotor 必须用堆叠 counts，禁止单圈 raw 相减。
  */
 static void discLatchHall(float abs_disc_deg) {
   abs_disc_deg = wrap360(abs_disc_deg);
   disc_ref_deg = abs_disc_deg;
   disc_ref_motor_unwrap = motor_unwrapped_deg;
-  disc_ref_motor_counts = motor_unwrapped_counts;
+  disc_ref_motor_counts = motor_unwrapped_counts;  // stacked position at Hall
   // 等价「盘 0° 时的电机展开角」：便于旧日志对照
   // zero_motor = motor_now − esc_sense * disc_ref * gear
   flap_zero_motor_unwrap =
@@ -1194,7 +1219,7 @@ void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
     last_hd_motor_unwrap = motor_unwrapped_deg;
     last_hd_motor_unwrap_counts = motor_unwrapped_counts;
     has_hd_counts = true;
-    // GPIO4 = 物理 0°：绝对复位；此后磁编推算盘相位
+    // GPIO4 = 物理 0°：每沿重锁 disc_ref=0 + motor_counts（互质齿不可沿用旧锁）
     discLatchHall(0.0f);
     last_hd_disc = 0.0f;
     {
@@ -1232,7 +1257,7 @@ void hallPoll(uint32_t now, float motor_rel, float motor_abs, uint16_t raw) {
     last_hu_motor_unwrap = motor_unwrapped_deg;
     last_hu_motor_unwrap_counts = motor_unwrapped_counts;
     has_hu_counts = true;
-    // GPIO5 = 物理 180°：绝对复位（纠正仅靠 GPIO4 零点时的 ~180° 错位/漂移）
+    // GPIO5 = 物理 180°：每沿重锁 disc_ref=180 + motor_counts（互质齿不可沿用旧锁）
     float disc_before = discEstFromMotor();
     discLatchHall(180.0f);
     last_hu_disc = 180.0f;
@@ -1523,6 +1548,8 @@ void loadMapsFromNvs() {
   holdph_lead_deg = prefs.getFloat("hplead", 10.0f);
   holdph_lead_ms = prefs.getFloat("hpleadt", 100.0f);
   holdph_lead_rpm_k = prefs.getFloat("hpleadk", 0.03f);
+  holdph_brake_k = prefs.getFloat("hpbk", 0.0008f);
+  holdph_plan_tc_s = prefs.getFloat("hptc", 1.5f);
   disc_phase_offset_deg = prefs.getFloat("hphoff", 0.0f);
   disc_phase_offset_deg = wrap360(disc_phase_offset_deg);
   if (holdph_lead_deg < 1.0f) holdph_lead_deg = 1.0f;
@@ -1531,6 +1558,10 @@ void loadMapsFromNvs() {
   if (holdph_lead_ms > 500.0f) holdph_lead_ms = 500.0f;
   if (holdph_lead_rpm_k < 0.0f) holdph_lead_rpm_k = 0.0f;
   if (holdph_lead_rpm_k > 0.2f) holdph_lead_rpm_k = 0.2f;
+  if (holdph_brake_k < 1.0e-7f) holdph_brake_k = 1.0e-7f;
+  if (holdph_brake_k > 0.01f) holdph_brake_k = 0.01f;
+  if (holdph_plan_tc_s < 0.3f) holdph_plan_tc_s = 0.3f;
+  if (holdph_plan_tc_s > 5.0f) holdph_plan_tc_s = 5.0f;
 }
 
 // ---------------- 分区 PID（GainMap） ----------------
@@ -1616,6 +1647,13 @@ void saveHoldPhaseLeadToNvs() {
   prefs.putFloat("hpleadt", holdph_lead_ms);
   prefs.putFloat("hpleadk", holdph_lead_rpm_k);
   prefs.putFloat("hphoff", disc_phase_offset_deg);
+  prefs.putFloat("hpbk", holdph_brake_k);
+  prefs.putFloat("hptc", holdph_plan_tc_s);
+}
+
+void saveHoldPhaseBrakeKToNvs() {
+  prefs.putFloat("hpbk", holdph_brake_k);
+  prefs.putFloat("hptc", holdph_plan_tc_s);
 }
 
 void saveEscSenseToNvs() {
@@ -2690,14 +2728,84 @@ void phaseMoveFinish(const char* why) {
                 why, (double)move_accum_deg, (double)move_target_deg);
 }
 
+/** Scheme B：切油后预估滑行盘角 ≈ k · rpm²（夹在 2…80°） */
+static float getEstimatedBrakeAngle(float rpm) {
+  float r = fabsf(rpm);
+  if (r < 1.0f) r = 1.0f;
+  float a = holdph_brake_k * r * r;
+  if (a < 2.0f) a = 2.0f;
+  if (a > 80.0f) a = 80.0f;
+  return a;
+}
+
+/** 成功 BRAKE→SETTLE 后，用 (rpm_at_brake, 滑行盘角) EMA 更新 k */
+static void holdPhaseLearnBrakeK(float disc_at_finish) {
+  if (isnan(holdph_brake_rpm) || isnan(holdph_brake_disc) || isnan(disc_at_finish))
+    return;
+  float rpm_b = fabsf(holdph_brake_rpm);
+  if (rpm_b < 30.0f) return;
+  // Forward coast along travel sense (esc_sense=-1 → disc decreases)
+  float coast = (esc_sense >= 0)
+                    ? wrap360(disc_at_finish - holdph_brake_disc)
+                    : wrap360(holdph_brake_disc - disc_at_finish);
+  // Tiny coast = cut already at target (no sample); >120 often frame/refine junk
+  if (coast < 0.5f || coast > 120.0f) return;
+  float k_samp = coast / (rpm_b * rpm_b);
+  if (k_samp < 1.0e-7f || k_samp > 0.01f) return;
+  const float alpha = 0.30f;
+  holdph_brake_k = (1.0f - alpha) * holdph_brake_k + alpha * k_samp;
+  if (holdph_brake_k < 1.0e-7f) holdph_brake_k = 1.0e-7f;
+  if (holdph_brake_k > 0.01f) holdph_brake_k = 0.01f;
+  if (holdph_brake_learn_n < 60000) holdph_brake_learn_n++;
+  hostPrintf(
+      "# HOLD PHASE BRAKEK learn coast=%.2f rpm_b=%.0f k_samp=%.6g k=%.6g n=%u\n",
+      (double)coast, (double)rpm_b, (double)k_samp, (double)holdph_brake_k,
+      (unsigned)holdph_brake_learn_n);
+}
+
+/** §3 红旗日志：crawl/remain >90/120/200 — 监督用，不改执行器 */
+static void holdPhaseLogRedFlag(const char* where, float remain_or_err,
+                                float motor_rpm_abs, float disc) {
+  const char* lvl = "ok";
+  float a = fabsf(remain_or_err);
+  if (a > 200.0f)
+    lvl = ">200";
+  else if (a > 120.0f)
+    lvl = ">120";
+  else if (a > 90.0f)
+    lvl = ">90";
+  else
+    return;
+  const char* branch = "C";  // default supervisory
+  if (motor_rpm_abs < 40.0f && a > 90.0f)
+    branch = "B";  // stall-risk soft/entry
+  else if (a >= 150.0f)
+    branch = "A";  // frame suspect until proven otherwise
+  hostPrintf(
+      "# HOLD PHASE REDFLAG lvl=%s branch=%s where=%s remain=%.1f rpm=%.0f "
+      "disc=%.2f ref=%.1f offset=%.1f counts=%ld (G-noSilent200)\n",
+      lvl, branch, where, (double)remain_or_err, (double)motor_rpm_abs,
+      (double)disc, (double)disc_ref_deg, (double)disc_phase_offset_deg,
+      (long)motor_unwrapped_counts);
+}
+
 void holdPhaseFinish(const char* why) {
   float disc = discEstFromMotor();
+  float err = isnan(disc) ? -1.0f
+                          : fabsf(wrap180(disc - holdph_target_deg));
   uint32_t elapsed = millis() - holdph_t0_ms;
   uint32_t brake_age =
       (holdph_brake_ms > 0) ? (millis() - holdph_brake_ms) : 0;
   uint32_t prof = holdph_profile_ms;
   uint32_t soft = holdph_soft_ms;
   float rpm0 = holdph_rpm_start;
+  bool hall_ok = holdph_hall_seen;
+  bool refine_used = holdph_refine_used;
+  float k_now = holdph_brake_k;
+  if (!isnan(disc) && holdph_brake_ms > 0) {
+    holdPhaseLearnBrakeK(disc);
+    k_now = holdph_brake_k;
+  }
   holdph_active = false;
   sense_learn = false;
   move_active = false;
@@ -2709,21 +2817,46 @@ void holdPhaseFinish(const char* why) {
   holdph_profile_ms = 0;
   holdph_soft_ms = 0;
   holdph_soft_done = false;
+  holdph_refine_travel = 0.0f;
+  holdph_refine_hit = false;
+  holdph_brake_rpm = NAN;
+  holdph_brake_disc = NAN;
+  holdph_desired_rpm = 0.0f;
+  holdph_est_brake_deg = 0.0f;
   clearPid();
   run_state = RUN_IDLE;
   applyEscPulse(ESC_PULSE_MIN_US);
   hostPrintf(
-      "# ACK HOLD PHASE DONE reason=%s target=%.1f disc=%.2f lead=%.1f "
-      "hall_confirm=%d pulse=%u elapsed_ms=%lu brake_to_stop_ms=%lu "
-      "profile_ms=%lu soft_ms=%lu rpm0=%.0f\n",
+      "# ACK HOLD PHASE DONE reason=%s target=%.1f disc=%.2f err=%.2f lead=%.1f "
+      "brake_k=%.6g hall_confirm=%d refine=%d pulse=%u elapsed_ms=%lu "
+      "brake_to_stop_ms=%lu profile_ms=%lu soft_ms=%lu rpm0=%.0f\n",
       why, (double)holdph_target_deg,
-      (double)(isnan(disc) ? -1.0f : disc), (double)holdph_lead_deg,
-      holdph_hall_seen ? 1 : 0, (unsigned)esc_pulse_us,
+      (double)(isnan(disc) ? -1.0f : disc), (double)err, (double)holdph_lead_deg,
+      (double)k_now, hall_ok ? 1 : 0, refine_used ? 1 : 0, (unsigned)esc_pulse_us,
       (unsigned long)elapsed, (unsigned long)brake_age,
       (unsigned long)prof, (unsigned long)soft, (double)rpm0);
 }
 
-/** 有效提前量（盘°）：基础角 + ω·T + k·RPM；单向接近时在「目标前」这么多度切油 */
+/** 目标是否为带专用霍尔的 0° / 180°（90° 等仅编码器，不做 REFINE→Hall） */
+static bool holdPhaseIsHallTarget(bool* want0, bool* want180) {
+  const bool w0 = fabsf(wrap180(holdph_target_deg)) <= 1.0f;
+  const bool w180 = fabsf(wrap180(holdph_target_deg - 180.0f)) <= 1.0f;
+  if (want0) *want0 = w0;
+  if (want180) *want180 = w180;
+  return w0 || w180;
+}
+
+static const char* holdphStateName(uint8_t st) {
+  switch (st) {
+    case HOLDPH_ST_APPROACH: return "APPROACH";
+    case HOLDPH_ST_BRAKE: return "BRAKE";
+    case HOLDPH_ST_SETTLE: return "SETTLE";
+    case HOLDPH_ST_REFINE: return "REFINE";
+    default: return "?";
+  }
+}
+
+/** 有效提前量（盘°）：旧 lead 公式；仅作 max(est_brake+margin, lead) 安全二次触发 */
 static float holdPhaseEffectiveLead(float disc_rate_deg_s, float motor_rpm_abs) {
   float lead = holdph_lead_deg;
   if (disc_rate_deg_s > 0.0f && holdph_lead_ms > 0.0f) {
@@ -2735,23 +2868,144 @@ static float holdPhaseEffectiveLead(float disc_rate_deg_s, float motor_rpm_abs) 
   return lead;
 }
 
-/** 接近段：剩余盘角越大油门越高；近提前区再降速；脉宽夹 holdph_max_pulse */
-static void holdPhaseApplyCrawl(float remain_disc_deg) {
-  float rpm = holdph_crawl_rpm;
-  if (remain_disc_deg < 50.0f) rpm = fminf(rpm, 100.0f);
-  if (remain_disc_deg < 25.0f) rpm = fminf(rpm, 70.0f);
-  if (remain_disc_deg < 15.0f) rpm = fminf(rpm, 55.0f);
+/** 后备开环爬行（无盘角时）；正常 APPROACH 用 holdPhaseApplyPlan */
+/** R-crawl120: remain/>|err| 分段爬行转速。>120° 抬高并持续，~90° 以下细爬 Hall 捕获。 */
+static float holdPhaseCrawlRpmForRemain(float remain_disc_deg) {
+  float rem = remain_disc_deg;
+  if (rem < 0.0f) rem = 0.0f;
+  float base = holdph_crawl_rpm;
+  if (base < 80.0f) base = 80.0f;
+  float rpm;
+  if (rem > 120.0f) {
+    // 长弧：勿全程 ~50RPM；抬高到持续爬行带
+    rpm = fmaxf(base * 1.6f, 220.0f);
+    if (rpm > 350.0f) rpm = 350.0f;
+  } else if (rem > 90.0f) {
+    rpm = fmaxf(base, 150.0f);
+    if (rpm > 220.0f) rpm = 220.0f;
+  } else if (rem > 50.0f) {
+    rpm = fminf(base, 120.0f);
+  } else if (rem > 25.0f) {
+    rpm = fminf(base, 90.0f);
+  } else if (rem > 15.0f) {
+    rpm = fminf(fmaxf(holdph_refine_rpm, 55.0f), 70.0f);
+  } else {
+    rpm = fmaxf(fminf(holdph_refine_rpm, 55.0f), 40.0f);
+  }
   if (rpm < 40.0f) rpm = 40.0f;
+  return rpm;
+}
+
+/** 备用/踢启爬行；R-crawl120：>90° 用 CLOSED 持续油门，近目标 OPEN 细爬 */
+static void holdPhaseApplyCrawl(float remain_disc_deg) {
+  float rpm = holdPhaseCrawlRpmForRemain(remain_disc_deg);
+  holdph_desired_rpm = rpm;
   target_cmd = rpm;
   target_ramped = rpm;
   soft_cmd_accel_rpm_s = 0.0f;
-  uint16_t p = computePulseCrawl(rpm);
+  float dt = 1.0f / (float)CTRL_HZ;
+  float meas = fabsf(rpm_signed_stable);
+  // 实测远高于目标时禁止 CRAWL_PULSE_MIN 托底（本机 1250µs≈3500RPM，软降永远下不来）
+  const bool too_fast = (meas > rpm + 250.0f);
+  if (remain_disc_deg > 90.0f || too_fast) {
+    ctrl_mode = MODE_CLOSED;
+    soft_cmd_accel_rpm_s = too_fast ? -900.0f : 0.0f;
+    uint16_t p = computePulseClosed(rpm, meas, dt);
+    if (p > holdph_max_pulse) p = holdph_max_pulse;
+    if (too_fast) {
+      // 松油滑降到爬行带；单向 ESC 唯一合法减速
+      if (p > ESC_PULSE_MIN_US) p = ESC_PULSE_MIN_US;
+    } else if (p < CRAWL_PULSE_MIN) {
+      p = CRAWL_PULSE_MIN;
+    }
+    holdph_pulse = p;
+  } else {
+    ctrl_mode = MODE_OPEN;
+    uint16_t p = computePulseCrawl(rpm);
+    if (p > holdph_max_pulse) p = holdph_max_pulse;
+    if (p < CRAWL_PULSE_MIN) p = CRAWL_PULSE_MIN;
+    holdph_pulse = p;
+  }
+}
+
+/**
+ * APPROACH 在线速度规划（主律）：
+ * desired_rpm = (remain / tc) * (GEAR/6)  （盘°/s → 电机 RPM；夹 [40, crawl_max]）
+ * 闭环跟踪；切油由 tick 侧 est_brake+margin / lead 安全触发，不在此函数内。
+ */
+static void holdPhaseApplyPlan(float remain_disc_deg, float motor_rpm_abs) {
+  float tc = holdph_plan_tc_s;
+  if (tc < 0.3f) tc = 0.3f;
+  if (tc > 5.0f) tc = 5.0f;
+  float remain = remain_disc_deg;
+  if (remain < 0.0f) remain = 0.0f;
+  // disc_deg/s = remain/tc；motor_rpm = disc_rpm * gear = (deg/s)/6 * gear
+  float desired = (remain / tc) * (GEAR_RATIO / 6.0f);
+  if (desired < 40.0f) desired = 40.0f;
+  // R-crawl120: long remaining arc → higher crawl cap (else stuck at tiny crawl)
+  float crawl_cap = holdph_crawl_rpm;
+  if (remain > 120.0f) {
+    crawl_cap = fmaxf(holdph_crawl_rpm * 1.6f, 220.0f);
+    if (crawl_cap > 350.0f) crawl_cap = 350.0f;
+  } else if (remain > 90.0f) {
+    crawl_cap = fmaxf(holdph_crawl_rpm, 150.0f);
+  }
+  if (desired > crawl_cap) desired = crawl_cap;
+  holdph_desired_rpm = desired;
+  float dt = 1.0f / (float)CTRL_HZ;
+  soft_cmd_accel_rpm_s = 0.0f;
+  target_cmd = desired;
+  target_ramped = desired;  // 跳过 soft_ramp，规划本身已随 remain 减速
+  ctrl_mode = MODE_CLOSED;
+  uint16_t p = computePulseClosed(desired, motor_rpm_abs, dt);
   if (p > holdph_max_pulse) p = holdph_max_pulse;
-  if (p < CRAWL_PULSE_MIN) p = CRAWL_PULSE_MIN;
+  // 入口仍高速时松油，勿被 map 托在高脉冲
+  if (motor_rpm_abs > desired + 400.0f) {
+    soft_cmd_accel_rpm_s = -900.0f;
+    p = ESC_PULSE_MIN_US;
+  }
   holdph_pulse = p;
 }
 
-/** 软降段：闭环线性 RPM 指令 start→crawl；不夹 max_pulse */
+/** REFINE：极低速开环爬行，等目标霍尔沿（不做距离规划制动） */
+static void holdPhaseApplyRefineCrawl() {
+  float disc = discEstFromMotor();
+  float remain = 180.0f;
+  if (!isnan(disc)) {
+    remain = discRemainFwd(disc, holdph_target_deg);
+    float err_abs = fabsf(wrap180(disc - holdph_target_deg));
+    if (err_abs > remain) remain = err_abs;  // 用较大者判长弧
+  }
+  float rpm = holdPhaseCrawlRpmForRemain(remain);
+  // refine 近窗仍允许细爬；远弧已由 R-crawl120 抬高
+  if (remain <= 90.0f && rpm > 80.0f) rpm = fmaxf(holdph_refine_rpm, 55.0f);
+  holdph_desired_rpm = rpm;
+  target_cmd = rpm;
+  target_ramped = rpm;
+  soft_cmd_accel_rpm_s = 0.0f;
+  float dt = 1.0f / (float)CTRL_HZ;
+  float meas = fabsf(rpm_signed_stable);
+  const bool too_fast = (meas > rpm + 250.0f);
+  if (remain > 90.0f || too_fast) {
+    ctrl_mode = MODE_CLOSED;
+    soft_cmd_accel_rpm_s = too_fast ? -900.0f : 0.0f;
+    uint16_t p = computePulseClosed(rpm, meas, dt);
+    if (p > holdph_max_pulse) p = holdph_max_pulse;
+    if (too_fast)
+      p = ESC_PULSE_MIN_US;
+    else if (p < CRAWL_PULSE_MIN)
+      p = CRAWL_PULSE_MIN;
+    holdph_pulse = p;
+  } else {
+    ctrl_mode = MODE_OPEN;
+    uint16_t p = computePulseCrawl(rpm);
+    if (p > 1320) p = 1320;
+    if (p < CRAWL_PULSE_MIN) p = CRAWL_PULSE_MIN;
+    holdph_pulse = p;
+  }
+}
+
+/** 软降段：闭环线性 RPM 指令 start→crawl；高速入口斜坡限幅（非主刹停律） */
 static void holdPhaseApplySoftDown(uint32_t elapsed_ms, float motor_rpm_abs) {
   float u = 1.0f;
   if (holdph_soft_ms > 0) {
@@ -2769,24 +3023,75 @@ static void holdPhaseApplySoftDown(uint32_t elapsed_ms, float motor_rpm_abs) {
            (float)holdph_soft_ms;  // 负=减速
   }
   soft_cmd_accel_rpm_s = rate;
+  holdph_desired_rpm = rpm_cmd;
   target_cmd = rpm_cmd;
   target_ramped = rpm_cmd;
-  ctrl_mode = MODE_CLOSED;
-  holdph_pulse = computePulseClosed(rpm_cmd, motor_rpm_abs, dt);
+  // Closed soft-down often undershoots to ~0 RPM; last third / near crawl →
+  // 若仍高速：必须松油（1000µs），禁止 OPEN crawl 托底（1250µs≈3500RPM 死锁）
+  if (u >= 0.55f || rpm_cmd <= holdph_crawl_rpm + 80.0f ||
+      motor_rpm_abs < fmaxf(holdph_crawl_rpm * 1.5f, rpm_cmd * 0.35f)) {
+    if (motor_rpm_abs > holdph_crawl_rpm + 200.0f) {
+      ctrl_mode = MODE_OPEN;
+      soft_cmd_accel_rpm_s = -900.0f;
+      holdph_desired_rpm = holdph_crawl_rpm;
+      target_cmd = holdph_crawl_rpm;
+      target_ramped = holdph_crawl_rpm;
+      holdph_pulse = ESC_PULSE_MIN_US;
+    } else {
+      ctrl_mode = MODE_OPEN;
+      uint16_t p = computePulseCrawl(holdph_crawl_rpm);
+      if (p > holdph_max_pulse) p = holdph_max_pulse;
+      if (p < CRAWL_PULSE_MIN) p = CRAWL_PULSE_MIN;
+      holdph_pulse = p;
+    }
+  } else {
+    ctrl_mode = MODE_CLOSED;
+    holdph_pulse = computePulseClosed(rpm_cmd, motor_rpm_abs, dt);
+  }
 }
 
 static void holdPhaseEnterBrake(const char* why) {
   holdph_state = HOLDPH_ST_BRAKE;
   holdph_brake_ms = millis();
+  holdph_brake_rpm = fabsf(rpm_signed_stable);
+  float disc_now = discEstFromMotor();
+  holdph_brake_disc = isnan(disc_now) ? holdph_prev_disc : disc_now;
   target_cmd = 0.0f;
   target_ramped = 0.0f;
   soft_cmd_accel_rpm_s = 0.0f;
+  holdph_desired_rpm = 0.0f;
   holdph_pulse = ESC_PULSE_MIN_US;
   applyEscPulse(ESC_PULSE_MIN_US);
   hostPrintf(
-      "# HOLD PHASE BRAKE reason=%s remain_was=%.2f elapsed_ms=%lu rpm=%.0f\n",
+      "# HOLD PHASE BRAKE reason=%s remain_was=%.2f est_brake=%.2f "
+      "elapsed_ms=%lu rpm=%.0f\n",
       why, (double)(isnan(holdph_prev_remain) ? -1.0f : holdph_prev_remain),
-      (unsigned long)(millis() - holdph_t0_ms), (double)fabsf(rpm_signed_stable));
+      (double)holdph_est_brake_deg,
+      (unsigned long)(millis() - holdph_t0_ms), (double)holdph_brake_rpm);
+}
+
+/** 首停 miss / 无霍尔确认 → 极低速单向爬至目标霍尔 */
+static void holdPhaseEnterRefine(float disc, float err) {
+  holdph_state = HOLDPH_ST_REFINE;
+  holdph_refine_used = true;
+  holdph_refine_hit = false;
+  holdph_refine_travel = 0.0f;
+  holdph_prev_disc = disc;
+  holdph_hall_seen = false;
+  holdph_dn0 = hall_dn_irq_cnt;
+  holdph_up0 = hall_up_irq_cnt;
+  uint32_t need = (millis() - holdph_t0_ms) + 25000u;
+  if (holdph_timeout_ms < need) holdph_timeout_ms = need;
+  holdPhaseApplyRefineCrawl();
+  applyEscPulse(holdph_pulse);
+  hostPrintf(
+      "# HOLD PHASE REFINE start disc=%.2f err=%.1f tol=%.1f refine_rpm=%.0f "
+      "cmd_rpm=%.0f remain=%.1f max_disc=%.0f (R-crawl120; crawl until Hall)\n",
+      (double)disc, (double)err, (double)holdph_tol_deg,
+      (double)holdph_refine_rpm, (double)holdph_desired_rpm, (double)fabsf(err),
+      (double)holdph_refine_max_disc);
+  if (fabsf(err) > 90.0f)
+    holdPhaseLogRedFlag("refine_enter", err, fabsf(rpm_signed_stable), disc);
 }
 
 /** stop_ms=0：旧行为立即爬行；stop_ms>0：先闭环软降再爬行+提前制动 */
@@ -2827,24 +3132,42 @@ bool holdPhaseBegin(float target_disc_deg, float rpm, uint32_t stop_ms) {
   holdph_prev_disc = NAN;
   holdph_prev_remain = NAN;
   holdph_hall_seen = false;
+  holdph_refine_used = false;
+  holdph_refine_hit = false;
+  holdph_refine_travel = 0.0f;
+  holdph_brake_rpm = NAN;
+  holdph_brake_disc = NAN;
+  holdph_desired_rpm = 0.0f;
+  holdph_est_brake_deg = 0.0f;
   holdph_state = HOLDPH_ST_APPROACH;
   holdph_dn0 = hall_dn_irq_cnt;
   holdph_up0 = hall_up_irq_cnt;
   holdph_rpm_start = fabsf(rpm_signed_stable);
   if (holdph_rpm_start < rpm) holdph_rpm_start = rpm;
 
-  // 定时软降：默认先试 ~2s；软降占 profile 前 ~75%，余量给爬行+提前制动
+  // 软降仅作高速→规划区斜坡限幅；主刹停律=距离规划（soft 结束后）
   if (stop_ms > 0) {
     if (stop_ms < 800) stop_ms = 800;
     if (stop_ms > 15000) stop_ms = 15000;
     holdph_profile_ms = stop_ms;
-    holdph_soft_ms = (stop_ms * 3u) / 4u;  // 75%
+    holdph_soft_ms = (stop_ms * 1u) / 2u;  // 50% shorter base than 75%
+    if (holdph_soft_ms < 400) holdph_soft_ms = 400;
+    {
+      // Cap soft-down magnitude ~900 RPM/s (gentler) by extending soft_ms
+      float drop = holdph_rpm_start - holdph_crawl_rpm;
+      if (drop > 80.0f) {
+        uint32_t need = (uint32_t)(drop * 1000.0f / 900.0f);
+        if (need < 400u) need = 400u;
+        if (need > holdph_soft_ms) holdph_soft_ms = need;
+      }
+      if (holdph_soft_ms > 8000u) holdph_soft_ms = 8000u;
+    }
     if (holdph_soft_ms < 500) holdph_soft_ms = 500;
     holdph_soft_done = false;
   } else {
     holdph_profile_ms = 0;
     holdph_soft_ms = 0;
-    holdph_soft_done = true;  // 无软降，直接允许 lead 制动
+    holdph_soft_done = true;  // 无软降，直接距离规划切油
   }
 
   float disc = discEstFromMotor();
@@ -2862,8 +3185,10 @@ bool holdPhaseBegin(float target_disc_deg, float rpm, uint32_t stop_ms) {
 
   // 超时：有 profile 时 = profile + 余量；否则按爬行估一盘
   if (holdph_profile_ms > 0) {
-    holdph_timeout_ms = holdph_profile_ms + 10000;
-    if (holdph_timeout_ms < 12000) holdph_timeout_ms = 12000;
+    // soft + approach/refine budget (was profile+10s; soft stall needed more time)
+    holdph_timeout_ms = holdph_soft_ms + 25000u;
+    if (holdph_timeout_ms < 30000u) holdph_timeout_ms = 30000u;
+    if (holdph_timeout_ms > 60000u) holdph_timeout_ms = 60000u;
   } else {
     float motor_rpm = fmaxf(rpm, 40.0f);
     float disc_rpm = motor_rpm / fmaxf(GEAR_RATIO, 1.0f);
@@ -2889,8 +3214,9 @@ bool holdPhaseBegin(float target_disc_deg, float rpm, uint32_t stop_ms) {
   } else {
     holdph_soft_done = true;
     holdph_soft_ms = 0;
-    ctrl_mode = MODE_OPEN;
-    holdPhaseApplyCrawl(180.0f);
+    float rem0 = 180.0f;
+    if (!isnan(disc)) rem0 = discRemainFwd(disc, target_disc_deg);
+    holdPhaseApplyPlan(rem0, holdph_rpm_start);
   }
   applyEscPulse(holdph_pulse);
 
@@ -2900,14 +3226,17 @@ bool holdPhaseBegin(float target_disc_deg, float rpm, uint32_t stop_ms) {
   hostPrintf(
       "# ACK HOLD PHASE target=%.1f marker=%s crawl_rpm=%.0f rpm0=%.0f "
       "profile_ms=%lu soft_ms=%lu max_pulse=%u lead_deg=%.1f lead_ms=%.0f "
-      "lead_k=%.3f timeout_ms=%lu tol=%.1f via=%s "
-      "(soft-down then early-brake BEFORE hall; uni ESC)\n",
+      "lead_k=%.3f brake_k=%.6g plan_tc=%.2f timeout_ms=%lu tol=%.1f "
+      "refine=%s via=%s "
+      "(soft-slew then distance-plan BRAKE; refine→Hall if miss; uni ESC)\n",
       (double)holdph_target_deg, marker, (double)holdph_crawl_rpm,
       (double)holdph_rpm_start, (unsigned long)holdph_profile_ms,
       (unsigned long)holdph_soft_ms, (unsigned)holdph_max_pulse,
       (double)holdph_lead_deg, (double)holdph_lead_ms,
-      (double)holdph_lead_rpm_k, (unsigned long)holdph_timeout_ms,
-      (double)holdph_tol_deg, esc_sense > 0 ? "CW" : "CCW");
+      (double)holdph_lead_rpm_k, (double)holdph_brake_k,
+      (double)holdph_plan_tc_s, (unsigned long)holdph_timeout_ms,
+      (double)holdph_tol_deg, holdph_refine_en ? "ON" : "OFF",
+      esc_sense > 0 ? "CW" : "CCW");
   return true;
 }
 
@@ -2929,6 +3258,8 @@ void holdPhaseTick(float ddeg_motor, float motor_rpm_abs) {
         holdPhaseApplySoftDown(elapsed, motor_rpm_abs);
       else
         holdPhaseApplyCrawl(90.0f);
+    } else if (holdph_state == HOLDPH_ST_REFINE) {
+      holdPhaseApplyRefineCrawl();
     } else {
       holdph_pulse = ESC_PULSE_MIN_US;
     }
@@ -2940,20 +3271,27 @@ void holdPhaseTick(float ddeg_motor, float motor_rpm_abs) {
   float lead = holdPhaseEffectiveLead(disc_rate, motor_rpm_abs);
 
   // 软降未完成：多圈经过目标时不因霍尔/lead 切油（否则高速误刹）
-  // 禁止仅凭瞬时低转速提前结束（测速毛刺会误触发，随后 lead 在高惯量下切油）
+  // P0：禁止仅靠壁钟 SOFTDONE（旧：time_up 时仍 ~3500RPM → remain≫90 红旗 + 切油点乱）
+  // 出口门闩：测速已落入爬行带且仍在转；超时则强制 OPEN crawl 续压，勿宣告 SOFTDONE。
   if (!holdph_soft_done && holdph_soft_ms > 0 &&
       holdph_state == HOLDPH_ST_APPROACH) {
     bool soft_time_up = (elapsed >= holdph_soft_ms);
     bool cmd_low = (target_ramped <= holdph_crawl_rpm + 50.0f);
-    bool meas_low = (motor_rpm_abs <= holdph_crawl_rpm + 120.0f);
-    bool soft_early_ok =
-        (elapsed >= (holdph_soft_ms * 2u) / 3u) && cmd_low && meas_low;
-    if (soft_time_up || soft_early_ok) {
+    bool meas_in_crawl =
+        (motor_rpm_abs <= holdph_crawl_rpm + 150.0f) &&
+        (motor_rpm_abs >= fmaxf(40.0f, holdph_crawl_rpm * 0.40f));
+    // Soft may overrun wall clock while CLOSED undershoots — still require crawl band
+    bool soft_exit_ok = meas_in_crawl &&
+                        (soft_time_up ||
+                         ((elapsed >= (holdph_soft_ms * 2u) / 3u) && cmd_low));
+    if (soft_exit_ok) {
       holdph_soft_done = true;
       ctrl_mode = MODE_OPEN;
       soft_cmd_accel_rpm_s = 0.0f;
       hostPrintf("# HOLD PHASE SOFTDONE elapsed_ms=%lu rpm=%.0f remain=%.1f\n",
                  (unsigned long)elapsed, (double)motor_rpm_abs, (double)remain);
+      if (remain > 90.0f)
+        holdPhaseLogRedFlag("softdone", remain, motor_rpm_abs, disc);
     } else {
       holdph_prev_remain = remain;
       holdph_prev_disc = disc;
@@ -2967,12 +3305,35 @@ void holdPhaseTick(float ddeg_motor, float motor_rpm_abs) {
       if (want180 && hall_up_irq_cnt > holdph_up0) {
         holdph_up0 = hall_up_irq_cnt;
       }
+      // 壁钟到但仍高速：强制 OPEN crawl 压速，并打红旗（勿 silent time_up）
+      if (soft_time_up && motor_rpm_abs > holdph_crawl_rpm + 150.0f) {
+        static uint32_t last_soft_stall_log_ms = 0;
+        if (millis() - last_soft_stall_log_ms > 800u) {
+          last_soft_stall_log_ms = millis();
+          holdPhaseLogRedFlag("soft_overrun_hi_rpm", remain, motor_rpm_abs,
+                              disc);
+        }
+        ctrl_mode = MODE_OPEN;
+        soft_cmd_accel_rpm_s = 0.0f;
+        holdPhaseApplyCrawl(fmaxf(remain, 91.0f));  // ≥90 → CLOSED crawl band
+        applyEscPulse(holdph_pulse);
+        return;
+      }
+      // 壁钟到但 RPM≈0：失速救场（R-stall90）
+      if (soft_time_up && motor_rpm_abs < fmaxf(40.0f, holdph_crawl_rpm * 0.35f)) {
+        holdPhaseLogRedFlag("soft_stall_rpm0", remain, motor_rpm_abs, disc);
+        ctrl_mode = MODE_OPEN;
+        holdPhaseApplyCrawl(fmaxf(remain, 91.0f));
+        applyEscPulse(holdph_pulse);
+        // 仍不 SOFTDONE，直到 meas_in_crawl
+        return;
+      }
       holdPhaseApplySoftDown(elapsed, motor_rpm_abs);
       return;
     }
   }
 
-  // 软降刚结束但转速仍高：继续闭环压到爬行区，暂不 lead 制动
+  // 软降刚结束但转速仍高：继续闭环压到爬行区，暂不距离规划切油（斜坡限幅）
   if (holdph_soft_done && holdph_profile_ms > 0 &&
       holdph_state == HOLDPH_ST_APPROACH &&
       motor_rpm_abs > holdph_crawl_rpm + 250.0f) {
@@ -2983,9 +3344,9 @@ void holdPhaseTick(float ddeg_motor, float motor_rpm_abs) {
         fabsf(wrap180(holdph_target_deg - 180.0f)) <= holdph_tol_deg;
     if (want0 && hall_dn_irq_cnt > holdph_dn0) holdph_dn0 = hall_dn_irq_cnt;
     if (want180 && hall_up_irq_cnt > holdph_up0) holdph_up0 = hall_up_irq_cnt;
-    // 继续压转速到爬行
     float dt = 1.0f / (float)CTRL_HZ;
     soft_cmd_accel_rpm_s = -soft_rate_down_rpm_s;
+    holdph_desired_rpm = holdph_crawl_rpm;
     target_cmd = holdph_crawl_rpm;
     target_ramped = holdph_crawl_rpm;
     ctrl_mode = MODE_CLOSED;
@@ -2993,43 +3354,111 @@ void holdPhaseTick(float ddeg_motor, float motor_rpm_abs) {
     return;
   }
 
-  // 霍尔仅作确认/诊断：不在此沿上才切油（切油必须发生在 remain<=lead）
-  const bool want0 = fabsf(wrap180(holdph_target_deg)) <= holdph_tol_deg;
-  const bool want180 = fabsf(wrap180(holdph_target_deg - 180.0f)) <= holdph_tol_deg;
+  // 霍尔仅作确认/诊断：主切油靠距离规划；霍尔已到而尚未切油 → 紧急刹
+  // REFINE 段：等目标霍尔沿，沿上立刻 1000µs（极低速，冲量小）
+  // Soft undershoot / stall: open-loop crawl until spinning again (CLOSED from ~0 often times out)
+  if (holdph_soft_done && holdph_state == HOLDPH_ST_APPROACH &&
+      motor_rpm_abs < fmaxf(40.0f, holdph_crawl_rpm * 0.45f) &&
+      remain > (holdph_tol_deg * 2.0f)) {
+    holdph_prev_remain = remain;
+    holdph_prev_disc = disc;
+    if (remain > 90.0f)
+      holdPhaseLogRedFlag("approach_stall90", remain, motor_rpm_abs, disc);
+    ctrl_mode = MODE_OPEN;
+    soft_cmd_accel_rpm_s = 0.0f;
+    holdPhaseApplyCrawl(remain);
+    return;
+  }
+
+  bool want0 = false;
+  bool want180 = false;
+  const bool hall_tgt = holdPhaseIsHallTarget(&want0, &want180);
+
+  if (holdph_state == HOLDPH_ST_REFINE) {
+    if (!isnan(holdph_prev_disc)) {
+      float step = wrap360(disc - holdph_prev_disc);
+      if (step < 180.0f) holdph_refine_travel += step;
+    }
+    holdph_prev_disc = disc;
+    holdph_prev_remain = remain;
+    if (holdph_refine_travel > holdph_refine_max_disc) {
+      hostPrintf(
+          "# ERR HOLD PHASE refine_max_travel disc=%.2f travel=%.1f max=%.0f — ESTOP\n",
+          (double)disc, (double)holdph_refine_travel,
+          (double)holdph_refine_max_disc);
+      doEstop("hold_phase_refine_max");
+      return;
+    }
+    if (want0 && hall_dn_irq_cnt > holdph_dn0) {
+      holdph_hall_seen = true;
+      holdph_refine_hit = true;
+      holdph_dn0 = hall_dn_irq_cnt;
+      // 高速撞霍尔再切油会冲过（日志见 rpm~3500 refine_hall → err~144）
+      if (motor_rpm_abs > fmaxf(holdph_crawl_rpm * 2.5f, 350.0f)) {
+        holdPhaseLogRedFlag("refine_hall_too_fast", remain, motor_rpm_abs, disc);
+        holdPhaseApplyRefineCrawl();
+        return;
+      }
+      holdPhaseEnterBrake("refine_hall_dn");
+      return;
+    }
+    if (want180 && hall_up_irq_cnt > holdph_up0) {
+      holdph_hall_seen = true;
+      holdph_refine_hit = true;
+      holdph_up0 = hall_up_irq_cnt;
+      if (motor_rpm_abs > fmaxf(holdph_crawl_rpm * 2.5f, 350.0f)) {
+        holdPhaseLogRedFlag("refine_hall_too_fast", remain, motor_rpm_abs, disc);
+        holdPhaseApplyRefineCrawl();
+        return;
+      }
+      holdPhaseEnterBrake("refine_hall_up");
+      return;
+    }
+    holdPhaseApplyRefineCrawl();
+    return;
+  }
+
   if (want0 && hall_dn_irq_cnt > holdph_dn0) {
     holdph_hall_seen = true;
     holdph_dn0 = hall_dn_irq_cnt;
-    if (holdph_state == HOLDPH_ST_APPROACH) {
-      // 霍尔已到而尚未提前制动 → 提前量不足，紧急切油
-      holdPhaseEnterBrake("hall_dn_before_lead");
+    // Only early-brake on Hall when remain says we are near marker (else disc frame mismatch)
+    if (holdph_state == HOLDPH_ST_APPROACH && remain <= 50.0f) {
+      holdPhaseEnterBrake("hall_dn_before_plan");
     }
   }
   if (want180 && hall_up_irq_cnt > holdph_up0) {
     holdph_hall_seen = true;
     holdph_up0 = hall_up_irq_cnt;
-    if (holdph_state == HOLDPH_ST_APPROACH) {
-      holdPhaseEnterBrake("hall_up_before_lead");
+    if (holdph_state == HOLDPH_ST_APPROACH && remain <= 50.0f) {
+      holdPhaseEnterBrake("hall_up_before_plan");
     }
   }
 
   if (holdph_state == HOLDPH_ST_APPROACH) {
-    // 预测制动：剩余盘角进入提前窗 → 立刻 1000µs（不等霍尔）
-    if (remain <= lead) {
+    // 主律：remain ≤ est_brake + margin → 切油；lead_eff 作 max 安全二次触发
+    float est = getEstimatedBrakeAngle(motor_rpm_abs);
+    holdph_est_brake_deg = est;
+    float margin = holdph_tol_deg;
+    if (margin < 2.0f) margin = 2.0f;
+    float cut = est + margin;
+    if (lead > cut) cut = lead;
+    if (remain <= cut) {
       holdph_prev_remain = remain;
-      holdPhaseEnterBrake("lead");
+      holdPhaseEnterBrake((remain <= est + margin) ? "est_brake" : "lead_fallback");
     } else {
       holdph_prev_remain = remain;
       holdph_prev_disc = disc;
-      holdPhaseApplyCrawl(remain);
+      holdPhaseApplyPlan(remain, motor_rpm_abs);
     }
     return;
   }
 
-  // BRAKE / SETTLE：保持最低油门，等惯量耗尽
+  // BRAKE / SETTLE：保持最低油门，等惯量耗尽（禁止误差→油门反馈）
   holdph_pulse = ESC_PULSE_MIN_US;
   target_cmd = 0.0f;
   target_ramped = 0.0f;
   soft_cmd_accel_rpm_s = 0.0f;
+  holdph_desired_rpm = 0.0f;
 
   float err = fabsf(wrap180(disc - holdph_target_deg));
   bool near = err <= holdph_tol_deg;
@@ -3053,13 +3482,33 @@ void holdPhaseTick(float ddeg_motor, float motor_rpm_abs) {
   }
 
   // SETTLE
-  if (slow && (near || past || holdph_hall_seen)) {
-    const char* why = holdph_hall_seen ? "settle_hall" : (past ? "settle_past" : "settle_near");
-    holdPhaseFinish(why);
+  // 1) REFINE 霍尔命中后短停 → DONE（霍尔 = 绝对 latch）
+  if (slow && holdph_refine_hit && holdph_hall_seen) {
+    holdPhaseFinish("refine_hall");
     return;
   }
-  if (slow && since_brake >= 1500) {
-    // 已停转但相位偏差大：仍停车，避免空转；报告 miss
+  // 2) 首停已在带内：无霍尔目标 / refine 关 / 已有 hall_confirm → DONE
+  //    0/180 + refine 开 + 尚无 hall_confirm → 仍进 REFINE（绝对对准）
+  if (slow && (near || past)) {
+    const bool need_hall =
+        holdph_refine_en && hall_tgt && !holdph_hall_seen && !holdph_refine_used;
+    if (!need_hall) {
+      const char* why =
+          holdph_hall_seen ? "settle_hall" : (past ? "settle_past" : "settle_near");
+      holdPhaseFinish(why);
+      return;
+    }
+  }
+  // 3) 首停 miss 或 0/180 缺 hall_confirm → REFINE 爬至霍尔
+  if (slow && since_brake >= 500) {
+    const bool need_refine =
+        holdph_refine_en && hall_tgt && !holdph_refine_used &&
+        (err > holdph_tol_deg || !holdph_hall_seen);
+    if (need_refine) {
+      holdPhaseEnterRefine(disc, err);
+      return;
+    }
+    // 90° 或 refine 关：宽松停 / miss
     if (err <= holdph_tol_deg * 3.0f) {
       holdPhaseFinish("settle_slow");
     } else {
@@ -4033,6 +4482,108 @@ void handleCommandLine(char* line) {
                (double)holdph_lead_rpm_k);
     return;
   }
+  if (strncasecmp(line, "PHASE REFINE", 12) == 0) {
+    char* p = line + 12;
+    while (*p == ' ' || *p == '=' || *p == ':') ++p;
+    if (*p == '\0' || strcasecmp(p, "?") == 0) {
+      hostPrintf(
+          "# ACK PHASE REFINE %s refine_rpm=%.0f max_disc=%.0f "
+          "(ON: after first settle, 0/180 crawl to Hall if |err|>tol or no hall_confirm; "
+          "90°=enc-only, no Hall refine)\n",
+          holdph_refine_en ? "ON" : "OFF", (double)holdph_refine_rpm,
+          (double)holdph_refine_max_disc);
+      return;
+    }
+    if (strcasecmp(p, "ON") == 0 || strcasecmp(p, "1") == 0) {
+      holdph_refine_en = true;
+      hostPrintln("# ACK PHASE REFINE ON");
+      return;
+    }
+    if (strcasecmp(p, "OFF") == 0 || strcasecmp(p, "0") == 0) {
+      holdph_refine_en = false;
+      hostPrintln("# ACK PHASE REFINE OFF");
+      return;
+    }
+    hostPrintln("# ERR PHASE REFINE ON|OFF|?");
+    return;
+  }
+  if (strncasecmp(line, "PHASE TOL", 9) == 0) {
+    char* p = line + 9;
+    while (*p == ' ' || *p == '=' || *p == ':') ++p;
+    if (*p == '\0' || strcasecmp(p, "?") == 0) {
+      hostPrintf("# ACK PHASE TOL deg=%.1f (pass band |wrap180(disc-target)|; plan margin)\n",
+                 (double)holdph_tol_deg);
+      return;
+    }
+    float t = strtof(p, &p);
+    if (t < 1.0f) t = 1.0f;
+    if (t > 30.0f) t = 30.0f;
+    holdph_tol_deg = t;
+    hostPrintf("# ACK PHASE TOL deg=%.1f (RAM)\n", (double)holdph_tol_deg);
+    return;
+  }
+  if (strncasecmp(line, "PHASE PLAN", 10) == 0) {
+    char* p = line + 10;
+    while (*p == ' ' || *p == '=' || *p == ':') ++p;
+    if (*p == '\0' || strcasecmp(p, "?") == 0) {
+      float rpm_now = fabsf(rpm_signed_stable);
+      float est = getEstimatedBrakeAngle(rpm_now);
+      hostPrintf(
+          "# ACK PHASE PLAN brake_k=%.6g plan_tc=%.2fs est_brake=%.2f "
+          "desired_rpm=%.0f crawl_max=%.0f learn_n=%u "
+          "(cut when remain<=max(est+tol, lead_eff); CLOSED track desired; "
+          "NVS hpbk/hptc via PHASE BRAKEK SAVE)\n",
+          (double)holdph_brake_k, (double)holdph_plan_tc_s, (double)est,
+          (double)holdph_desired_rpm, (double)holdph_crawl_rpm,
+          (unsigned)holdph_brake_learn_n);
+      return;
+    }
+    if (strncasecmp(p, "TC", 2) == 0) {
+      p += 2;
+      while (*p == ' ' || *p == '=' || *p == ':') ++p;
+      if (*p == '\0' || strcasecmp(p, "?") == 0) {
+        hostPrintf("# ACK PHASE PLAN TC sec=%.2f (desired≈remain/tc*gear/6)\n",
+                   (double)holdph_plan_tc_s);
+        return;
+      }
+      float tc = strtof(p, &p);
+      if (tc < 0.3f) tc = 0.3f;
+      if (tc > 5.0f) tc = 5.0f;
+      holdph_plan_tc_s = tc;
+      hostPrintf("# ACK PHASE PLAN TC sec=%.2f (RAM; PHASE BRAKEK SAVE → NVS hptc)\n",
+                 (double)holdph_plan_tc_s);
+      return;
+    }
+    hostPrintln("# ERR PHASE PLAN? | PHASE PLAN TC <sec>");
+    return;
+  }
+  if (strncasecmp(line, "PHASE BRAKEK", 12) == 0) {
+    char* p = line + 12;
+    while (*p == ' ' || *p == '=' || *p == ':') ++p;
+    if (*p == '\0' || strcasecmp(p, "?") == 0) {
+      float rpm_now = fabsf(rpm_signed_stable);
+      hostPrintf(
+          "# ACK PHASE BRAKEK k=%.6g est@rpm=%.2f (rpm=%.0f) learn_n=%u "
+          "(Scheme B: coast_deg≈k*rpm^2; NVS hpbk)\n",
+          (double)holdph_brake_k,
+          (double)getEstimatedBrakeAngle(rpm_now), (double)rpm_now,
+          (unsigned)holdph_brake_learn_n);
+      return;
+    }
+    if (strcasecmp(p, "SAVE") == 0) {
+      saveHoldPhaseBrakeKToNvs();
+      hostPrintf("# ACK PHASE BRAKEK SAVE k=%.6g plan_tc=%.2f\n",
+                 (double)holdph_brake_k, (double)holdph_plan_tc_s);
+      return;
+    }
+    float k = strtof(p, &p);
+    if (k < 1.0e-7f) k = 1.0e-7f;
+    if (k > 0.01f) k = 0.01f;
+    holdph_brake_k = k;
+    hostPrintf("# ACK PHASE BRAKEK k=%.6g (RAM; PHASE BRAKEK SAVE → NVS)\n",
+               (double)holdph_brake_k);
+    return;
+  }
   if (strncasecmp(line, "PHASE HOLD ", 11) == 0 || strncasecmp(line, "HOLD PHASE ", 11) == 0) {
     char* p = line + 11;
     while (*p == ' ') ++p;
@@ -4070,17 +4621,27 @@ void handleCommandLine(char* line) {
     float absd = isnan(last_deg) ? 0.0f : last_deg;
     float rel = phaseRelFromAbs(absd);
     float disc = discEstFromMotor();
+    float err = isnan(disc) ? -1.0f
+                            : fabsf(wrap180(disc - holdph_target_deg));
+    float rpm_now = fabsf(rpm_signed_stable);
+    float est = getEstimatedBrakeAngle(rpm_now);
     hostPrintf(
         "# ACK PHASE motor_abs=%.3f motor_rel=%.3f zero=%.3f esc_sense=%d "
-        "disc_deg=%.2f disc_ref=%.1f offset=%.1f cal=%d holdph=%d state=%u target=%.1f "
-        "lead=%.1f/%.0fms gear=%d/%d stopat=%s/%.1f move=%d "
-        "(disc=wrap(ref+sense*dmotor/gear+offset); Hall latch, enc continuous)\n",
+        "disc_deg=%.2f disc_ref=%.1f offset=%.1f cal=%d holdph=%d state=%s/%u "
+        "target=%.1f err=%.2f tol=%.1f hall_confirm=%d refine=%s/%d "
+        "lead=%.1f/%.0fms est_brake=%.2f desired_rpm=%.0f brake_k=%.6g "
+        "plan_tc=%.2f gear=%d/%d stopat=%s/%.1f move=%d "
+        "(plan: remain<=max(est+tol,lead)→BRAKE; CLOSED desired; Hall latch)\n",
         (double)absd, (double)rel, (double)phase_zero_deg, esc_sense,
         (double)(isnan(disc) ? -1.0f : disc), (double)disc_ref_deg,
         (double)disc_phase_offset_deg, flap_calibrated ? 1 : 0,
-        holdph_active ? 1 : 0, (unsigned)holdph_state, (double)holdph_target_deg,
-        (double)holdph_lead_deg, (double)holdph_lead_ms,
-        (int)GEAR_RATIO_NUM, (int)GEAR_RATIO_DEN,
+        holdph_active ? 1 : 0, holdphStateName(holdph_state),
+        (unsigned)holdph_state, (double)holdph_target_deg, (double)err,
+        (double)holdph_tol_deg, holdph_hall_seen ? 1 : 0,
+        holdph_refine_en ? "ON" : "OFF", holdph_refine_used ? 1 : 0,
+        (double)holdph_lead_deg, (double)holdph_lead_ms, (double)est,
+        (double)holdph_desired_rpm, (double)holdph_brake_k,
+        (double)holdph_plan_tc_s, (int)GEAR_RATIO_NUM, (int)GEAR_RATIO_DEN,
         stopat_on ? "ON" : "OFF", (double)stopat_deg, move_active ? 1 : 0);
     return;
   }
