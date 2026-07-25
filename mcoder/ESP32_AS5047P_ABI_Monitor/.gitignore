@@ -1,0 +1,16 @@
+# Android build
+android/**/.gradle/
+android/**/build/
+android/**/local.properties
+*.apk
+
+# Python
+pc/**/__pycache__/
+pc/**/*.pyc
+pc/captures/
+pc/serial_logs/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
