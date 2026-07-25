@@ -39,6 +39,17 @@ except ImportError:
     def bleak_available() -> bool:
         return False
 
+    def scan_oez_devices_sync(timeout_s: float = 5.0):
+        return []
+
+
+try:
+    from voice_notify import speak as voice_speak
+except ImportError:
+
+    def voice_speak(text: str, **kwargs) -> None:  # type: ignore[misc]
+        print(f"[语音] {text}", flush=True)
+
     def scan_oez_devices_sync(_timeout_s: float = 5.0):
         return []
 
@@ -96,7 +107,17 @@ SNAP_PREAMBLE = bytes([0xAA] * 10 + [0x55])
 _SNAP_FMT = "<IhbBI"
 assert struct.calcsize(_SNAP_FMT) == SNAP_POINT_SIZE
 
-SERIAL_LOG_DIR = Path(__file__).resolve().parent / "serial_logs"
+
+def app_dir() -> Path:
+    """源码运行 → pc/；打包 exe → exe 所在目录（logs/serial_logs 写在旁边）。"""
+    import sys
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+SERIAL_LOG_DIR = app_dir() / "serial_logs"
 
 
 def snap_crc32(data: bytes) -> int:
@@ -476,6 +497,17 @@ class App(tk.Tk):
         self.lbl_mon_state.pack(fill=tk.X, pady=(4, 2))
         ttk.Label(mon_box, textvariable=self.var_log).pack(anchor=tk.W, pady=4)
         ttk.Label(mon_box, textvariable=self.var_dump_prog, foreground="#0a7").pack(anchor=tk.W)
+        # 蓝牙 BIN 下载进度
+        prog_fr = ttk.Frame(mon_box)
+        prog_fr.pack(fill=tk.X, pady=(4, 2))
+        self.var_ble_pct = tk.StringVar(value="")
+        ttk.Label(prog_fr, text="蓝牙下载").pack(side=tk.LEFT)
+        self.ble_prog = ttk.Progressbar(
+            prog_fr, orient=tk.HORIZONTAL, mode="determinate", maximum=100, length=180
+        )
+        self.ble_prog.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Label(prog_fr, textvariable=self.var_ble_pct, width=6).pack(side=tk.LEFT)
+        self.ble_prog["value"] = 0
         rec_fr = ttk.Frame(mon_box)
         rec_fr.pack(fill=tk.X, pady=4)
         ttk.Label(rec_fr, text="确认后记录时长").pack(side=tk.LEFT)
@@ -740,10 +772,12 @@ class App(tk.Tk):
                 self.btn_dump.configure(text="仅拉取(USB全速)")
 
     def _dump_cmd(self) -> str:
-        """USB/仿真 用 LOG DUMP USB；BLE 用 LOG DUMP BLE。"""
-        if self._is_sim_mode() or isinstance(self.link, SerialLink):
+        """短时 snap：BLE→DUMP BIN BLE；USB→DUMP BIN。旧长 LOG 仍可用 LOG DUMP。"""
+        if self._is_sim_mode():
             return "LOG DUMP USB"
-        return "LOG DUMP BLE"
+        if self._is_ble_mode():
+            return "DUMP BIN BLE"
+        return "DUMP BIN"
 
     def _refresh_ports(self) -> None:
         if self._is_ble_mode():
@@ -876,10 +910,40 @@ class App(tk.Tk):
     def _ble_status(self, msg: str) -> None:
         # 限流：避免 bleak 线程狂刷 after(0) 把 Tk 事件队列撑爆
         now = time.monotonic()
-        if now - self._last_ble_status < 0.25 and "error" not in msg.lower():
+        # 进度类状态更勤刷新
+        is_prog = "BLE BIN" in msg and "%" in msg
+        gap = 0.12 if is_prog else 0.25
+        if now - self._last_ble_status < gap and "error" not in msg.lower():
             return
         self._last_ble_status = now
         self.after(0, lambda m=msg: self.var_status.set(m))
+        if is_prog:
+            self.after(0, lambda m=msg: self._apply_ble_prog_from_status(m))
+
+    def _apply_ble_prog_from_status(self, msg: str) -> None:
+        """解析 'BLE BIN 1234/5678 (45%)' → 进度条。"""
+        try:
+            if "(" in msg and "%" in msg:
+                pct_s = msg.rsplit("(", 1)[1].split("%", 1)[0].strip()
+                pct = max(0, min(100, int(pct_s)))
+                self.ble_prog["value"] = pct
+                self.var_ble_pct.set(f"{pct}%")
+                if "BLE BIN" in msg and "/" in msg:
+                    mid = msg.split("BLE BIN", 1)[1].strip()
+                    frac = mid.split("(", 1)[0].strip()
+                    self.var_dump_prog.set(f"蓝牙下载 {frac} · {pct}%")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _set_ble_bin_progress(self, got: int, expect: int, pct: int) -> None:
+        pct = max(0, min(100, int(pct)))
+        self.ble_prog["value"] = pct
+        self.var_ble_pct.set(f"{pct}%")
+        if expect > 0:
+            self.var_dump_prog.set(f"蓝牙下载 {got}/{expect} 字节 · {pct}%")
+            self.var_mon.set(f"蓝牙回传中… {pct}%")
+        else:
+            self.var_dump_prog.set(f"蓝牙下载 {got} 字节…")
 
     def _queue_cmd(self, cmd: str) -> None:
         """连接中也可排队发送（不弹未连接框）。"""
@@ -940,7 +1004,7 @@ class App(tk.Tk):
             return
         from pathlib import Path
 
-        folder = Path(__file__).resolve().parent / "captures"
+        folder = app_dir() / "captures"
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / datetime.now().strftime("hand_twist_%Y%m%d_%H%M%S.csv")
         try:
@@ -968,7 +1032,7 @@ class App(tk.Tk):
         from pathlib import Path
         import subprocess
 
-        folder = Path(__file__).resolve().parent / "captures"
+        folder = app_dir() / "captures"
         folder.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(["explorer", str(folder)])
 
@@ -978,7 +1042,7 @@ class App(tk.Tk):
             # 尝试读最近文件
             from pathlib import Path
 
-            folder = Path(__file__).resolve().parent / "captures"
+            folder = app_dir() / "captures"
             files = sorted(folder.glob("hand_twist_*.csv")) if folder.exists() else []
             if not files:
                 messagebox.showinfo("长采", "还没有长采数据/文件")
@@ -1106,12 +1170,9 @@ class App(tk.Tk):
         self.var_info.set("停止后板内已记数据仍在；可点②拉取")
 
     def _on_rec_now(self) -> None:
-        """电机已转起来后：立刻采满 1s → SNAP DONE → DUMP BIN。"""
+        """电机已转起来后：立刻采满 → SNAP DONE → SD SAVE →（BLE 则拉 RAM）。"""
         if not self.link or not getattr(self.link, "is_open", False):
             messagebox.showwarning("未连接", "请先连接设备")
-            return
-        if self._is_ble_mode():
-            messagebox.showinfo("提示", "二进制 DUMP 目前仅 USB；请用 --usb 连接")
             return
         self._read_scheduled = False
         self._ui_dumping = False
@@ -1122,12 +1183,15 @@ class App(tk.Tk):
         self._toggle_plot()
         self._set_mon_ui("recording")
         self.var_mon.set("直采中… 2s@2kHz（RAM）")
-        self.var_info.set("RAM 记满 → ALIVE → 自动 SD SAVE；可选再 DUMP BIN")
+        if self._is_ble_mode():
+            self.var_info.set("RAM→SD 存档后，蓝牙从 RAM 拉（不读 SD SPI）")
+        else:
+            self.var_info.set("RAM 记满 → ALIVE → 自动 SD SAVE；可选再 DUMP BIN / U盘")
         self.var_dump_prog.set("记录中（INTERNAL RAM）…")
         self.after(20, lambda: self._queue_cmd("REC NOW"))
 
     def _do_bin_pull(self) -> None:
-        """SNAP DUMP READY 后发 DUMP BIN（前导 AA×10+55 + 定长）。"""
+        """USB: DUMP BIN；BLE: DUMP BIN BLE（读板内 RAM，与 SD 内容一致）。"""
         if not self.link or not getattr(self.link, "is_open", False):
             self.var_dump_prog.set("DUMP BIN 失败：未连接")
             return
@@ -1140,13 +1204,20 @@ class App(tk.Tk):
         self._dump_watch_t0 = time.monotonic()
         self._dump_watch_n = 0
         self._set_mon_ui("dumping")
-        self.var_dump_prog.set("DUMP BIN 拉取中（preamble+magic）…")
-        self.var_mon.set("二进制回传中")
-        # 先问板内 n，再拉二进制
-        self._queue_cmd("SNAP?")
-        if isinstance(self.link, SerialLink):
-            self.link.arm_bindump(timeout_s=15.0)
-        self.after(50, lambda: self._queue_cmd("DUMP BIN"))
+        if self._is_ble_mode():
+            self.var_dump_prog.set("BLE BIN 拉取中（src=RAM）… 0%")
+            self.var_mon.set("蓝牙回传 RAM snap…")
+            self.ble_prog["value"] = 0
+            self.var_ble_pct.set("0%")
+            self._queue_cmd("SNAP?")
+            self.after(80, lambda: self._queue_cmd("DUMP BIN BLE"))
+        else:
+            self.var_dump_prog.set("DUMP BIN 拉取中（preamble+magic）…")
+            self.var_mon.set("二进制回传中")
+            self._queue_cmd("SNAP?")
+            if isinstance(self.link, SerialLink):
+                self.link.arm_bindump(timeout_s=15.0)
+            self.after(50, lambda: self._queue_cmd("DUMP BIN"))
 
     def _handle_bindump(self, raw: bytes) -> None:
         self._awaiting_bindump = False
@@ -1167,6 +1238,12 @@ class App(tk.Tk):
         self._append(f"# BIN OK n={n} hz={hz} bytes={len(raw)} CRC ok")
         self.var_dump_prog.set(f"BIN OK {n} 点 @ {hz}Hz")
         self.var_mon.set(f"二进制收齐 {n} 点 · 正在保存")
+        try:
+            self.ble_prog["value"] = 100
+            self.var_ble_pct.set("100%")
+        except Exception:  # noqa: BLE001
+            pass
+        voice_speak(f"数据已取回，共{n}个点")
         self._force_finish_dump = True
         self.after(50, self._finish_auto_recv)
 
@@ -1182,10 +1259,14 @@ class App(tk.Tk):
         self._toggle_plot()
         self._set_mon_ui("armed")
         self.var_mon.set("已武装 · 环缓中… 等 |RPM|>10 且 I 过1圈")
-        self.var_info.set("触发后自动：回溯400点 + 再记2s → SD SAVE（再 USB DISK ON 读卡）")
+        if self._is_ble_mode():
+            self.var_info.set("触发→RAM→SD 存档→自动蓝牙从 RAM 取回（SD 仅存档）")
+        else:
+            self.var_info.set("触发后：回溯400 + 再记2s → SD SAVE → USB DISK ON 读卡")
         self.var_dump_prog.set("armed / ring…")
         self._sync_board_time()
         self.after(40, lambda: self._queue_cmd("MONITOR START"))
+        voice_speak("已经开始监控，请加油")
 
     def _schedule_read_once(self, delay_ms: int = 200) -> None:
         """记完后：PC 立刻拉取；板子 1.2s 无动作也会自推。"""
@@ -1428,22 +1509,36 @@ class App(tk.Tk):
             self.cmb_seg.set("")
 
     def _dump(self) -> None:
-        self.dump_rows.clear()
-        self.dump_index.clear()
-        self.playback.clear()
-        self._auto_split_after_dump = False
-        cmd = self._dump_cmd()
-        self.var_info.set(f"正在拉取… ({cmd})")
-        self._send(cmd)
+        """② 仅拉取：短时 snap 走二进制（BLE/USB），与自动路径一致。"""
+        if not self.link or not getattr(self.link, "is_open", False):
+            messagebox.showwarning("未连接", "请先连接设备")
+            return
+        if self._is_sim_mode():
+            self.dump_rows.clear()
+            self.dump_index.clear()
+            self.playback.clear()
+            self._auto_split_after_dump = False
+            cmd = self._dump_cmd()
+            self.var_info.set(f"正在拉取… ({cmd})")
+            self._send(cmd)
+            return
+        self._do_bin_pull()
 
     def _dump_and_split(self) -> None:
-        self.dump_rows.clear()
-        self.dump_index.clear()
-        self.playback.clear()
+        if not self.link or not getattr(self.link, "is_open", False):
+            messagebox.showwarning("未连接", "请先连接设备")
+            return
+        if self._is_sim_mode():
+            self.dump_rows.clear()
+            self.dump_index.clear()
+            self.playback.clear()
+            self._auto_split_after_dump = True
+            cmd = self._dump_cmd()
+            self.var_info.set(f"正在拉取并保存… ({cmd})")
+            self._send(cmd)
+            return
         self._auto_split_after_dump = True
-        cmd = self._dump_cmd()
-        self.var_info.set(f"正在拉取并保存… ({cmd})")
-        self._send(cmd)
+        self._do_bin_pull()
 
     def _save_csv_split(self, folder: str | None = None) -> None:
         from pathlib import Path
@@ -2204,7 +2299,15 @@ class App(tk.Tk):
                     self.var_status.set(f"错误: {payload}")
                     self._append(str(payload))
                 elif kind == "__bindump__":
+                    self._set_ble_bin_progress(
+                        len(payload) if isinstance(payload, (bytes, bytearray)) else 0,
+                        len(payload) if isinstance(payload, (bytes, bytearray)) else 0,
+                        100,
+                    )
                     self._handle_bindump(payload)
+                elif kind == "__bin_prog__":
+                    got, exp, pct = payload
+                    self._set_ble_bin_progress(int(got), int(exp or 0), int(pct))
                 elif kind == "__dump_batch__":
                     for line in payload:
                         self._on_dump_sample_line(str(line))
@@ -2248,10 +2351,20 @@ class App(tk.Tk):
                     if len(self.dump_rows) != getattr(self, "_dump_watch_n", -1):
                         self._dump_watch_t0 = now
                         self._dump_watch_n = len(self.dump_rows)
-                    elif now - self._dump_watch_t0 > 8.0:
-                        # 等二进制时不要改走 LOG DUMP 文本路径
+                    elif now - self._dump_watch_t0 > (
+                        120.0
+                        if (
+                            getattr(self, "_awaiting_bindump", False)
+                            and self._is_ble_mode()
+                        )
+                        else 8.0
+                    ):
+                        # 等二进制时不要改走 LOG DUMP 文本路径（BLE BIN 可达数分钟）
                         if getattr(self, "_awaiting_bindump", False):
-                            self._append("# WARN BIN stall — still waiting magic/CRC")
+                            self._append(
+                                "# WARN BIN stall — still waiting "
+                                + ("BLE hex/CRC" if self._is_ble_mode() else "magic/CRC")
+                            )
                             self._dump_watch_t0 = now
                         else:
                             n = len(self.dump_rows)
@@ -2502,7 +2615,8 @@ class App(tk.Tk):
                 self.var_mon.set("直采中… 1s@2kHz SNAP")
             elif "SNAP DONE" in line:
                 self._set_mon_ui("recording")
-                self.var_mon.set("SNAP 完成 · 等 ALIVE 1..5（验复位）")
+                self.var_mon.set("SNAP 完成 · 等 ALIVE（约2秒）")
+                voice_speak("记录完毕")
                 try:
                     for tok in line.replace("#", " ").split():
                         if tok.startswith("n="):
@@ -2531,17 +2645,57 @@ class App(tk.Tk):
                 self._set_mon_ui("done")
                 self.var_mon.set("已存档到 SD（RAM→SD）")
                 self.var_dump_prog.set(line.strip())
-                self.var_info.set("发 USB DISK ON 用 Native USB 拷 snap_*.bin；或拔卡读")
+                voice_speak("已存入存储卡")
+                if self._is_ble_mode():
+                    self.var_info.set("SD 已存档 · 即将蓝牙从 RAM 取回（不读卡）")
+                else:
+                    self.var_info.set("发 USB DISK ON 用 Native USB 拷 snap_*.bin；或拔卡读")
+            elif "BLE PULL READY" in line:
+                self.var_mon.set("SD 已存 · RAM 可拉")
+                self.var_info.set("蓝牙从 RAM 取数（与 SD 文件一致，更稳）")
+                self.ble_prog["value"] = 0
+                self.var_ble_pct.set("0%")
+                self.var_dump_prog.set("即将蓝牙下载… 0%")
+                if self._is_ble_mode() and not getattr(self, "_awaiting_bindump", False):
+                    self.after(200, self._do_bin_pull)
+            elif "BIN BLE BEGIN" in line:
+                self.ble_prog["value"] = 0
+                self.var_ble_pct.set("0%")
+                self.var_dump_prog.set("蓝牙下载开始… 0%")
+                self.var_mon.set("蓝牙回传中… 0%")
+                try:
+                    for tok in line.replace("#", " ").split():
+                        if tok.startswith("bytes="):
+                            self._dump_expect = int(tok[6:])
+                except Exception:  # noqa: BLE001
+                    pass
             elif "STAGING" in line and "I+1" in line:
                 self._set_mon_ui("staging")
                 self.var_mon.set("|RPM|>10 · 等待 I 过完 1 圈")
+                voice_speak("探测到了")
             elif "CONFIRM" in line and "I+1" in line:
                 self._set_mon_ui("recording")
                 self.var_mon.set("已触发 · 回溯400 + 记2s…")
+                voice_speak("开始记录，请保持转动两秒")
             elif "SD SAVE fail" in line:
                 self._set_mon_ui("idle")
                 self.var_mon.set("SD 存档失败 · RAM 数据仍在")
-                self.var_info.set("可发 DUMP BIN 或检查 SD 后 SD SAVE")
+                if self._is_ble_mode():
+                    self.var_info.set("可点②发 DUMP BIN BLE（读 RAM）；或插卡后 SD SAVE")
+                    voice_speak("存卡失败，请检查存储卡")
+                else:
+                    self.var_info.set("可发 DUMP BIN 或检查 SD 后 SD SAVE")
+            elif "BIN BLE END" in line and "ok=0" in line:
+                self._awaiting_bindump = False
+                self._ui_dumping = False
+                self.var_mon.set("蓝牙 BIN 传输中断")
+                self.var_dump_prog.set(line.strip())
+                voice_speak("蓝牙取回失败")
+            elif "DUMP BIN BLE fail" in line or "DUMP BIN BLE wait" in line:
+                self._awaiting_bindump = False
+                self._ui_dumping = False
+                self.var_mon.set(line.strip())
+                self.var_dump_prog.set(line.strip())
             elif "BIN END" in line:
                 pass  # 真正收齐靠 __bindump__
             elif "MONITOR armed" in line:
@@ -2565,17 +2719,34 @@ class App(tk.Tk):
                 self._set_mon_ui("armed")
                 self.var_mon.set("噪声：临时池已丢弃")
             elif "DUMP BUSY" in line or "RECORD done" in line or line.startswith("# RECORD_DONE"):
-                self._set_mon_ui("dumping")
-                self.var_mon.set("记录完成 · 即将拉取完整段")
-                try:
-                    if "seg=" in line:
-                        self._pull_seg = int(line.split("seg=")[1].split()[0])
-                    if line.startswith("# RECORD_DONE"):
-                        n = int(line.split("|", 1)[1].strip().split()[0])
-                        self._dump_expect = n
-                except Exception:  # noqa: BLE001
-                    pass
-                self._schedule_read_once(150)
+                # snap 路径：`RECORD done … → ALIVE then SD SAVE` — 等 SD/BLE PULL，勿发 LOG DUMP
+                if "RECORD done" in line and "SD SAVE" in line:
+                    self._set_mon_ui("recording")
+                    self.var_mon.set("记录完毕 · 等存卡后蓝牙/U盘取数")
+                    voice_speak("记录完毕")
+                    try:
+                        for tok in line.replace("#", " ").replace("→", " ").split():
+                            if tok.startswith("n="):
+                                self._dump_expect = int(tok[2:].rstrip(","))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self.var_dump_prog.set(
+                        f"snap n={self._dump_expect or '?'} → ALIVE → SD → BLE/USB"
+                    )
+                else:
+                    self._set_mon_ui("dumping")
+                    self.var_mon.set("记录完成 · 即将拉取完整段")
+                    if "RECORD done" in line or line.startswith("# RECORD_DONE"):
+                        voice_speak("记录完毕")
+                    try:
+                        if "seg=" in line:
+                            self._pull_seg = int(line.split("seg=")[1].split()[0])
+                        if line.startswith("# RECORD_DONE"):
+                            n = int(line.split("|", 1)[1].strip().split()[0])
+                            self._dump_expect = n
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._schedule_read_once(150)
             elif "AUTO DUMP PREP" in line or "AUTO DUMP FALLBACK" in line:
                 self._set_mon_ui("dumping")
                 self._ui_dumping = True
@@ -2792,7 +2963,7 @@ class App(tk.Tk):
             return
         from pathlib import Path
 
-        folder = Path(__file__).resolve().parent / "logs" / datetime.now().strftime(
+        folder = app_dir() / "logs" / datetime.now().strftime(
             "%Y%m%d_%H%M%S"
         )
         try:
@@ -2813,7 +2984,7 @@ if __name__ == "__main__":
     import traceback
     from pathlib import Path
 
-    _crash_log = Path(__file__).resolve().parent / "ui_crash.log"
+    _crash_log = app_dir() / "ui_crash.log"
 
     def _excepthook(exc_type, exc, tb):
         try:

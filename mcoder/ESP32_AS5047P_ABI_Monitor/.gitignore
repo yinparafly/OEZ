@@ -9,6 +9,10 @@ pc/**/__pycache__/
 pc/**/*.pyc
 pc/captures/
 pc/serial_logs/
+pc/build/
+pc/dist/
+pc/*.spec.bak
+*.exe
 
 # Editor / OS
 .DS_Store

@@ -465,16 +465,17 @@ static void discardStaging(uint8_t why) {
   bleMuteHost(false);  // 丢弃后恢复 BLE 状态通道
 }
 
-/** 停转/超时/翻转：有数据则提交并进入 RECORD 记满 1s（对齐 00ACC）；无数据才丢。 */
+/** 停转/超时/翻转：有数据则提交并进入 RECORD 记满时长（停转也继续记，不删）；无数据才丢。 */
 static void salvageStagingOrDiscard(uint8_t why, uint32_t now_ms, int64_t net) {
-  const bool keep = (g_pool_n >= 40) || (net >= 40) || (net >= (CONFIRM_COUNTS / 4));
+  // 弹射很短：只要进过 STAGING 且有一点转动痕迹就保留并记满
+  const bool keep = (g_pool_n >= 8) || (net >= 8) || (net >= (CONFIRM_COUNTS / 8));
   if (!keep) {
     g_evt_seg = g_seg_cur;
     g_evt_n = (uint32_t)((net > 0) ? net : (int64_t)g_pool_n);
     discardStaging(why);
     return;
   }
-  // 有实质数据：提交临时池 → 继续记满 REC 时长（不再立刻结束）
+  // 有实质数据：提交临时池 → 继续记满 REC 时长（停转也采完既定窗口）
   g_evt_revs = (float)net / (float)ABI_STEPS_PER_REV;
   g_evt_seg = g_seg_cur;
   poolCommitToMain();
@@ -486,7 +487,7 @@ static void salvageStagingOrDiscard(uint8_t why, uint32_t now_ms, int64_t net) {
   g_noise_why = why;
   g_evt_code = 1;  // 当作确认，进入 RECORD
   g_evt_pending = true;
-  // 保持 armed，记满 g_rec_duration_ms 后再停
+  // 保持 armed，记满 g_rec_duration_ms 后再停（期间 RPM=0 也写点）
 }
 
 static void beginStaging(uint32_t now_ms, int64_t counts, float rpm, uint32_t index_n) {
@@ -616,10 +617,16 @@ static void sampleCb(void* arg) {
   const uint32_t dt_sample_ms = SAMPLE_PERIOD_US / 1000UL;
 
   // 主路径：武装环缓 → |RPM|>10 且 I+1圈 → 回溯400 + 再记2s（snap）
+  // 注意：触发后 g_armed_ring=false，但仍须继续 snapOnSampleCounts，否则正式段不写点且会误入旧 STAGING 挤死 BLE
+  if (snapIsRecording()) {
+    snapOnSampleCounts(counts, index_n, now_us);
+    goto snap_out;
+  }
   if (g_armed && snapIsArmed()) {
     snapOnSampleCounts(counts, index_n, now_us);
     if (g_phase == PH_IDLE) {
       if (arpm > RPM_GATE) {
+        bleMuteHost(true);  // STAGING/RECORD：少灌 BLE，防 Windows 断链
         g_phase = PH_STAGING;
         g_stage_start_ms = now_ms;
         g_stage_index0 = index_n;
@@ -630,11 +637,14 @@ static void sampleCb(void* arg) {
         g_evt_pending = true;
       }
     } else if (g_phase == PH_STAGING) {
-      if (arpm <= RPM_GATE) {
-        // 掉速：回 IDLE 重等（环缓不停，换新 I 基准）
-        g_phase = PH_IDLE;
-        g_seg_cur = 0;
-      } else if ((int32_t)(index_n - g_stage_index0) >= 1) {
+      // 弹射约 0.3s：进入 STAGING 后绝不因掉转速回 IDLE 丢弃。
+      // 掉速 / 短时 / I+1 / 环缓够 → 立刻触发正式段，记满 REC 时长（停转也继续采点）。
+      const bool rpm_drop = (arpm < (RPM_GATE * 0.5f));
+      const bool short_hold = (now_ms - g_stage_start_ms) >= 200u;  // 0.2s 覆盖弹射主过程
+      const bool i_plus = ((int32_t)(index_n - g_stage_index0) >= 1);
+      const bool ring_ok = (snapRingCount() >= 120);
+      const bool drop_salvage = rpm_drop && (snapRingCount() >= 40);
+      if (i_plus || short_hold || ring_ok || drop_salvage) {
         if (snapTriggerFromRing(BACKTRACK_N, g_rec_duration_ms)) {
           g_phase = PH_RECORD;
           g_rec_start_ms = now_ms;
@@ -643,7 +653,6 @@ static void sampleCb(void* arg) {
           g_evt_n = (uint32_t)snapCount();
           g_evt_code = 1;
           g_evt_pending = true;
-          // 下一拍起走 snapIsRecording() 整数路径
         }
       }
     }
@@ -830,12 +839,16 @@ static void emitTelem(const Snap& s) {
            (unsigned long)t_rel, (unsigned long long)unix_ms);
   Serial.print(line);
 
-  // 参考 00ACC：STAGING/RECORD 期间不往 BLE 推实时流（只留串口），
-  // 避免一点监控就灌包导致手机/PC UI 卡死、断链。状态靠 # CONFIRM / # RECORD_DONE。
-  if (bleConnected() && g_phase == PH_IDLE) {
+  // 完全分离：未武装时才发 BLE 实时转速；一 MONITOR START 就停发 L，
+  // 只靠 # QUIET / # CONFIRM / # RECORD done / # CD15 / # BLE PULL READY。
+  // USB 串口始终有完整 L, 供 PC 调试。
+  if (bleConnected() && !bleHostMuted() && !g_armed && g_phase == PH_IDLE &&
+      !snapIsRecording()) {
+    uint16_t snap_n = snapCount();
     char short_l[96];
     snprintf(short_l, sizeof(short_l), "L,%s%d.%d,%d,%d,%u,%lu,%u\n", neg ? "-" : "", whole, frac,
-             (int)s.dir, g_armed ? 1 : 0, (unsigned)g_phase, (unsigned long)remain, (unsigned)n);
+             (int)s.dir, g_armed ? 1 : 0, (unsigned)g_phase, (unsigned long)remain,
+             (unsigned)snap_n);
     bleSendLine(short_l);
   }
 }
@@ -858,12 +871,14 @@ static void bleDumpPollRx() {
   char line[96];
   while (bleTakeRxLine(line, sizeof(line))) {
     if (!strncasecmp(line, "DUMP ACK", 8) || !strcasecmp(line, "ACK") ||
-        !strcasecmp(line, "DUMP NEXT")) {
+        !strncasecmp(line, "ACK,", 4) || !strcasecmp(line, "DUMP NEXT")) {
       g_dump_ack = true;
+    } else if (!strncasecmp(line, "TIME", 4) || !strcasecmp(line, "ABI?") ||
+               !strncasecmp(line, "BLE RATE", 8) || !strncasecmp(line, "PING", 4) ||
+               !strcasecmp(line, "DIAG") || !strcasecmp(line, "SNAP?")) {
+      // 重连对时/诊断：吞掉但不中止 BIN 回传（旧逻辑 TIME 会 abort → 像「清空」）
     } else if (!strncasecmp(line, "MONITOR", 7) || !strncasecmp(line, "LOG", 3) ||
-               !strcasecmp(line, "DUMP ABORT") || !strcasecmp(line, "ABORT") ||
-               !strncasecmp(line, "TIME", 4) || !strcasecmp(line, "ABI?")) {
-      // 回传中收到 MONITOR/TIME 等：中止；LOG DUMP 由 loop 在回传结束后再处理不便，这里直接中止即可
+               !strcasecmp(line, "DUMP ABORT") || !strcasecmp(line, "ABORT")) {
       g_dump_abort = true;
     }
   }
@@ -1178,33 +1193,58 @@ static bool ensureMonBuffers() {
 }
 
 static void monitorStart() {
+  // 残留 U 盘模式会挡住武装；自动关掉
   if (sdMscIsOn()) {
-    hostPrintln("# MONITOR blocked — USB DISK ON (USB DISK OFF first)");
-    return;
+    hostPrintln("# MONITOR: USB DISK was ON → OFF");
+    sdMscOff();
   }
+  // 残留 freeze/dumping 会导致 sampleCb 直接 return，永远不记
+  if (g_sample_freeze || g_dumping) {
+    hostPrintf("# MONITOR: clear stuck freeze=%d dumping=%d\n", g_sample_freeze ? 1 : 0,
+               g_dumping ? 1 : 0);
+  }
+  g_sample_freeze = false;
+  g_dumping = false;
+  g_dump_abort = false;
   if (snapIsRecording()) {
     hostPrintln("# MONITOR busy (snap recording)");
     return;
   }
   if (!snapArmBegin()) {
     hostPrintln("# MONITOR fail: snap arm/ring alloc");
+    char d[120];
+    snapDiagLine(d, sizeof(d));
+    hostPrintln(d);
     return;
   }
   g_armed = true;
   g_phase = PH_IDLE;
   g_seg_cur = 0;
-  g_sample_freeze = false;
-  g_dumping = false;
   g_dump_started = false;
   g_ready_ms = 0;
-  bleMuteHost(false);
-  // 可静止武装：环缓临时存 → |RPM|>10 且 I 过 1 圈 → 回溯400 + 再记 2s → SD
+  static uint32_t s_monitor_start_count = 0;
+  s_monitor_start_count++;
   char stamp[24];
   bool synced = formatWallStamp(stamp, sizeof(stamp), wallUnixMsNow());
-  hostPrintf("# MONITOR armed: temp-ring → |rpm|>%.0f AND I+1rev → backtrack=%u + REC %lums → SD\n",
-             RPM_GATE, (unsigned)BACKTRACK_N, (unsigned long)g_rec_duration_ms);
-  hostPrintf("# MONITOR time stamp=%s synced=%d (SD file will use wall clock at SAVE)\n", stamp,
-             synced ? 1 : 0);
+  // 武装说明走串口；BLE 只发短标记，随后静音实时流
+  hostPrintf("# MONITOR armed: ESP32 auto |rpm|>%.0f → I+1/1.2s/ring → REC %lums\n", RPM_GATE,
+             (unsigned long)g_rec_duration_ms);
+  hostPrintf("# MONITOR time stamp=%s synced=%d\n", stamp, synced ? 1 : 0);
+  hostPrintf("# MONITOR START count=%lu (clears previous RAM snap)\n",
+             (unsigned long)s_monitor_start_count);
+  {
+    char d[120];
+    snapDiagLine(d, sizeof(d));
+    hostPrintln(d);
+  }
+  if (bleConnected()) {
+    char s[72];
+    snprintf(s, sizeof(s), "# MONITOR START count=%lu\n", (unsigned long)s_monitor_start_count);
+    bleSendLine(s);
+    bleSendLine("# MONITOR armed — BLE live RPM OFF until STOP/done\n");
+  }
+  // 武装后禁止 host*→BLE 灌包；事件仍用 bleSendLine 越过 mute
+  bleMuteHost(true);
   if (g_timer) {
     esp_timer_stop(g_timer);
     esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
@@ -1258,7 +1298,13 @@ static void snapArchiveToSd() {
     return;
   }
   if (!sdReady() && !sdBegin()) {
-    hostPrintln("# SD SAVE fail: no card — data still in RAM, try DUMP BIN");
+    hostPrintln("# SD SAVE fail: no card — data still in RAM");
+    if (bleConnected()) {
+      delay(400);
+      hostPrintln("# BLE PULL READY src=RAM — send DUMP BIN BLE (no SD archive)");
+    } else {
+      hostPrintln("# → try DUMP BIN (USB) or insert SD + SD SAVE");
+    }
     return;
   }
   uint64_t unix_now = wallUnixMsNow();
@@ -1295,9 +1341,24 @@ static void snapArchiveToSd() {
     if (!synced) {
       hostPrintln("# WARN no PC TIME yet — filename uses board millis; reconnect UI to sync clock");
     }
-    hostPrintln("# → auto USB DISK ON (Native USB = U-disk; CH343 = serial)");
-    sdMscOn();
-    hostPrintln("# → if still JTAG: unplug/replug Native USB once");
+    // 取数策略：SD=存档；BLE 传输期间不读卡（SPI 争用易断链）。
+    // 有 BLE 连接时跳过 USB MSC，保留 RAM 供 DUMP BIN BLE；无 BLE 则 U 盘读卡。
+    if (bleConnected()) {
+      hostPrintln("# → BLE linked: skip USB DISK ON; RAM kept (=SD payload)");
+      // 给 SD SPI / BLE 栈一点喘息，再通知手机拉（避免立刻 DUMP 空/断）
+      delay(400);
+      hostPrintln("# BLE PULL READY src=RAM — send DUMP BIN BLE (safer than SD SPI TX)");
+    } else {
+      hostPrintln("# → auto USB DISK ON (Native USB = U-disk; CH343 = serial)");
+      sdMscOn();
+      hostPrintln("# → if still JTAG: unplug/replug Native USB once");
+    }
+  } else {
+    hostPrintln("# SD SAVE fail: write error — data still in RAM");
+    if (bleConnected()) {
+      delay(400);
+      hostPrintln("# BLE PULL READY src=RAM — send DUMP BIN BLE (SD write failed)");
+    }
   }
   if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
   g_sample_freeze = false;
@@ -1310,7 +1371,7 @@ static void dumpBin() {
     return;
   }
   if (!snapDumpReady()) {
-    hostPrintln("# DUMP BIN wait — need # SNAP DUMP READY (ALIVE 5s)");
+    hostPrintln("# DUMP BIN wait — need # SNAP DUMP READY (ALIVE ~2s)");
     return;
   }
   g_dumping = true;
@@ -1320,6 +1381,177 @@ static void dumpBin() {
   if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
   g_sample_freeze = false;
   g_dumping = false;
+}
+
+/** BLE hex 分包：B,<seq>,<HEX> 每包等 ACK。从 RAM 读，不碰 SD。 */
+static bool bleSendBinHexChunks(const uint8_t* data, size_t len, uint32_t* seq) {
+  static const char* HEXDIG = "0123456789ABCDEF";
+  const size_t CHUNK = 72;  // 144 hex + 前缀，适配 MTU≈247
+  size_t off = 0;
+  char line[200];
+  while (off < len) {
+    if (!bleConnected() || g_dump_abort) return false;
+    size_t m = len - off;
+    if (m > CHUNK) m = CHUNK;
+    int pos = snprintf(line, sizeof(line), "B,%lu,", (unsigned long)(*seq));
+    for (size_t i = 0; i < m && pos + 2 < (int)sizeof(line) - 2; ++i) {
+      uint8_t b = data[off + i];
+      line[pos++] = HEXDIG[b >> 4];
+      line[pos++] = HEXDIG[b & 0x0F];
+    }
+    line[pos++] = '\n';
+    line[pos] = '\0';
+    if (!bleDumpSendLine(line)) return false;
+    (*seq)++;
+    off += m;
+  }
+  return true;
+}
+
+/**
+ * BLE 二进制回传公共路径：payload=原始 SnapPoint 字节（与 SD 文件内容一致）。
+ * 协议：# BIN BLE BEGIN … / B,<seq>,<hex> / # BIN BLE END …（每包等 DUMP ACK）
+ * src 仅用于标记：RAM / SD
+ */
+static void dumpBinBlePayload(const uint8_t* payload, size_t plen, uint16_t n, uint16_t hz,
+                              const char* src) {
+  if (!bleConnected()) {
+    hostPrintln("# DUMP BIN BLE fail: BLE not connected");
+    return;
+  }
+  if (!payload || n == 0 || plen == 0) {
+    hostPrintln("# DUMP BIN BLE fail: empty payload");
+    return;
+  }
+  if (plen != (size_t)n * 12u) {
+    // SD 裸文件按 12B 对齐；尾部残片丢弃
+    n = (uint16_t)(plen / 12u);
+    plen = (size_t)n * 12u;
+    if (n == 0) {
+      hostPrintln("# DUMP BIN BLE fail: payload not snap points");
+      return;
+    }
+  }
+  if (hz == 0) hz = 2000;
+
+  static const uint32_t SNAP_MAGIC = 0xAB1C0001UL;
+  uint32_t crc = snapCrc32(payload, plen);
+  uint8_t head[8];
+  memcpy(head, &SNAP_MAGIC, 4);
+  memcpy(head + 4, &n, 2);
+  memcpy(head + 6, &hz, 2);
+  uint8_t crc_le[4];
+  memcpy(crc_le, &crc, 4);
+
+  g_dumping = true;
+  g_sample_freeze = true;
+  g_dump_abort = false;
+  bleMuteHost(true);
+  if (g_timer) esp_timer_stop(g_timer);
+
+  uint16_t saved_gap = g_ble_min_gap_ms;
+  uint16_t saved_ack = g_ble_ack_wait_ms;
+  g_ble_min_gap_ms = 35;
+  g_ble_ack_wait_ms = 900;
+
+  const char* src_tag = (src && src[0]) ? src : "RAM";
+  char mark[180];
+  snprintf(mark, sizeof(mark),
+           "# BIN BLE BEGIN src=%s n=%u hz=%u bytes=%u crc=0x%08lX\n", src_tag, (unsigned)n,
+           (unsigned)hz, (unsigned)(8 + plen + 4), (unsigned long)crc);
+  Serial.print(mark);
+  bool ok = bleDumpSendLine(mark);
+
+  uint32_t seq = 0;
+  if (ok) ok = bleSendBinHexChunks(head, sizeof(head), &seq);
+  if (ok) ok = bleSendBinHexChunks(payload, plen, &seq);
+  if (ok) ok = bleSendBinHexChunks(crc_le, sizeof(crc_le), &seq);
+
+  snprintf(mark, sizeof(mark),
+           "# BIN BLE END src=%s n=%u chunks=%lu ok=%d crc=0x%08lX\n", src_tag, (unsigned)n,
+           (unsigned long)seq, ok ? 1 : 0, (unsigned long)crc);
+  Serial.print(mark);
+  if (bleConnected() && !g_dump_abort) bleDumpSendLine(mark);
+
+  g_ble_min_gap_ms = saved_gap;
+  g_ble_ack_wait_ms = saved_ack;
+  if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  bleMuteHost(false);
+  g_sample_freeze = false;
+  g_dumping = false;
+  g_dump_abort = false;
+}
+
+/** 从 SD 最新 snap_*.bin 拉：先整文件读入 RAM 再 BLE 传（避免 SPI/BLE 交错） */
+static void dumpBinBleFromSd() {
+  if (!bleConnected()) {
+    hostPrintln("# DUMP BIN BLE SD fail: BLE not connected");
+    return;
+  }
+  if (snapIsRecording()) {
+    hostPrintln("# DUMP BIN BLE SD busy recording");
+    return;
+  }
+  if (sdMscIsOn()) {
+    hostPrintln("# DUMP BIN BLE SD blocked — USB DISK ON");
+    return;
+  }
+  char path[64];
+  uint32_t fsz = 0;
+  if (!sdFindLatestSnap(path, sizeof(path), &fsz)) {
+    hostPrintln("# DUMP BIN BLE SD fail: no snap_*.bin on card");
+    return;
+  }
+  g_dumping = true;
+  g_sample_freeze = true;
+  if (g_timer) esp_timer_stop(g_timer);
+  uint8_t* buf = nullptr;
+  size_t len = 0;
+  bool rd = sdReadEntire(path, &buf, &len);
+  if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  g_sample_freeze = false;
+  g_dumping = false;
+  if (!rd || !buf || len == 0) {
+    if (buf) free(buf);
+    hostPrintf("# DUMP BIN BLE SD fail: read %s\n", path);
+    return;
+  }
+  hostPrintf("# DUMP BIN BLE SD file=%s bytes=%u → BLE\n", path, (unsigned)len);
+  uint16_t n = (uint16_t)(len / 12u);
+  dumpBinBlePayload(buf, (size_t)n * 12u, n, 2000, "SD");
+  free(buf);
+}
+
+/**
+ * BLE 优先读 INTERNAL RAM；空则自动改拉 SD 最新 snap（手机可用）。
+ */
+static void dumpBinBle() {
+  if (!bleConnected()) {
+    hostPrintln("# DUMP BIN BLE fail: BLE not connected");
+    return;
+  }
+  if (snapIsRecording()) {
+    hostPrintln("# DUMP BIN BLE busy recording");
+    return;
+  }
+  const uint8_t* payload = snapDataBytes();
+  size_t plen = snapDataLen();
+  uint16_t n = snapCount();
+  uint16_t hz = (uint16_t)snapHz();
+  if (payload && n > 0 && plen > 0) {
+    dumpBinBlePayload(payload, plen, n, hz, "RAM");
+    return;
+  }
+  char d[140];
+  snapDiagLine(d, sizeof(d));
+  hostPrintln(d);
+  if (snapRingCount() > 0 && n == 0) {
+    hostPrintf("# DUMP BIN BLE: empty SNAP (ring=%u) — try SD fallback\n",
+               (unsigned)snapRingCount());
+  } else {
+    hostPrintln("# DUMP BIN BLE: empty RAM — try SD fallback");
+  }
+  dumpBinBleFromSd();
 }
 
 static void dumpHex() {
@@ -1366,21 +1598,57 @@ static void handleCmd(char* line) {
   if (*line == '\0') return;
 
   // 直采优先：勿被 REC MS 前缀误吞（旧 bug：REC NOW → 只改时长）
+  // 记录中/武装中禁止 REC NOW，防止重连误令清空 RAM
   if (!strcasecmp(line, "REC") || !strncasecmp(line, "REC NOW", 7) || !strcasecmp(line, "SNAP") ||
       !strcasecmp(line, "REC SNAP")) {
+    if (snapIsRecording() || g_armed || snapCount() > 0) {
+      hostPrintf("# REC NOW ignored (rec=%d armed=%d snap=%u) — use MONITOR path\n",
+                 snapIsRecording() ? 1 : 0, g_armed ? 1 : 0, (unsigned)snapCount());
+      return;
+    }
     recNow();
     return;
   }
+  if (!strcasecmp(line, "DUMP BIN BLE SD") || !strcasecmp(line, "BIN DUMP BLE SD") ||
+      !strcasecmp(line, "BLE BIN SD") || !strcasecmp(line, "DUMP SD BLE")) {
+    dumpBinBleFromSd();
+    return;
+  }
+  if (!strcasecmp(line, "DUMP BIN BLE") || !strcasecmp(line, "BIN DUMP BLE") ||
+      !strcasecmp(line, "BLE BIN")) {
+    dumpBinBle();
+    return;
+  }
   if (!strcasecmp(line, "DUMP BIN") || !strcasecmp(line, "BIN DUMP")) {
-    dumpBin();
+    dumpBin();  // USB 串口二进制；蓝牙请用 DUMP BIN BLE（读 RAM，不读 SD）
     return;
   }
   if (!strcasecmp(line, "HEX DUMP") || !strcasecmp(line, "DUMP HEX")) {
     dumpHex();
     return;
   }
-  if (!strcasecmp(line, "SNAP?") || !strcasecmp(line, "LOG?") || !strcasecmp(line, "SNAP STATUS")) {
+  if (!strcasecmp(line, "SNAP?")) {
+    // 短状态：手机据此决定 RAM 还是 SD
+    uint16_t n = snapCount();
+    size_t bytes = snapDataLen();
+    int valid = (n > 0 && bytes > 0) ? 1 : 0;
+    char s[120];
+    snprintf(s, sizeof(s), "# SNAP src=RAM valid=%d n=%u bytes=%u ring=%u ready=%d\n", valid,
+             (unsigned)n, (unsigned)bytes, (unsigned)snapRingCount(), snapDumpReady() ? 1 : 0);
+    hostPrintln(s);
+    if (bleConnected()) bleSendLine(s);
+    return;
+  }
+  if (!strcasecmp(line, "LOG?") || !strcasecmp(line, "SNAP STATUS") || !strcasecmp(line, "DIAG") ||
+      !strcasecmp(line, "STATUS")) {
     snapPrintStatus();
+    char d[160];
+    snapDiagLine(d, sizeof(d));
+    hostPrintln(d);
+    hostPrintf("# DIAG2 armed=%d phase=%s freeze=%d dumping=%d rpm=%.1f idx=%lu rec_ms=%lu\n",
+               g_armed ? 1 : 0, phaseName(g_phase), g_sample_freeze ? 1 : 0, g_dumping ? 1 : 0,
+               (double)takeSnap().rpm, (unsigned long)takeSnap().index_n,
+               (unsigned long)g_rec_duration_ms);
     return;
   }
   if (!strcasecmp(line, "SD?") || !strcasecmp(line, "SD STATUS")) {
@@ -1477,7 +1745,10 @@ static void handleCmd(char* line) {
       if (v < 500) v = 500;
       g_rec_duration_ms = (uint32_t)v;
     }
-    hostPrintf("# REC MS=%lu (SNAP/直采时长，范围 500~3000)\n", (unsigned long)g_rec_duration_ms);
+    // 只改「下次」时长，绝不清 RAM / 不停记录
+    hostPrintf("# REC MS=%lu (next shot only; snap=%u rec=%d)\n",
+               (unsigned long)g_rec_duration_ms, (unsigned)snapCount(),
+               snapIsRecording() ? 1 : 0);
     return;
   }
   if (!strncasecmp(line, "DUMP ACK", 8) || !strcasecmp(line, "ACK") ||
@@ -1520,6 +1791,10 @@ static void handleCmd(char* line) {
     hostSerialPrintln("# PONG");
     return;
   }
+  if (!strcasecmp(line, "FW?") || !strcasecmp(line, "VERSION")) {
+    hostPrintln("# FW=monitor-v37-keep-shot snap=RAM→SD ble_pull=RAM|SD");
+    return;
+  }
   if (!strncasecmp(line, "TIME", 4)) {
     const char* a = line + 4;
     while (*a == ' ') ++a;
@@ -1529,9 +1804,9 @@ static void handleCmd(char* line) {
     return;
   }
   if (!strcasecmp(line, "HELP") || !strcasecmp(line, "?")) {
-    hostPrintln("# CMD: MONITOR START|STOP | REC NOW | SD SAVE | USB DISK ON/OFF …");
-    hostPrintln("# 触发: 环缓临时存 → |rpm|>10 且 I 过1圈 → 回溯400 + 再记2s → SD");
-    hostPrintln("# REC NOW=强制直采(无门限) | USB DISK ON=Native USB 读卡");
+    hostPrintln("# CMD: MONITOR START|STOP | REC NOW | SD SAVE | DUMP BIN BLE | USB DISK …");
+    hostPrintln("# 触发: 环缓 → |rpm|>10 且 I+1圈 → 回溯400+2s → RAM→SD；BLE 从 RAM 拉");
+    hostPrintln("# DUMP BIN BLE=读RAM(不读SD) | USB DISK ON=Native USB 读卡");
     hostPrintln("# SPI SD: CS=10 SCK=12 MOSI=11 MISO=13 @3.3V");
     return;
   }
@@ -1695,7 +1970,10 @@ void setup() {
   Serial.begin(921600);
   delay(300);
   Serial.println();
-  Serial.println("# ESP32 AS5047P ABI Monitor FW=monitor-v25-timestamp");
+  Serial.println("# ESP32 AS5047P ABI Monitor FW=monitor-v37-keep-shot");
+  Serial.println("# Policy: idle=BLE live RPM; MONITOR armed=BLE telem OFF (events only)");
+  Serial.println("# Shot: once STAGING/triggered, keep full REC window even if RPM→0");
+  Serial.println("# Android tip: dump = Notify + DUMP ACK; avoid continuous GATT READ");
   Serial.println("# Policy: arm → trigger → SD snap_YYYYMMDD_HHMMSS_n.bin (+ .txt meta)");
   Serial.println("# PC connect sends TIME → wall clock for SD filenames (CST-8)");
 
@@ -1714,14 +1992,15 @@ void setup() {
   else Serial.println("# ABI PCNT + 2kHz OK");
   revsClear();
 
-  // BLE 吃内部堆，默认关闭；需要时发 BLE ON
-  Serial.println("# BLE deferred — send BLE ON if needed");
+  // 主路径要蓝牙搜得到：上电即广播 OEZ-ABI（堆紧张时仍可 SD；失败再 BLE ON）
+  bleBegin();
+  Serial.printf("# BLE name=%s (auto on boot)\n", BLE_DEVICE_NAME);
   Serial.printf("# heap after setup internal=%u spiram=%u\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   Serial.printf("# USB DISK available=%u — after SAVE: USB DISK ON\n",
                 (unsigned)sdMscAvailable());
-  Serial.println("# ready. MONITOR START → ring → trigger → SD → USB DISK ON");
+  Serial.println("# ready. MONITOR START → ring → trigger → SD; BLE→DUMP BIN BLE(src=RAM) / USB→DISK ON");
 }
 
 void loop() {
@@ -1775,9 +2054,16 @@ void loop() {
     g_evt_pending = false;
     uint8_t c = g_evt_code;
     if (c == 1) {
+      // 串口详单；BLE 在 mute 下只发短行（防大包 Notify 断链）
       hostPrintf("# CONFIRM |rpm|>%.0f & I+1rev seg=%u snap_n=%lu → +REC %lums (backtrack≤%u)\n",
                  RPM_GATE, (unsigned)g_evt_seg, (unsigned long)g_evt_n,
                  (unsigned long)g_rec_duration_ms, (unsigned)BACKTRACK_N);
+      if (bleConnected()) {
+        char s[72];
+        snprintf(s, sizeof(s), "# CONFIRM seg=%u n=%lu\n", (unsigned)g_evt_seg,
+                 (unsigned long)g_evt_n);
+        bleSendLine(s);  // 单行状态，可越过 mute
+      }
       g_noise_why = 0;
     } else if (c == 2) {
       const char* why = "unknown";
@@ -1787,14 +2073,27 @@ void loop() {
       else if (g_noise_why == 5) why = "pool_ovf";
       hostPrintf("# NOISE discard seg=%u why=%s counts=%lu\n", (unsigned)g_evt_seg, why,
                  (unsigned long)g_evt_n);
+      if (bleConnected()) bleSendLine("# NOISE discard\n");
     } else if (c == 3) {
       hostPrintf("# RECORD done n=%lu → ALIVE then SD SAVE (disarmed)\n",
                  (unsigned long)g_evt_n);
-      // 旧 log 路径才 USB 自推；snap 走 SD SAVE
-      if (g_log_n > 0 && g_evt_n == (uint32_t)g_log_n) requestAutoDump(g_evt_seg);
+      if (bleConnected()) {
+        // 短标记：手机专门认 CD15 / RECORD done 开 15s 倒计时
+        char s[96];
+        snprintf(s, sizeof(s), "# RECORD done n=%lu → SD SAVE\n", (unsigned long)g_evt_n);
+        bleSendLine(s);
+        snprintf(s, sizeof(s), "# CD15 n=%lu\n", (unsigned long)g_evt_n);
+        bleSendLine(s);
+      }
+      // 旧 log 路径才自推 LOG DUMP；snap 有 RAM 点数时走 SD SAVE / DUMP BIN BLE，勿发 AUTO DUMP
+      if (snapCount() == 0 && g_log_n > 0 && g_evt_n == (uint32_t)g_log_n) {
+        requestAutoDump(g_evt_seg);
+      }
     } else if (c == 6) {
       hostPrintf("# STAGING |rpm|>%.0f waiting I+1rev ring=%u\n", RPM_GATE,
                  (unsigned)snapRingCount());
+      // 短行通知手机立刻静默 GATT 轮询（PC 无此问题）；勿发长 STAGING 文案
+      if (bleConnected()) bleSendLine("# QUIET\n");
     } else if (c == 5) {
       const char* why = "stop";
       if (g_noise_why == 2) why = "flip";
@@ -1892,12 +2191,31 @@ void loop() {
   char ble_line[128];
   if (bleTakeRxLine(ble_line, sizeof(ble_line))) handleCmd(ble_line);
 
+  // 武装期间不往 BLE 灌 # MON（实时流已分离）；仅串口诊断
+  static uint32_t last_mon_diag_ms = 0;
+  uint32_t now_diag = millis();
+  if (g_armed && !g_dumping && g_phase == PH_IDLE && !snapIsRecording() &&
+      (now_diag - last_mon_diag_ms) >= 1000) {
+    last_mon_diag_ms = now_diag;
+    Snap sdiag = takeSnap();
+    Serial.printf("# MON phase=%s rpm=%.0f snap=%u ring=%u rec=%d idx=%lu\n", phaseName(g_phase),
+                  (double)fabsf(sdiag.rpm), (unsigned)snapCount(), (unsigned)snapRingCount(),
+                  snapIsRecording() ? 1 : 0, (unsigned long)sdiag.index_n);
+  }
+
   static uint32_t last_telem_ms = 0;
   uint32_t now = millis();
-  // 长采中降到 1Hz；CAP DUMP 时完全停遥测
   uint16_t want_hz = bleTelemHz();
   if (capIsDumping()) {
     // 不发 L
+  } else if (snapIsRecording() || g_phase == PH_STAGING || g_phase == PH_RECORD) {
+    // 记录窗口：loop 仍可走 emitTelem→Serial，但 BLE 短帧已在 emitTelem 内关闭
+    // 降到 1Hz 减轻 USB；BLE 侧无包
+    uint32_t period = 1000;
+    if (now - last_telem_ms >= period) {
+      last_telem_ms = now;
+      emitTelem(takeSnap());
+    }
   } else {
     if (capIsRunning()) want_hz = 1;
     uint32_t period = 1000UL / (uint32_t)want_hz;

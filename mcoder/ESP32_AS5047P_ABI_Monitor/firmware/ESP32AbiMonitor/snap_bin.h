@@ -46,6 +46,8 @@ bool snapTakeArchiveEdge();
 bool snapDumpBinary();
 bool snapDumpHex();
 void snapPrintStatus();
+/** 填充一行 # DIAG …（含 snap/ring），便于 BLE */
+void snapDiagLine(char* out, size_t out_sz);
 
 const uint8_t* snapDataBytes();
 size_t snapDataLen();

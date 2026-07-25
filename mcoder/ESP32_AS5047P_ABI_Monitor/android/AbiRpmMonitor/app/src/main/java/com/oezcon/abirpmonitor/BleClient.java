@@ -26,11 +26,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Queue;
 import java.util.UUID;
 
 /**
- * Nordic UART → OEZ-ABI。连接后发 TIME 对时；少发 PING；MTU 协商失败也能发现服务。
+ * Nordic UART → OEZ-ABI。
+ * Android：Dump 期间以 Notify 为主（勿照搬 PC 持续 READ）；
+ * 仅听 {@code BLE PULL READY} 后 SNAP? → DUMP BIN BLE / SD；无 PING/无自动重连。
  */
 public class BleClient {
     public static final UUID NUS_SERVICE =
@@ -66,6 +67,15 @@ public class BleClient {
         void onIndexEnd(int n);
 
         void onInfo(String line);
+
+        /** RAM snap 二进制拉齐（DUMP BIN BLE），已 CRC 校验。 */
+        void onSnapBin(int n, int hz, List<float[]> rows);
+
+        /** DUMP BIN BLE 进度：已收字节 / 期望字节 / 百分比 0~100。 */
+        default void onBinBleProgress(int gotBytes, int expectBytes, int pct) {}
+
+        /** PC 同款拉取提示：0=即将/开始拉取；-1=取消。（不再用 15s 倒数） */
+        default void onPullCountdown(int secLeft) {}
     }
 
     public static class DeviceItem {
@@ -99,7 +109,7 @@ public class BleClient {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Listener listener;
     private final Map<String, DeviceItem> found = new LinkedHashMap<>();
-    private final Queue<Op> opQ = new ArrayDeque<>();
+    private final ArrayDeque<Op> opQ = new ArrayDeque<>();
     private boolean busy;
     private boolean notifyReady;
     private boolean mtuDone;
@@ -114,40 +124,118 @@ public class BleClient {
     private boolean dumping;
     private int dumpAccepted;
     private final java.util.ArrayList<Object[]> dumpBatch = new java.util.ArrayList<>(256);
+    private boolean binBleActive;
+    private final java.io.ByteArrayOutputStream binBleBuf = new java.io.ByteArrayOutputStream(65536);
+    private int binBleExpect;
+    private int binBleChunks;
+    private int binBleLastPct = -1;
+    private long binBleLastUiMs;
+    /** 下一包期望 seq；小于此值视为 Notify+READ 重复包 */
+    private int binBleNextSeq;
+    private String binBleSrc = "RAM";
+    /** 与 PC ble_link last_val 相同：跳过特征值重复读 */
+    private byte[] lastIngestPayload;
     private long lastTelemMs;
     private int telemCount;
-    private long lastPingMs;
+    private long lastPollMs;
+    private long lastStatusMs;
     /** 发给板子的 TIME 锚点（毫秒），用于 unix=0 时本地推算 */
     private long timeAnchorUnixMs;
     private String lastAddress;
-    private int autoReconnectLeft;
     private boolean ackQueued;
+    private int dumpRetryLeft;
+    /** 最近一次 snap 记完时间；此期间禁止发旧 LOG READ */
+    private long snapDoneAtMs;
+    /** 对齐 PC `_awaiting_bindump`：避免重复自动拉 */
+    private boolean awaitingBindump;
+    private boolean pullScheduled;
+    /** 正在等 # SNAP valid= 回复 */
+    private boolean snapQueryPending;
+    /**
+     * 流分离：点了开始监控后停 GATT 轮询读，直到 STOP / 记完 / PULL。
+     * 与固件「武装后停发 BLE 实时转速」对称。
+     */
+    private boolean monitorSession;
+    /** 本进程是否已完成首次连接引导（TIME/RATE/ABI?） */
+    private boolean sessionConfigured;
+    /** 首次连接后允许自动发一次 REC MS */
+    private boolean recMsPendingFirst = true;
+    private final Runnable dumpRetryTask = new Runnable() {
+        @Override
+        public void run() {
+            if (!connected || binBleActive || awaitingBindump) return;
+            if (dumpRetryLeft <= 0) return;
+            dumpRetryLeft--;
+            status("延时重试拉取 RAM… 剩余 " + dumpRetryLeft);
+            dumpBinBle();
+        }
+    };
+    private final Runnable pcPullTask = new Runnable() {
+        @Override
+        public void run() {
+            pullScheduled = false;
+            if (!connected || binBleActive) return;
+            if (awaitingBindump) return;
+            status("PC同款 · SNAP? → DUMP BIN BLE");
+            ui.post(() -> listener.onPullCountdown(0));
+            dumpBinBle();
+        }
+    };
 
+    /**
+     * Android 策略（朋友建议）：空闲可慢速 READ；Dump/BIN 期间默认只用 Notify，
+     * 仅当 500ms 无新包时才补一次 READ（救援）。勿照搬 PC 持续快读。
+     */
+    private long lastBinRxMs;
     private final Runnable tickTask = new Runnable() {
         @Override
         public void run() {
             if (!connected) return;
-            if (dumping) {
-                ui.postDelayed(this, 500);
+            long now = System.currentTimeMillis();
+            // 监控会话中：不轮询读
+            if (monitorSession && !(dumping || binBleActive)) {
+                if (now - lastStatusMs >= 2000L) {
+                    lastStatusMs = now;
+                    status("监控中 · 流已分离（无实时转速，等事件）");
+                }
+                ui.postDelayed(this, 200L);
                 return;
             }
-            long now = System.currentTimeMillis();
-            if (now - lastTelemMs > 800) enqueueRead();
-            // 很少发 PING，且固件 PONG 不再灌 BLE
-            if (now - lastPingMs > 8000) {
-                lastPingMs = now;
-                enqueueWrite("PING");
+            if (dumping || binBleActive) {
+                // Dump：默认不 READ；500ms 无进度才救援读一次
+                if (lastBinRxMs > 0 && (now - lastBinRxMs) >= 500L
+                        && (now - lastPollMs) >= 500L) {
+                    lastPollMs = now;
+                    enqueueRead();
+                    status("BIN 超时救援 READ（仅一次窗口）");
+                }
+                if (now - lastStatusMs >= 1500L) {
+                    lastStatusMs = now;
+                    status(String.format(Locale.US, "拉取中(Notify) · %d/%s B",
+                            binBleBuf.size(),
+                            binBleExpect > 0 ? String.valueOf(binBleExpect) : "?"));
+                }
+                ui.postDelayed(this, 100L);
+                return;
             }
-            String st;
-            if (lastTelemMs == 0) {
-                st = "已连接 · 等待转速遥测…";
-            } else if (now - lastTelemMs > 3000) {
-                st = String.format(Locale.US, "已连接 · 遥测中断(曾%d帧)，重试读…", telemCount);
-            } else {
-                st = String.format(Locale.US, "已连接 · 遥测正常 %d帧", telemCount);
+            // 空闲：慢速 READ 兜底遥测（≥200ms，朋友2建议；勿过密）
+            if (now - lastPollMs >= 200L) {
+                lastPollMs = now;
+                enqueueRead();
             }
-            status(st);
-            ui.postDelayed(this, 350);
+            if (now - lastStatusMs >= 2000L) {
+                lastStatusMs = now;
+                String st;
+                if (lastTelemMs == 0) {
+                    st = "已连接 · 等待遥测…";
+                } else if (now - lastTelemMs > 3000) {
+                    st = String.format(Locale.US, "已连接 · 遥测暂停(曾%d帧)", telemCount);
+                } else {
+                    st = String.format(Locale.US, "已连接 · 遥测正常 %d帧", telemCount);
+                }
+                status(st);
+            }
+            ui.postDelayed(this, 40L);
         }
     };
 
@@ -184,12 +272,37 @@ public class BleClient {
         }
     }
 
+    /** 武装中或正在拉数：UI 应禁用「开始监控」，防止二次武装清 RAM */
+    public boolean isMonitorOrPullBusy() {
+        return monitorSession || dumping || binBleActive || awaitingBindump || pullScheduled;
+    }
+
+    public boolean isMonitorSession() {
+        return monitorSession;
+    }
+
     public boolean hasAdapter() {
         return adapter != null && adapter.isEnabled();
     }
 
     public boolean isConnected() {
         return connected;
+    }
+
+    /** 是否已做过首次连接配置（供 UI 决定是否自动发 REC MS） */
+    public boolean isSessionConfigured() {
+        return sessionConfigured;
+    }
+
+    /** 首次连接前为 false；finishNotifySetup 里首次设 true 之后重连不再自动灌设定 */
+    public boolean shouldAutoSendRecMs() {
+        // finishNotifySetup 在 onConnected(true) 之前把 sessionConfigured 置 true，
+        // 故用「尚未配置」判断会失败。改为：仅当 recMsPendingFirst 时自动发。
+        return recMsPendingFirst;
+    }
+
+    public void clearRecMsPendingFirst() {
+        recMsPendingFirst = false;
     }
 
     @SuppressLint("MissingPermission")
@@ -238,27 +351,33 @@ public class BleClient {
     public void connect(String address) {
         disconnect();
         lastAddress = address;
-        autoReconnectLeft = 2;
         BluetoothDevice d = adapter.getRemoteDevice(address);
         status("连接 " + address + " …");
         lastTelemMs = 0;
         telemCount = 0;
         dumping = false;
+        awaitingBindump = false;
+        pullScheduled = false;
         rxBuf.setLength(0);
         notifyReady = false;
         mtuDone = false;
+        // 对齐 PC：不设 CONNECTION_PRIORITY_HIGH、不自动重连
         gatt = d.connectGatt(appCtx, false, gattCb, BluetoothDevice.TRANSPORT_LE);
     }
 
     @SuppressLint("MissingPermission")
     public void disconnect() {
-        autoReconnectLeft = 0;
         ui.removeCallbacks(tickTask);
         ui.removeCallbacks(busyWatchdog);
         ui.removeCallbacks(mtuFallback);
+        ui.removeCallbacks(dumpRetryTask);
+        ui.removeCallbacks(pcPullTask);
+        cancelPendingPull();
         connected = false;
         notifyReady = false;
         dumping = false;
+        binBleActive = false;
+        awaitingBindump = false;
         rxChar = null;
         txChar = null;
         opQ.clear();
@@ -300,7 +419,8 @@ public class BleClient {
                     || u.startsWith("DUMP ABORT") || u.startsWith("MONITOR")
                     || u.startsWith("TIME") || u.startsWith("ABI")
                     || u.startsWith("LOG DUMP") || u.startsWith("LOG CLEAR")
-                    || u.equals("READ") || u.startsWith("LOG READ"))) {
+                    || u.startsWith("DUMP BIN") || u.startsWith("BIN DUMP") || u.startsWith("BLE BIN")
+                    || u.startsWith("SNAP") || u.equals("READ") || u.startsWith("LOG READ"))) {
                 return;
             }
         }
@@ -308,11 +428,24 @@ public class BleClient {
     }
 
     public void monitorStart() {
-        send("MONITOR START");
+        // 对齐 PC _on_monitor_start：先 TIME，40ms 后 MONITOR START；不发 DIAG
+        awaitingBindump = false;
+        pullScheduled = false;
+        monitorSession = true;
+        ui.removeCallbacks(pcPullTask);
+        cancelPendingPull();
+        timeAnchorUnixMs = System.currentTimeMillis();
+        enqueueWrite("TIME " + timeAnchorUnixMs);
+        ui.postDelayed(() -> {
+            if (connected) enqueueWrite("MONITOR START");
+        }, 40);
+        status("已武装 · BLE 实时转速关闭（流分离）");
     }
 
     public void monitorStop() {
+        monitorSession = false;
         send("MONITOR STOP");
+        status("已停止 · 恢复实时转速");
     }
 
     public void logClear() {
@@ -323,13 +456,84 @@ public class BleClient {
         send("LOG DUMP");
     }
 
+    /** SNAP? → 看 valid；valid=0 则 DUMP BIN BLE SD，否则 DUMP BIN BLE */
+    public void dumpBinBle() {
+        if (!connected) return;
+        awaitingBindump = true;
+        snapQueryPending = true;
+        dumpRetryLeft = 5;
+        snapDoneAtMs = System.currentTimeMillis();
+        enqueueWrite("SNAP?");
+        ui.postDelayed(() -> {
+            if (!connected || binBleActive || !snapQueryPending) return;
+            snapQueryPending = false;
+            status("SNAP? 超时 · 仍发 DUMP BIN BLE");
+            enqueueWrite("DUMP BIN BLE");
+        }, 800);
+    }
+
+    /** 强制从 SD 最新 snap_*.bin 拉（先读卡进板再 BLE） */
+    public void dumpBinBleSd() {
+        if (!connected) return;
+        awaitingBindump = true;
+        dumpRetryLeft = 3;
+        enqueueWrite("DUMP BIN BLE SD");
+    }
+
+    private void cancelPendingPull() {
+        pullScheduled = false;
+        ui.removeCallbacks(pcPullTask);
+        ui.removeCallbacks(dumpRetryTask);
+        ui.post(() -> listener.onPullCountdown(-1));
+    }
+
+    /**
+     * 对齐 PC：仅 {@code BLE PULL READY} 后 200ms 自动拉。
+     * CD15 / RECORD done 只提示，不拉（等板子 SD SAVE 完成）。
+     */
+    private void schedulePcStylePull(String why) {
+        if (!connected || binBleActive || awaitingBindump) return;
+        if (pullScheduled) return;
+        pullScheduled = true;
+        monitorSession = false; // 记完：允许再 poll；固件也会恢复 L
+        snapDoneAtMs = System.currentTimeMillis();
+        status("BLE PULL READY · 200ms 后拉取（同 PC / " + why + "）");
+        ui.post(() -> listener.onPullCountdown(0));
+        ui.removeCallbacks(pcPullTask);
+        ui.postDelayed(pcPullTask, 200L);
+    }
+
+    private void scheduleDumpRetry(long delayMs) {
+        if (dumpRetryLeft <= 0) dumpRetryLeft = 4;
+        awaitingBindump = false;
+        ui.removeCallbacks(dumpRetryTask);
+        ui.postDelayed(dumpRetryTask, Math.max(delayMs, 1200L));
+    }
+
+    private boolean inSnapSettleWindow() {
+        return snapDoneAtMs > 0 && (System.currentTimeMillis() - snapDoneAtMs) < 20000L;
+    }
+
     private void status(String msg) {
         ui.post(() -> listener.onStatus(msg));
     }
 
+    private void postBinProgress(int got, int expect, int pct) {
+        final int g = Math.max(0, got);
+        final int e = Math.max(0, expect);
+        final int p = Math.max(0, Math.min(100, pct));
+        ui.post(() -> listener.onBinBleProgress(g, e, p));
+    }
+
     private void enqueueWrite(String line) {
         String s = line.endsWith("\n") ? line : line + "\n";
-        opQ.offer(new Op(OpType.WRITE, s.getBytes(StandardCharsets.UTF_8)));
+        Op op = new Op(OpType.WRITE, s.getBytes(StandardCharsets.UTF_8));
+        // 对齐 PC：DUMP ACK 插队，优先于其它命令
+        if (s.startsWith("DUMP ACK")) {
+            opQ.addFirst(op);
+        } else {
+            opQ.offer(op);
+        }
         pump();
     }
 
@@ -408,8 +612,10 @@ public class BleClient {
 
     private void handleLine(String line) {
         // 实时遥测到来 = 退出回传静默（修复卡住后不显示转速）
+        // 短帧(BLE): L,rpm,dir,armed,phase,remain,log_n
+        // 长帧(USB): L,t,rpm,dir,armed,log_n,drop,hz,...,phase,...
         if (line.startsWith("L,")) {
-            if (dumping) {
+            if (dumping && !binBleActive) {
                 dumping = false;
                 ackQueued = false;
                 status("遥测已恢复");
@@ -417,29 +623,68 @@ public class BleClient {
             lastTelemMs = System.currentTimeMillis();
             telemCount++;
             String[] p = line.split(",");
-            if (p.length < 8) return;
+            if (p.length < 3) return;
             try {
-                float rpm = Float.parseFloat(p[2]);
-                int dir = (int) Float.parseFloat(p[3]);
-                boolean armed = ((int) Float.parseFloat(p[4])) != 0;
-                int logN = (int) Float.parseFloat(p[5]);
-                int drop = (int) Float.parseFloat(p[6]);
-                float hz = Float.parseFloat(p[7]);
-                int phase = p.length > 10 ? (int) Float.parseFloat(p[10]) : 0;
-                float stageRevs = p.length > 12 ? Float.parseFloat(p[12]) : 0f;
-                int remain = p.length > 13 ? (int) Float.parseFloat(p[13]) : 0;
-                int segs = p.length > 14 ? (int) Float.parseFloat(p[14]) : 0;
-                float revsAbi = p.length > 15 ? Float.parseFloat(p[15]) : 0f;
-                float revsAbs = p.length > 16 ? Float.parseFloat(p[16]) : 0f;
-                long indexN = p.length > 17 ? (long) Double.parseDouble(p[17]) : 0L;
-                long indexSigned = p.length > 18 ? (long) Double.parseDouble(p[18]) : 0L;
-                long tRel = p.length > 19 ? (long) Double.parseDouble(p[19]) : 0L;
-                long unix = p.length > 20 ? (long) Double.parseDouble(p[20]) : 0L;
+                final float rpm;
+                final int dir;
+                final boolean armed;
+                final int logN;
+                final int drop;
+                final float hz;
+                final int phase;
+                final float stageRevs;
+                final int remain;
+                final int segs;
+                final float revsAbi;
+                final float revsAbs;
+                final long indexN;
+                final long indexSigned;
+                long tRel;
+                long unix;
+                // BLE 短帧：第 2 字段是带小数点的 rpm（无 t_ms）
+                boolean shortBle = p.length <= 8 && p[1].indexOf('.') >= 0;
+                if (shortBle) {
+                    rpm = Float.parseFloat(p[1]);
+                    dir = p.length > 2 ? (int) Float.parseFloat(p[2]) : 0;
+                    armed = p.length > 3 && ((int) Float.parseFloat(p[3])) != 0;
+                    phase = p.length > 4 ? (int) Float.parseFloat(p[4]) : 0;
+                    remain = p.length > 5 ? (int) Float.parseFloat(p[5]) : 0;
+                    logN = p.length > 6 ? (int) Float.parseFloat(p[6]) : 0;
+                    drop = 0;
+                    hz = 0f;
+                    stageRevs = 0f;
+                    segs = 0;
+                    revsAbi = 0f;
+                    revsAbs = 0f;
+                    indexN = 0L;
+                    indexSigned = 0L;
+                    tRel = 0L;
+                    unix = 0L;
+                } else {
+                    if (p.length < 8) return;
+                    rpm = Float.parseFloat(p[2]);
+                    dir = (int) Float.parseFloat(p[3]);
+                    armed = ((int) Float.parseFloat(p[4])) != 0;
+                    logN = (int) Float.parseFloat(p[5]);
+                    drop = (int) Float.parseFloat(p[6]);
+                    hz = Float.parseFloat(p[7]);
+                    phase = p.length > 10 ? (int) Float.parseFloat(p[10]) : 0;
+                    stageRevs = p.length > 12 ? Float.parseFloat(p[12]) : 0f;
+                    remain = p.length > 13 ? (int) Float.parseFloat(p[13]) : 0;
+                    segs = p.length > 14 ? (int) Float.parseFloat(p[14]) : 0;
+                    revsAbi = p.length > 15 ? Float.parseFloat(p[15]) : 0f;
+                    revsAbs = p.length > 16 ? Float.parseFloat(p[16]) : 0f;
+                    indexN = p.length > 17 ? (long) Double.parseDouble(p[17]) : 0L;
+                    indexSigned = p.length > 18 ? (long) Double.parseDouble(p[18]) : 0L;
+                    tRel = p.length > 19 ? (long) Double.parseDouble(p[19]) : 0L;
+                    unix = p.length > 20 ? (long) Double.parseDouble(p[20]) : 0L;
+                }
                 if (unix <= 0 && timeAnchorUnixMs > 0 && tRel >= 0) {
                     unix = timeAnchorUnixMs + tRel;
                 }
                 long finalUnix = unix;
                 long finalTRel = tRel;
+                // 遥测只刷新 UI；是否记录 / 何时记完一律由 ESP32 决定，手机不根据 phase 开倒计时
                 ui.post(() -> listener.onLive(rpm, dir, armed, phase, logN, drop, hz,
                         stageRevs, remain, segs, revsAbi, revsAbs, indexN, indexSigned,
                         finalTRel, finalUnix));
@@ -456,16 +701,203 @@ public class BleClient {
             status("板子准备回传…");
             return;
         }
-        if (line.startsWith("# RECORD done") || line.startsWith("# RECORD_DONE")) {
+        // —— DUMP BIN BLE（RAM snap hex）——
+        if (line.startsWith("# SNAP ") && (line.contains("valid=") || line.contains("src="))) {
+            // # SNAP src=RAM valid=1 n=… bytes=…
+            snapQueryPending = false;
             ui.post(() -> listener.onInfo(line));
-            status("记录完成…");
-            // 对齐 00ACC：RECORD_DONE 后 300ms 发 READ
-            ui.postDelayed(() -> {
-                if (connected) send("READ");
-            }, 300);
+            boolean valid = line.contains("valid=1");
+            int n = 0;
+            for (String tok : line.replace("#", " ").trim().split("\\s+")) {
+                if (tok.startsWith("n=")) {
+                    try {
+                        n = Integer.parseInt(tok.substring(2));
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+            }
+            if (!connected) return;
+            awaitingBindump = true;
+            if (valid && n > 0) {
+                status("SNAP valid · DUMP BIN BLE (RAM)");
+                enqueueWrite("DUMP BIN BLE");
+            } else {
+                status("SNAP empty · DUMP BIN BLE SD");
+                enqueueWrite("DUMP BIN BLE SD");
+            }
+            return;
+        }
+        if (line.startsWith("# MONITOR START count=")) {
+            ui.post(() -> listener.onInfo(line));
+            status(line.replace("# ", ""));
+            return;
+        }
+        if (line.startsWith("# BIN BLE BEGIN")) {
+            binBleActive = true;
+            dumping = true;
+            awaitingBindump = true;
+            binBleBuf.reset();
+            binBleExpect = 0;
+            binBleChunks = 0;
+            binBleNextSeq = 0;
+            binBleLastPct = -1;
+            binBleLastUiMs = 0L;
+            lastBinRxMs = System.currentTimeMillis();
+            binBleSrc = "RAM";
+            ackQueued = false;
+            for (String tok : line.replace("#", " ").trim().split("\\s+")) {
+                if (tok.startsWith("bytes=")) {
+                    try {
+                        binBleExpect = Integer.parseInt(tok.substring(6));
+                    } catch (NumberFormatException ignored) {
+                    }
+                } else if (tok.startsWith("src=")) {
+                    binBleSrc = tok.substring(4);
+                }
+            }
+            ui.post(() -> listener.onInfo(line));
+            status("蓝牙拉 " + binBleSrc + "（Notify）… 0/"
+                    + (binBleExpect > 0 ? binBleExpect : "?"));
+            postBinProgress(0, binBleExpect, 0);
+            queueDumpAck();
+            return;
+        }
+        if (binBleActive && line.startsWith("B,")) {
+            lastBinRxMs = System.currentTimeMillis();
+            String[] parts = line.split(",", 3);
+            if (parts.length >= 3) {
+                int seq = -1;
+                try {
+                    seq = Integer.parseInt(parts[1].trim());
+                } catch (NumberFormatException ignored) {
+                }
+                // Notify + GATT READ 常把同一 B,seq 送两次 → 字节翻倍 → CRC 失败
+                if (seq >= 0 && seq < binBleNextSeq) {
+                    queueDumpAck();
+                    return;
+                }
+                if (seq >= 0) binBleNextSeq = seq + 1;
+                boolean room = binBleExpect <= 0 || binBleBuf.size() < binBleExpect;
+                if (room) {
+                    try {
+                        String hx = parts[2].trim();
+                        int len = hx.length();
+                        if ((len & 1) == 0 && len > 0) {
+                            int need = len / 2;
+                            if (binBleExpect > 0) {
+                                int left = binBleExpect - binBleBuf.size();
+                                if (need > left) need = left;
+                            }
+                            if (need > 0) {
+                                byte[] chunk = new byte[need];
+                                for (int i = 0; i < need; i++) {
+                                    chunk[i] = (byte) Integer.parseInt(
+                                            hx.substring(i * 2, i * 2 + 2), 16);
+                                }
+                                binBleBuf.write(chunk);
+                                binBleChunks++;
+                            }
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+                queueDumpAck();
+                int got = binBleBuf.size();
+                int pct;
+                if (binBleExpect > 0) {
+                    pct = Math.min(99, got * 100 / binBleExpect);
+                } else {
+                    pct = Math.min(99, Math.max(1, got / 512));
+                }
+                long now = System.currentTimeMillis();
+                if (pct != binBleLastPct || (now - binBleLastUiMs) >= 120L || (binBleChunks % 10) == 0) {
+                    binBleLastPct = pct;
+                    binBleLastUiMs = now;
+                    postBinProgress(got, binBleExpect, pct);
+                    status("蓝牙 BIN(" + binBleSrc + ") " + got + "/"
+                            + (binBleExpect > 0 ? binBleExpect : "?") + " (" + pct + "%)");
+                }
+            }
+            return;
+        }
+        if (line.startsWith("# BIN BLE END")
+                || (binBleActive && line.startsWith("# BIN BLE"))) {
+            if (binBleActive) {
+                byte[] raw = binBleBuf.toByteArray();
+                binBleActive = false;
+                dumping = false;
+                ackQueued = false;
+                queueDumpAck();
+                // 若仍有重复残留，按 BEGIN 声明长度截断
+                if (binBleExpect > 0 && raw.length > binBleExpect) {
+                    final int before = raw.length;
+                    final int after = binBleExpect;
+                    ui.post(() -> listener.onInfo("# BIN trim " + before + "→" + after
+                            + " (dedupe excess)"));
+                    raw = java.util.Arrays.copyOf(raw, binBleExpect);
+                }
+                final byte[] parsed = raw;
+                final int exp = binBleExpect > 0 ? binBleExpect : parsed.length;
+                postBinProgress(parsed.length, exp, 100);
+                final String src = binBleSrc;
+                try {
+                    SnapBinParser.Result r = SnapBinParser.parse(parsed);
+                    awaitingBindump = false;
+                    ui.post(() -> listener.onSnapBin(r.n, r.hz, r.rows));
+                    status("BIN 完成 ✓ src=" + src + " n=" + r.n + " hz=" + r.hz);
+                } catch (IllegalArgumentException e) {
+                    awaitingBindump = false;
+                    final String err = e.getMessage();
+                    final int gotLen = parsed.length;
+                    ui.post(() -> listener.onInfo("# BIN parse fail: " + err
+                            + " got=" + gotLen + " exp=" + exp + " src=" + src));
+                    status("BIN 校验失败（已收" + gotLen + "/" + exp + "）");
+                }
+            }
+            ui.post(() -> listener.onInfo(line));
+            return;
+        }
+        if (line.startsWith("# MONITOR armed") || line.startsWith("# MONITOR disarm")) {
+            ui.post(() -> listener.onInfo(line));
+            if (line.contains("armed")) {
+                monitorSession = true;
+                status("板子已武装 · 无实时转速（正常）");
+            } else {
+                monitorSession = false;
+            }
+            return;
+        }
+        if (line.startsWith("# CONFIRM") || line.startsWith("# QUIET")
+                || line.startsWith("# STAGING")) {
+            monitorSession = true;
+            ui.post(() -> listener.onInfo(line));
+            status(line.startsWith("# CONFIRM") ? "已触发记录（无实时转速=正常）" : "探测中（流分离）");
+            return;
+        }
+        if (line.startsWith("# NOISE discard")) {
+            ui.post(() -> listener.onInfo(line));
+            return;
+        }
+        if (line.startsWith("# CD15") || line.startsWith("# RECORD done")
+                || line.startsWith("# RECORD_DONE")) {
+            snapDoneAtMs = System.currentTimeMillis();
+            monitorSession = false;
+            ui.post(() -> listener.onInfo(line));
+            status("板子记完 · 等 SD SAVE → BLE PULL READY");
+            return;
+        }
+        if (line.startsWith("# BLE PULL READY")) {
+            ui.post(() -> listener.onInfo(line));
+            schedulePcStylePull("PULL_READY");
             return;
         }
         if (line.startsWith("# AUTO DUMP READY") || line.startsWith("# DATA_START")) {
+            // snap 记完后的 15s 内忽略旧 LOG 自动拉，避免 READ 冲 BLE
+            if (inSnapSettleWindow() && line.startsWith("# AUTO DUMP READY")) {
+                ui.post(() -> listener.onInfo("# skip AUTO DUMP (snap settle)"));
+                status("跳过旧 LOG 自动拉（正在等 RAM）");
+                return;
+            }
             dumping = line.startsWith("# DATA_START") || dumping;
             ackQueued = false;
             if (line.startsWith("# DATA_START")) {
@@ -478,7 +910,7 @@ public class BleClient {
             status(line.startsWith("# DATA_START") ? "正在慢速分包接收…" : "准备慢速拉取…");
             if (line.startsWith("# AUTO DUMP READY")) {
                 ui.postDelayed(() -> {
-                    if (connected) send("READ");
+                    if (connected && !inSnapSettleWindow()) send("READ");
                 }, 350);
             }
             return;
@@ -604,6 +1036,38 @@ public class BleClient {
             }
             return;
         }
+        if (line.startsWith("# DUMP BIN BLE fail") || line.startsWith("# DUMP BIN BLE wait")
+                || line.startsWith("# DUMP BIN BLE busy")
+                || line.startsWith("# DUMP BIN BLE SD fail")) {
+            binBleActive = false;
+            dumping = false;
+            awaitingBindump = false;
+            ackQueued = false;
+            ui.post(() -> listener.onInfo(line));
+            status(line.replace("# ", ""));
+            if (line.contains("wait") || line.contains("busy")) {
+                scheduleDumpRetry(800);
+            }
+            return;
+        }
+        // 固件提示正在改拉 SD（随后会有 BIN BLE BEGIN src=SD）
+        if (line.startsWith("# DUMP BIN BLE: empty") || line.startsWith("# DUMP BIN BLE SD file=")) {
+            ui.post(() -> listener.onInfo(line));
+            status(line.contains("file=") ? "正在从 SD 拉…" : "RAM 空 · 固件改拉 SD…");
+            return;
+        }
+        if (line.startsWith("# SNAP DONE")) {
+            snapDoneAtMs = System.currentTimeMillis();
+            ui.post(() -> listener.onInfo(line));
+            status("SNAP DONE · 等 ALIVE/SD/PULL READY（同 PC）");
+            return;
+        }
+        if (line.startsWith("# SNAP DUMP READY")) {
+            snapDoneAtMs = System.currentTimeMillis();
+            ui.post(() -> listener.onInfo(line));
+            status("RAM 就绪 · 板子自动 SD SAVE…");
+            return;
+        }
         if (line.startsWith("#")) {
             ui.post(() -> listener.onInfo(line));
         }
@@ -611,6 +1075,13 @@ public class BleClient {
 
     private void ingest(byte[] data) {
         if (data == null || data.length == 0) return;
+        // 对齐 PC：GATT READ 常返回「上一次 Notify 的同一特征值」，必须丢弃，否则 B 包翻倍
+        if (lastIngestPayload != null
+                && lastIngestPayload.length == data.length
+                && java.util.Arrays.equals(lastIngestPayload, data)) {
+            return;
+        }
+        lastIngestPayload = java.util.Arrays.copyOf(data, data.length);
         // 先拼上、立刻拆完整行；禁止先截断（旧逻辑会丢掉尚未解析的 D 行）
         rxBuf.append(new String(data, StandardCharsets.UTF_8));
         int nl;
@@ -638,21 +1109,38 @@ public class BleClient {
         notifyReady = true;
         telemCount = 0;
         lastTelemMs = 0;
+        lastPollMs = 0;
         ui.post(() -> {
             listener.onConnected(true);
-            status("已连接，发送对时…");
+            status("已连接 · PC同款引导…");
         });
-        // 手机墙上时钟 → ESP32 会话锚点
+        // 对齐 PC ble_link：notify 后 sleep 250ms，再 TIME / BLE RATE / ABI?（间隔 80ms）
         timeAnchorUnixMs = System.currentTimeMillis();
         dumping = false;
+        binBleActive = false;
+        awaitingBindump = false;
         ackQueued = false;
-        enqueueWrite("TIME " + timeAnchorUnixMs);
-        enqueueWrite("BLE RATE 10");
-        enqueueWrite("ABI?");
-        // REC MS 由 MainActivity 在连接成功后按 SeekBar 下发
+        final long t = timeAnchorUnixMs;
+        ui.postDelayed(() -> {
+            if (!connected) return;
+            enqueueWrite("TIME " + t);
+        }, 250);
+        ui.postDelayed(() -> {
+            if (!connected) return;
+            enqueueWrite("BLE RATE 10");
+        }, 330);
+        ui.postDelayed(() -> {
+            if (!connected) return;
+            enqueueWrite("ABI?");
+            sessionConfigured = true;
+        }, 410);
+        // REC MS 仍由 MainActivity @600ms 发（PC @500ms）
+        if (!sessionConfigured) {
+            recMsPendingFirst = true;
+        }
         ui.removeCallbacks(tickTask);
         ui.removeCallbacks(busyWatchdog);
-        ui.post(tickTask);
+        ui.postDelayed(tickTask, 250);
         ui.post(busyWatchdog);
     }
 
@@ -661,14 +1149,11 @@ public class BleClient {
         @Override
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                connected = true; // 允许后续 pump
+                connected = true;
                 dumping = false;
                 status("已连接，协商 MTU…");
                 mtuDone = false;
-                try {
-                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
-                } catch (Exception ignored) {
-                }
+                // 对齐 PC：不请求 CONNECTION_PRIORITY_HIGH
                 boolean req = g.requestMtu(247);
                 ui.postDelayed(mtuFallback, 800);
                 if (!req) {
@@ -676,41 +1161,26 @@ public class BleClient {
                     g.discoverServices();
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                boolean wasDumping = dumping;
+                boolean wasDumping = dumping || binBleActive;
                 connected = false;
                 notifyReady = false;
                 dumping = false;
+                binBleActive = false;
+                awaitingBindump = false;
+                pullScheduled = false;
+                dumpRetryLeft = 0;
                 ui.removeCallbacks(tickTask);
                 ui.removeCallbacks(busyWatchdog);
                 ui.removeCallbacks(mtuFallback);
+                ui.removeCallbacks(dumpRetryTask);
+                ui.removeCallbacks(pcPullTask);
                 final String why = gattStatusText(status)
-                        + (wasDumping ? " · 断在回传中" : " · 非回传时段");
+                        + (wasDumping ? " · 断在回传中" : " · 记录/空闲时段");
                 ui.post(() -> {
                     listener.onConnected(false);
-                    status("已断开（" + why + "）");
+                    // 对齐 PC：不自动重连，需手动点连接
+                    status("已断开（" + why + "）· 请手动重连（同 PC）");
                 });
-                // 回传冲垮时自动重连一两次
-                if (autoReconnectLeft > 0 && lastAddress != null
-                        && (wasDumping || status == 8 || status == 133)) {
-                    autoReconnectLeft--;
-                    final String addr = lastAddress;
-                    ui.postDelayed(() -> {
-                        status("自动重连剩余 " + autoReconnectLeft + " …");
-                        BluetoothDevice d = adapter.getRemoteDevice(addr);
-                        try {
-                            if (gatt != null) {
-                                try {
-                                    gatt.close();
-                                } catch (Exception ignored) {
-                                }
-                                gatt = null;
-                            }
-                            gatt = d.connectGatt(appCtx, false, gattCb, BluetoothDevice.TRANSPORT_LE);
-                        } catch (Exception e) {
-                            status("自动重连失败: " + e.getMessage());
-                        }
-                    }, 900);
-                }
             }
         }
 
@@ -759,19 +1229,24 @@ public class BleClient {
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic ch) {
-            ingest(ch.getValue());
+            // 立刻拷贝：特征值缓冲会被后续 notify 覆盖（朋友2）
+            byte[] v = ch.getValue();
+            if (v != null) ingest(java.util.Arrays.copyOf(v, v.length));
         }
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic ch,
                                             byte[] value) {
-            ingest(value);
+            if (value != null) ingest(java.util.Arrays.copyOf(value, value.length));
         }
 
         @Override
         public void onCharacteristicRead(BluetoothGatt g, BluetoothGattCharacteristic ch,
                                          int status) {
-            if (status == BluetoothGatt.GATT_SUCCESS) ingest(ch.getValue());
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                byte[] v = ch.getValue();
+                if (v != null) ingest(java.util.Arrays.copyOf(v, v.length));
+            }
             busy = false;
             pump();
         }
@@ -779,7 +1254,9 @@ public class BleClient {
         @Override
         public void onCharacteristicRead(BluetoothGatt g, BluetoothGattCharacteristic ch,
                                          byte[] value, int status) {
-            if (status == BluetoothGatt.GATT_SUCCESS) ingest(value);
+            if (status == BluetoothGatt.GATT_SUCCESS && value != null) {
+                ingest(java.util.Arrays.copyOf(value, value.length));
+            }
             busy = false;
             pump();
         }

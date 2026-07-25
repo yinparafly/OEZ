@@ -67,16 +67,16 @@
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
+            android:layout_marginTop="16dp"
             android:background="@color/panel"
             android:gravity="center"
             android:orientation="vertical"
-            android:padding="24dp">
+            android:padding="20dp">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="当前转速（实时，与是否记录无关）"
+                android:text="当前转速（实时）"
                 android:textColor="@color/muted"
                 android:textSize="14sp" />
 
@@ -156,6 +156,155 @@
                 android:textColor="@color/muted"
                 android:textSize="13sp" />
         </LinearLayout>
+
+        <!-- 主操作：放在首屏，无需下滚 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnMonStart"
+                android:layout_width="0dp"
+                android:layout_height="56dp"
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1"
+                android:text="开始监控"
+                android:textColor="@color/bg"
+                android:textSize="16sp"
+                app:backgroundTint="@color/accent" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnMonStop"
+                android:layout_width="0dp"
+                android:layout_height="56dp"
+                android:layout_weight="1"
+                android:text="停止监控"
+                android:textColor="@color/btn_on"
+                android:textSize="16sp"
+                app:backgroundTint="@color/danger" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="确认后记录时长（0.5~3.0 秒）"
+            android:textColor="@color/muted"
+            android:textSize="13sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <SeekBar
+                android:id="@+id/seekRecMs"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="25"
+                android:progress="5" />
+
+            <TextView
+                android:id="@+id/recMsLabel"
+                android:layout_width="64dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:text="1.0 s"
+                android:textColor="@color/text"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnDump"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1"
+                android:text="拉取(RAM/SD)"
+                android:textColor="@color/text"
+                app:strokeColor="@color/muted" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnDiag"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1"
+                android:text="诊断"
+                android:textColor="@color/text"
+                app:strokeColor="@color/muted" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnClear"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:text="清空板内"
+                android:textColor="@color/text"
+                app:strokeColor="@color/muted" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnShare"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1"
+                android:text="发送数据"
+                android:textColor="@color/text"
+                app:strokeColor="@color/muted" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnOpenFolder"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:text="打开文件夹"
+                android:textColor="@color/text"
+                app:strokeColor="@color/muted" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/dumpProgText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text=""
+            android:textColor="@color/accent_bright"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <ProgressBar
+            android:id="@+id/dumpProgressBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="10dp"
+            android:layout_marginTop="6dp"
+            android:max="100"
+            android:progress="0"
+            android:visibility="gone" />
 
         <TextView
             android:layout_width="match_parent"
@@ -325,109 +474,10 @@
             android:textSize="13sp" />
 
         <TextView
-            android:id="@+id/dumpProgText"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text=""
-            android:textColor="@color/accent_bright"
-            android:textSize="14sp"
-            android:textStyle="bold" />
-
-        <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="确认后记录时长（0.5~3.0 秒）"
-            android:textColor="@color/muted"
-            android:textSize="13sp" />
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
-
-            <SeekBar
-                android:id="@+id/seekRecMs"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:max="25"
-                android:progress="5" />
-
-            <TextView
-                android:id="@+id/recMsLabel"
-                android:layout_width="64dp"
-                android:layout_height="wrap_content"
-                android:gravity="end"
-                android:text="1.0 s"
-                android:textColor="@color/text"
-                android:textSize="14sp" />
-        </LinearLayout>
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:orientation="horizontal">
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnMonStart"
-                android:layout_width="0dp"
-                android:layout_height="56dp"
-                android:layout_marginEnd="8dp"
-                android:layout_weight="1"
-                android:text="开始监控"
-                android:textColor="@color/bg"
-                android:textSize="16sp"
-                app:backgroundTint="@color/accent" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnMonStop"
-                android:layout_width="0dp"
-                android:layout_height="56dp"
-                android:layout_weight="1"
-                android:text="停止监控"
-                android:textColor="@color/btn_on"
-                android:textSize="16sp"
-                app:backgroundTint="@color/danger" />
-        </LinearLayout>
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:orientation="horizontal">
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnDump"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_marginEnd="8dp"
-                android:layout_weight="1"
-                android:text="拉取回放"
-                android:textColor="@color/text"
-                app:strokeColor="@color/muted" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnClear"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="清空板内"
-                android:textColor="@color/text"
-                app:strokeColor="@color/muted" />
-        </LinearLayout>
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="曲线段：双指缩放 / 拖动平移 / 双击全段。可设 t0~t1（如 0~0.3s）拉长时间轴。"
+            android:text="流程：连接 → 开始监控 → 加油 → 记满后点拉取(RAM空则自动SD)。长按拉取=强制SD。"
             android:textColor="@color/muted"
             android:textSize="12sp" />
     </LinearLayout>

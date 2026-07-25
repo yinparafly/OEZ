@@ -2,7 +2,9 @@
 
 #include <Arduino.h>
 #include <string.h>
+#include <stdio.h>
 
+#include "ble_nus.h"
 #include "esp_heap_caps.h"
 
 static const uint32_t SNAP_MAGIC = 0xAB1C0001UL;
@@ -42,6 +44,8 @@ static uint8_t g_alive_i = 0;
 static uint32_t g_alive_next_ms = 0;
 static bool g_dump_ready = true;
 static volatile bool g_archive_edge = false;
+/** false=RAM 有有效数据时禁止覆盖；仅 MONITOR START 置 true */
+static bool g_snap_allow_overwrite = true;
 
 static void pushPoint(SnapPoint* dst, size_t* n, size_t cap, int64_t* last_c, bool* base_ok,
                       uint32_t* t0_us, int64_t counts, uint32_t index_n, uint32_t now_us,
@@ -90,7 +94,7 @@ bool snapAlloc() {
     g_ring = (SnapPoint*)heap_caps_malloc(RING_CAP * sizeof(SnapPoint), MALLOC_CAP_INTERNAL);
     if (!g_ring) g_ring = (SnapPoint*)malloc(RING_CAP * sizeof(SnapPoint));
   }
-  g_snap_n = 0;
+  // 注意：不要在此清 g_snap_n —— 否则 MONITOR 再武装会误清空已记 RAM
   return g_snap != nullptr && g_ring != nullptr;
 }
 
@@ -120,8 +124,10 @@ bool snapArmBegin() {
   g_ring_w = 0;
   g_ring_n = 0;
   g_ring_base_ok = false;
+  // 仅 MONITOR START（经此函数）清空上一拍 RAM；其它路径不得抹掉
   g_snap_n = 0;
   g_dump_ready = false;
+  g_snap_allow_overwrite = true;
   g_alive_running = false;
   g_snap_done_edge = false;
   return true;
@@ -134,6 +140,8 @@ bool snapIsArmed() { return g_armed_ring; }
 bool snapRecStart(uint32_t duration_ms, uint32_t sample_hz) {
   if (!snapAlloc()) return false;
   if (g_snap_rec) return false;
+  // 已有有效 RAM 且未再经 MONITOR START 授权 → 拒绝覆盖
+  if (g_snap_n > 0 && !g_snap_allow_overwrite) return false;
   if (duration_ms < 100) duration_ms = 100;
   if (duration_ms > 3000) duration_ms = 3000;
   if (sample_hz < 500) sample_hz = 500;
@@ -146,6 +154,7 @@ bool snapRecStart(uint32_t duration_ms, uint32_t sample_hz) {
   g_snap_base_ok = false;
   g_alive_running = false;
   g_dump_ready = false;
+  g_snap_allow_overwrite = false;
   g_snap_rec = true;
   return true;
 }
@@ -159,6 +168,14 @@ bool snapTriggerFromRing(uint16_t backtrack_n, uint32_t duration_ms) {
 
   size_t n_bt = g_ring_n;
   if (n_bt > backtrack_n) n_bt = backtrack_n;
+
+  // 空环缓触发会把已有 RAM 抹成 0 — 拒绝（手机掉线重连误触发时尤其危险）
+  if (n_bt == 0) {
+    return false;
+  }
+  if (g_snap_n > 0 && !g_snap_allow_overwrite) {
+    return false;
+  }
 
   g_snap_n = 0;
   if (n_bt > 0) {
@@ -179,6 +196,7 @@ bool snapTriggerFromRing(uint16_t backtrack_n, uint32_t duration_ms) {
   g_snap_done_edge = false;
   g_dump_ready = false;
   g_alive_running = false;
+  g_snap_allow_overwrite = false;  // 本拍写入中/写完后禁止再覆盖，除非再 MONITOR START
   g_snap_rec = true;
 
   // 回溯段 t_us 与后续段衔接：正式段从 backtrack 末尾时间接着写
@@ -262,6 +280,12 @@ void snapPollDone() {
     Serial.printf("# SNAP DONE n=%u hz=%lu bytes=%u — RAM full; ALIVE then SD archive\n",
                   (unsigned)g_snap_n, (unsigned long)g_snap_hz,
                   (unsigned)(g_snap_n * sizeof(SnapPoint)));
+    // 短状态也推 BLE，手机可显示「记满，等 ALIVE」
+    if (bleConnected()) {
+      char s[72];
+      snprintf(s, sizeof(s), "# SNAP DONE n=%u\n", (unsigned)g_snap_n);
+      bleSendLine(s);
+    }
     g_dump_ready = false;
     g_alive_running = true;
     g_alive_i = 0;
@@ -273,12 +297,22 @@ void snapPollDone() {
   if ((int32_t)(now - g_alive_next_ms) < 0) return;
   g_alive_i++;
   Serial.printf("# ALIVE %u n=%u\n", (unsigned)g_alive_i, (unsigned)g_snap_n);
+  if (bleConnected()) {
+    char s[48];
+    snprintf(s, sizeof(s), "# ALIVE %u n=%u\n", (unsigned)g_alive_i, (unsigned)g_snap_n);
+    bleSendLine(s);
+  }
   if (g_alive_i >= 2) {
     g_alive_running = false;
     g_dump_ready = true;
     g_archive_edge = true;
     Serial.printf("# SNAP DUMP READY n=%u — auto SD SAVE (RAM→SD); optional DUMP BIN\n",
                   (unsigned)g_snap_n);
+    if (bleConnected()) {
+      char s[64];
+      snprintf(s, sizeof(s), "# SNAP DUMP READY n=%u\n", (unsigned)g_snap_n);
+      bleSendLine(s);
+    }
   } else {
     g_alive_next_ms = now + 1000;
   }
@@ -295,6 +329,15 @@ void snapPrintStatus() {
                 (unsigned)g_snap_n, (unsigned)g_ring_n, (unsigned long)g_snap_hz,
                 snapDumpReady() ? 1 : 0, g_snap_rec ? 1 : 0, g_armed_ring ? 1 : 0,
                 g_alive_running ? 1 : 0, (unsigned)(g_snap_n * sizeof(SnapPoint)));
+}
+
+/** 一行诊断，供 BLE/手机直接显示 */
+void snapDiagLine(char* out, size_t out_sz) {
+  if (!out || out_sz < 8) return;
+  snprintf(out, out_sz,
+           "# DIAG snap=%u ring=%u rec=%d arm_ring=%d ready=%d alive=%d\n",
+           (unsigned)g_snap_n, (unsigned)g_ring_n, g_snap_rec ? 1 : 0, g_armed_ring ? 1 : 0,
+           snapDumpReady() ? 1 : 0, g_alive_running ? 1 : 0);
 }
 
 const uint8_t* snapDataBytes() { return (const uint8_t*)g_snap; }

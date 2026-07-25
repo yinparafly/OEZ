@@ -80,16 +80,19 @@ class BleLink(threading.Thread):
         self._ack_needed = False
         self._dump_lines = 0
         self._last_telem_mono = 0.0
-        self._last_l_emit = 0.0  # UI ?? ?10Hz
+        self._last_l_emit = 0.0  # UI ≈10Hz
         self._pending_l: str | None = None
         self._dump_batch: list[str] = []
+        self._bin_ble_buf = bytearray()
+        self._bin_ble_active = False
+        self._bin_ble_expect = 0
 
     def send(self, cmd: str) -> None:
         line = cmd.strip()
         if not line:
             return
         up = line.upper()
-        if self._dumping:
+        if self._dumping or self._bin_ble_active:
             allow = (
                 up.startswith("DUMP ACK")
                 or up == "ACK"
@@ -100,6 +103,10 @@ class BleLink(threading.Thread):
                 or up.startswith("ABI")
                 or up.startswith("LOG DUMP")
                 or up.startswith("LOG CLEAR")
+                or up.startswith("DUMP BIN")
+                or up.startswith("BIN DUMP")
+                or up.startswith("BLE BIN")
+                or up.startswith("SNAP")
                 or up == "READ"
                 or up.startswith("LOG READ")
             )
@@ -144,14 +151,68 @@ class BleLink(threading.Thread):
     def _on_rx_line(self, line: str, *, via: str = "n") -> None:
         self._rx_count += 1
 
+        # RAM snap 二进制（hex 分包）：SD 已存档后从 RAM 拉，不读卡
+        if line.startswith("# BIN BLE BEGIN"):
+            self._bin_ble_active = True
+            self._bin_ble_buf = bytearray()
+            self._bin_ble_expect = 0
+            self._dumping = True
+            self._dump_lines = 0
+            for tok in line.replace("#", " ").split():
+                if tok.startswith("bytes="):
+                    try:
+                        self._bin_ble_expect = int(tok[6:])
+                    except ValueError:
+                        pass
+            self._status(f"BLE BIN from RAM… expect={self._bin_ble_expect or '?'}")
+            self.out_q.put(("__raw__", line))
+            self.out_q.put(("__bin_prog__", (0, self._bin_ble_expect, 0)))
+            self._ack_needed = True
+            return
+
+        if self._bin_ble_active and line.startswith("B,"):
+            parts = line.split(",", 2)
+            if len(parts) >= 3:
+                hx = parts[2].strip()
+                try:
+                    self._bin_ble_buf.extend(bytes.fromhex(hx))
+                except ValueError:
+                    self._status(f"BLE BIN bad hex seq={parts[1] if len(parts) > 1 else '?'}")
+                self._dump_lines += 1
+                self._ack_needed = True
+                # 约每 8 包刷新进度（~0.3–0.5s），给 UI 进度条用
+                if self._dump_lines == 1 or (self._dump_lines % 8) == 0:
+                    got = len(self._bin_ble_buf)
+                    exp = self._bin_ble_expect or 0
+                    pct = int(100 * got / exp) if exp else 0
+                    if pct > 99 and exp and got < exp:
+                        pct = 99
+                    self.out_q.put(("__bin_prog__", (got, exp, pct)))
+                    self._status(f"BLE BIN {got}/{exp or '?'} ({pct}%)")
+            return
+
+        if line.startswith("# BIN BLE END") or (
+            self._bin_ble_active and line.startswith("# BIN BLE")
+        ):
+            if self._bin_ble_active:
+                raw = bytes(self._bin_ble_buf)
+                self._bin_ble_active = False
+                self._dumping = False
+                # 让出最后一包 ACK，避免固件卡在 pace 超时
+                self._ack_needed = True
+                self.out_q.put(("__bin_prog__", (len(raw), self._bin_ble_expect or len(raw), 100)))
+                self.out_q.put(("__bindump__", raw))
+                self._status(f"BLE BIN done bytes={len(raw)}")
+            self.out_q.put(("__raw__", line))
+            return
+
         if line.startswith("L,"):
             self._last_telem_mono = time.monotonic()
-            if self._dumping:
+            if self._dumping and not self._bin_ble_active:
                 self._flush_dump_batch()
                 self._dumping = False
                 self._ack_needed = False
                 self._status("BLE live telem OK")
-            # ?? 10Hz??????????????? UI ??
             now = time.monotonic()
             if now - self._last_l_emit < 0.1:
                 self._pending_l = line
@@ -190,7 +251,7 @@ class BleLink(threading.Thread):
                 self._ack_needed = False
                 self._status(f"BLE dump done, lines {self._dump_lines}")
 
-        if self._dumping and line.startswith("D,"):
+        if self._dumping and not self._bin_ble_active and line.startswith("D,"):
             self._dump_lines += 1
             self._dump_batch.append(line)
             self._ack_needed = True
@@ -308,7 +369,11 @@ class BleLink(threading.Thread):
                     self._pending_l = None
                     self._last_l_emit = now
                 # Dump: always poll fast (Windows notify often drops D lines)
-                poll_period = 0.045 if self._dumping else (0.12 if sys.platform == "win32" else 0.25)
+                poll_period = (
+                    0.04
+                    if (self._dumping or self._bin_ble_active)
+                    else (0.12 if sys.platform == "win32" else 0.25)
+                )
                 if now - last_poll >= poll_period:
                     last_poll = now
                     try:
@@ -342,7 +407,7 @@ class BleLink(threading.Thread):
                         f"telem_age={age}"
                         + (f" | dump {self._dump_lines}" if self._dumping else "")
                     )
-                await asyncio.sleep(0.005 if self._dumping else 0.02)
+                await asyncio.sleep(0.005 if (self._dumping or self._bin_ble_active) else 0.02)
 
             try:
                 await client.stop_notify(tx)

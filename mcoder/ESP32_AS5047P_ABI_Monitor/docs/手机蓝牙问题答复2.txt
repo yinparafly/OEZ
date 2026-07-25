@@ -1,0 +1,171 @@
+你的文档写得已经非常清楚了，问题定位方向也基本正确。PC（bleak + Windows）能稳定工作、手机反复改仍不稳，本质是 **Android GATT 栈的行为差异 + 主机侧时序/命令风暴 + 记录窗口与 BLE 争用** 叠加，而不是“手机蓝牙坏了”。
+
+下面按你文档第 8 节的问题清单直接回答，并给出可落地的建议。
+
+---
+
+## 1. 流分离：同意，而且是正确方向
+
+把「空闲实时流 `L,...`」和「监控/拉数」在 BLE 上完全分离，是正确且必要的设计。
+
+- 2 kHz 采样 + RAM snap 已经很吃 CPU/中断，再叠加实时 `L` 帧 notify，手机侧一有 READ/PING/命令，很容易把连接间隔、调度打乱，导致断链或采样抖动。
+- 固件侧 `bleMuteHost` + 只发短事件（`# QUIET` / `# CONFIRM` / `# RECORD done` / `# BLE PULL READY`）是对的。
+- USB 串口始终保留完整 `L,` 方便调试，也合理。
+
+**建议再补一点**：武装期间主机侧 **完全禁止** 任何“补遥测”的 READ/PING/DIAG，只允许监听短事件和最终的拉数流程。你已经在做，继续坚持。
+
+---
+
+## 2. PC 的「Notify + 周期性 READ + last_val 去重」在 Android 上能不能照搬？
+
+**能照搬，但必须更严格去重，且 DUMP 阶段策略要更干净。**
+
+### 已知事实（Android 普遍现象）
+
+- Notify 交付后，立刻对同一 TX 特征做 `readCharacteristic`，经常读到 **同一份缓冲**（特征值内容尚未被新 notify 覆盖）。
+- 这不是 bug，是 Android GATT 实现的常见行为：特征值 value 是共享缓冲，notify 和 read 都读它。
+- Windows/bleak 上 READ 也经常返回“上次 notify 的同一份”，所以你们 PC 侧 `last_val` 去重是刚需。
+- 手机若两路都 `ingest` → 每个 `B,seq,hex` 翻倍 → 字节超标 + CRC 失败。你们 1.8.1 的“相同 payload 丢弃 + 按 `B,seq` 去重 + 超 `bytes=` 截断”方向正确。
+
+### 推荐策略（手机）
+
+| 阶段 | 建议 |
+|------|------|
+| 空闲（未武装） | Notify 为主；可选低频 READ（≥150–200 ms）仅作兜底，且必须 `last_val` 去重 |
+| 武装 / STAGING / RECORD | **完全禁止 READ**，只听短事件 notify |
+| 听到 `# BLE PULL READY` | 等 200–300 ms → 发 `SNAP?` → 80 ms → `DUMP BIN BLE` |
+| DUMP 进行中 | **优先只走 Notify**；超时（例如 300–500 ms 无新包）再 READ 一次兜底；每包立即 `DUMP ACK`；强去重（payload + seq） |
+| 结束后 | 恢复空闲策略 |
+
+**不要**在 DUMP 时像 Windows 那样 40 ms 狂 READ。Android 上更容易重复，且会和 notify 抢 GATT 队列（Android 同一时刻只允许一个 pending GATT 操作）。
+
+另外注意：
+
+- 所有 GATT 操作（READ / WRITE / WRITE_DESCRIPTOR）必须 **串行队列化**，等 `onCharacteristicRead/Write` 回调后再发下一个。Android 不允许并发。
+- `onCharacteristicChanged` 里 **立刻拷贝** `characteristic.getValue()`（或用 API 33+ 的新回调），不要延迟解析，否则可能读到被后续 notify 覆盖的值。
+
+---
+
+## 3. 手机仍经常 empty RAM 但 SD 能拉到：更像哪条？
+
+**更怀疑「写了又被清」或「触发流程被打乱」，而不是纯“采样被 BLE 拖死”。**
+
+优先排查顺序：
+
+1. **再次 `MONITOR START` 清 RAM**  
+   固件已改为只有 `snapArmBegin()` 才清，但手机若在拉数前后、重连后、或用户误点“开始监控”，仍会清掉上一拍。  
+   → 手机 UI：拉数流程中 **禁用** “开始监控”按钮；断线后不要自动重武装。
+
+2. **重连 / 命令风暴撞在 STAGING/RECORD/SAVE 窗口**  
+   即使关掉了自动重连和 HIGH priority，若用户手动重连，或旧逻辑残留 `TIME`/`REC MS`/`DIAG` 狂发，仍可能打断状态机。  
+   → 连接后只发最小引导（`TIME` + `BLE RATE` + `ABI?`），武装时只发 `TIME` → 40 ms → `MONITOR START`，期间不发其他。
+
+3. **触发条件本身在手机会话下未满足**  
+   环缓有、正式段无 → 可能是手机连接时 BLE 栈占用导致采样抖动，或门限/`I+1` 圈逻辑对“真实转速曲线”更敏感。  
+   → 用 USB 串口同时看 `L,` 和事件，对比“仅手机连接” vs “仅 PC 连接” vs “双端都连（若支持）”时，触发是否发生、`snap_n` 是否写入。
+
+4. **SD 有文件说明至少某次 SAVE 成功**  
+   必须确认是 **哪次**（手机那次还是之前 PC 那次）。在固件或 SD 文件名/时间戳上加明确标识（例如 `snap_手机会话标记_时间.bin`），避免误判。
+
+**采样被 BLE 拖死** 不能完全排除，但优先级低于上面 1/2。若怀疑，可在 RECORD 窗口固件侧临时关掉所有 BLE notify（只留内部状态机），看 RAM 是否稳定有数据。
+
+---
+
+## 4. 若只能留一条手机拉数路径：选哪条？
+
+**短期：以 SD 回退为主路径，RAM 作“刚记完立刻拉”的快路径。**
+
+理由：
+
+- 手机会话下 RAM 为空的频率仍高，SD 至少能保证“有数据可下”。
+- 固件已支持「RAM 空则先读完 SD 最新 snap 再 BLE 传」，且避免边传边读卡——这已经是合理设计。
+- 长期目标仍应是 RAM 优先（延迟更低、不争用 SD SPI），但前提是手机侧彻底消掉“清 RAM / 断链 / 命令风暴”。
+
+产品策略建议：
+
+```text
+听到 # BLE PULL READY src=RAM  → 优先 DUMP BIN BLE（RAM）
+若 BEGIN 报 src=SD 或 empty     → 接受 SD，正常收
+用户手动“强制 SD”             → DUMP BIN BLE SD
+```
+
+不要让手机自己猜“要不要等 15 秒再拉”。
+
+---
+
+## 5. ESP32-S3 + NUS + 2 kHz 采样 + 手机 GATT 的已知雷区
+
+1. **Android 同一时刻只能有一个 pending GATT 操作**  
+   READ/WRITE 必须队列化，否则返回 false 或丢操作。
+
+2. **Notify 后立刻 READ 同一特征 → 重复数据**  
+   必须强去重（你们已做）。
+
+3. **CONNECTION_PRIORITY_HIGH**  
+   能提高吞吐，但在记录窗口更容易和采样争用，且部分机型行为激进。你们关掉是对的；若以后要开，只在 DUMP 阶段临时请求，结束后改回 BALANCED。
+
+4. **自动重连**  
+   极易撞在 STAGING/RECORD/SAVE。关掉，断了让用户手动点。
+
+5. **MTU 协商**  
+   连接后尽快 `requestMtu(247)` 或更高，并等 `onMtuChanged` 再开始大量传输。失败可忽略，但不要假设一定是 247。
+
+6. **NimBLE 侧**  
+   - 记录窗口尽量减少 notify 频率和 payload。  
+   - 确认 disconnect 时正确清理订阅（有些版本重连后订阅状态异常）。  
+   - 2 kHz 采样任务优先级要高于 BLE 主机任务，避免采样被 BLE 回调拖死。
+
+7. **WRITE WITHOUT RESPONSE vs WRITE**  
+   主机发命令用 Write Without Response（对齐 PC），减少往返；但 ACK（`DUMP ACK`）也可用 WWR，注意不要打爆从机接收缓冲。
+
+8. **手机厂商差异**  
+   小米/OPPO/华为等对 BLE 后台、扫描、连接间隔限制更严。测试至少覆盖 2–3 个主流品牌。
+
+---
+
+## 具体落地建议（按优先级）
+
+### 手机 App（立刻做）
+
+1. **DUMP 阶段改为「Notify 为主 + 超时才 READ」**，去掉持续 40 ms 轮询。
+2. **武装到拉数结束**：禁用“开始监控”、禁用自动重连、禁止任何 PING/DIAG/多余 `REC MS`。
+3. 拉数只认 `# BLE PULL READY`，延迟 200–300 ms，与 PC 完全一致。
+4. 去重再加强：  
+   - 相同 payload 丢弃  
+   - `B,seq` 去重  
+   - 超 `bytes=` 截断  
+   - 可选：记录已收 seq 集合，乱序/重复直接丢
+5. 所有 GATT 操作进串行队列。
+6. `onCharacteristicChanged` 里立刻 `Arrays.copyOf(value)`。
+
+### 固件（辅助）
+
+1. 武装后除短事件外，**彻底不发** 任何实时帧（已做）。
+2. `MONITOR START` 之外的路径绝不清 RAM。
+3. 记录窗口若检测到主机频繁 READ，可考虑临时忽略或限流（保护采样）。
+4. SD 文件名/元数据带会话标记，方便判断“是哪次记的”。
+5. 可选：`# BLE PULL READY` 后若 N 秒内无 `DUMP BIN BLE`，自动进入“可 SD 回退”状态并保持 RAM 直到下次武装。
+
+### 验证方法
+
+1. 固定场景：同一转速曲线、同一门限，只连手机 vs 只连 PC，对比：  
+   - 是否触发 `# QUIET` → `# CONFIRM` → `# RECORD done` → `# BLE PULL READY`  
+   - `snap_n`、BEGIN 的 `src=` / `bytes=`  
+   - 是否断链
+2. 用 nRF Connect 或 Wireshark（若有）看连接间隔、notify 间隔、是否有多余 READ。
+3. 手机开 log：每次 `ingest` 打印 seq、长度、是否被去重丢弃。
+
+---
+
+## 总结一句话
+
+PC 能通，是因为 **bleak 的 READ 去重 + 不发多余命令 + 不自动重连 + 拉数时机精准**。手机要对齐的不是“多读几次”，而是：
+
+- 记录窗口零干扰  
+- DUMP 只靠 Notify + 强去重  
+- 绝不二次武装清 RAM  
+- 接受 SD 回退作可靠路径  
+
+把以上几点落地后，empty RAM 和 CRC 失败应会明显下降。若仍有个别机型断链，再针对该机型的连接间隔/后台限制单独处理。
+
+需要的话，可以把 `BleClient.java` 里 DUMP 收包和武装期间的 READ/命令逻辑贴出来，我可以按上述策略直接标出改点。

@@ -1,0 +1,706 @@
+
+我仔细看了你的文档，PC端能稳定跑通而手机端反复出问题，这个现象本身就很能说明问题——**不是BLE协议本身不行，而是Android BLE栈的行为和PC（特别是Windows+bleak）有本质差异**，你们现在的方案是照着PC的行为去适配手机，这路子本身就有问题。
+
+我直接说结论和改动建议，不绕弯子。
+
+---
+
+## 🎯 核心判断：问题根因排序
+
+| 优先级 | 问题 | 证据 |
+|--------|------|------|
+| **1** | 手机GATT Read会返回Notify缓存 | 你已确认：`readCharacteristic(TX)` 经常返回和上次Notify相同的内容 |
+| **2** | 手机连接参数/优先级与ESP32不匹配 | PC从不设`CONNECTION_PRIORITY_HIGH`，手机设了反而断链 |
+| **3** | 手机端“开始监控”时命令风暴 | 重连狂发`REC MS`/`TIME`，会打断`DUMP BIN BLE` |
+| **4** | 手机端轮询READ频率过高 | PC在普通状态下是120ms，dump时40ms；手机旧逻辑是350ms+还发PING |
+
+**最关键的结论：在Android上，不要照搬PC的“持续READ + last_val去重”策略。** 那是为Windows BLE驱动设计的变通方案，在Android上会放大问题。
+
+---
+
+## 📱 针对Android的正确策略（建议）
+
+### 策略一：Dump期间**完全关闭READ，只用Notify**
+
+```java
+// Dump开始时
+gatt.setCharacteristicNotification(txChar, true);  // 开启Notify
+// 停止一切readCharacteristic()调用
+// 只靠onCharacteristicChanged()收包
+
+// 超时保护：如果500ms内没收到任何包，再发一次READ
+// 否则绝不主动READ
+```
+
+**理由**：
+- Android上Notify已经可靠（NUS服务是标准服务）
+- 你加READ只会引入重复包，而去重逻辑在Android上比PC更难做（因为Android的`readCharacteristic`有时会返回陈旧数据，有时返回空，有时返回新数据，时序不可预测）
+- PC上做READ是因为Windows BLE驱动有时Notify会丢包，但Android的Notify通常更稳
+
+### 策略二：收包校验改为**逐包ACK + 重传机制**
+
+现在你们的协议是主机收完一整包才回`DUMP ACK`，这在Android上风险很大——如果中间丢一个包，整包作废。
+
+改为**逐包ACK**：
+
+```text
+# BIN BLE BEGIN src=RAM n=100 bytes=2000 crc=0x1234
+B,0,<hex>  → 主机回复 ACK,0
+B,1,<hex>  → 主机回复 ACK,1
+...
+# BIN BLE END ok=1 crc=0x1234
+```
+
+固件端如果200ms内没收到`ACK,seq`，重发当前包。这样丢包后只需重传1包，而不是整包重来。
+
+### 策略三：手机端完全废弃`CONNECTION_PRIORITY_HIGH`
+
+```java
+// 删除这行
+// gatt.requestConnectionPriority(GATT_CONNECTION_PRIORITY_HIGH);
+```
+
+PC从不设这个，反而稳。Android设了高优先级后，底层会缩短连接间隔，但这会加剧ESP32的BLE中断负载，和2kHz采样争抢CPU。
+
+---
+
+## 🧪 针对“RAM经常为0”的排查
+
+这是你目前最头疼的现象。我逐个分析可能性：
+
+| 可能原因 | 如何验证 | 概率 |
+|----------|----------|------|
+| **触发从未成功** | 看手机日志里有没有`# CONFIRM seg=`或`# RECORD done` | 低（因为你说有时能下到数据） |
+| **触发成功但被清空** | `MONITOR START`会清空上一拍RAM。手机端是不是在触发成功后又自动发了`MONITOR START`？ | **高** |
+| **采样被BLE中断拖死** | 2kHz采样在ESP32-S3上如果BLE中断频繁，可能会丢采样点，导致环缓永远填不满触发条件 | 中 |
+| **RAM snap计数为0但SD有文件** | 说明SAVE走的是SD直接写入，不是从RAM来的。可能RAM snap结构体被破坏 | 中 |
+
+**最可疑的是第2条**：手机端在`# RECORD done`之后，是不是又自动发了一次`MONITOR START`准备下一轮？如果是，那上一拍RAM被清掉，但SD文件已经保存了，所以出现“SD有数据，RAM为空”。
+
+**验证方法**：
+在`MONITOR START`处理函数里加个计数器，手机连一次就打一条`# MONITOR START count=X`，看手机上到底发了多少次。
+
+---
+
+## 🔧 具体改动建议（按优先级）
+
+### 高优先级（立即改）
+
+1. **Dump期间停止READ，只走Notify**
+   ```java
+   // BleClient.java
+   private boolean isDumping = false;
+   
+   public void startDump() {
+       isDumping = true;
+       // 不主动read，只等onCharacteristicChanged
+   }
+   
+   public void stopDump() {
+       isDumping = false;
+   }
+   
+   @Override
+   public void onCharacteristicChanged(...) {
+       if (isDumping) {
+           // 只处理Notify，不触发read
+           ingestPayload(value);
+       }
+   }
+   ```
+
+2. **删除所有`CONNECTION_PRIORITY_HIGH`调用**
+
+3. **手机端停止自动重连**
+   - 断线后手动点“重连”即可，不要自动重连
+   - 自动重连容易在固件处于RECORD/SAVE状态时插入命令，破坏状态机
+
+### 中优先级（逐步改）
+
+4. **实现逐包ACK**
+   - 固件端发`B,seq`后等待`ACK,seq`
+   - 超时200ms重发
+   - 手机端收到包后立即回复`ACK,seq`
+
+5. **Dump开始前先发`SNAP?`确认RAM状态**
+   ```text
+   主机 → SNAP?
+   板 → # SNAP src=RAM n=100 valid=1
+   ```
+   如果`valid=0`，直接走SD回退，不要硬拉RAM
+
+### 低优先级（优化）
+
+6. **PC和手机共用同一套收包逻辑抽象**
+   - 现在PC和手机各写各的，建议把收包/去重/CRC校验抽象成一个独立模块，PC和手机都调用
+   - 避免“PC修了手机没修”的情况
+
+---
+
+## 📊 关于你文档里列的问题清单，我的直接回答
+
+| 问题 | 我的回答 |
+|------|----------|
+| 空闲流和监控流分离是否正确？ | ✅ **正确，这是最合理的设计** |
+| PC的READ+去重是否照搬到Android？ | ❌ **不要照搬**。Android上Dump期间只用Notify，超时才补一次READ |
+| RAM为空但SD有数据，更怀疑哪条？ | **怀疑手机在`# RECORD done`后自动发了`MONITOR START`清掉了RAM** |
+| 只留一条路径，选RAM还是SD？ | 选**RAM为主，SD为备**。但Android上Dump协议要改成逐包ACK |
+| ESP32-S3+NUS+2kHz采样的雷区？ | ① `CONNECTION_PRIORITY_HIGH`会加重中断负载 ② `readCharacteristic`会返回Notify缓存 ③ 手机端`onServicesDiscovered`后不要立即发命令，等500ms |
+
+---
+
+## 🧰 一个快速验证建议
+
+在手机上装一个**纯Notify收包测试App**（不做任何READ），然后：
+
+1. 连接ESP32
+2. 点击“开始监控”
+3. 触发记录
+4. 等`# BLE PULL READY`出现后，App只开Notify收`B,seq`包，**不发任何ACK/READ**
+5. 看能否收完整包
+
+如果这样能收齐，说明问题出在“READ干扰Notify”上；如果收不齐，说明Notify本身在Android上不可靠，那就必须走逐包ACK+重传。
+
+---
+
+需要我把上面这套策略整理成具体的代码改动清单（分固件/PC/手机三端）吗？
+
+
+好的，我来给你一份**三端联动的具体代码改动清单**，按固件→手机→PC的顺序，每项都给出具体实现和改动位置。
+
+---
+
+## 📋 改动总览
+
+| 端 | 改动项 | 优先级 | 预计工作量 |
+|---|--------|--------|-----------|
+| **固件** | 逐包ACK + 重传机制 | 🔴 高 | 2-3h |
+| **固件** | `SNAP?`命令返回RAM状态 | 🟡 中 | 0.5h |
+| **固件** | `MONITOR START`加计数器日志 | 🟢 低 | 0.5h |
+| **手机** | Dump期间只用Notify，停READ | 🔴 高 | 1-2h |
+| **手机** | 实现逐包ACK回复 | 🔴 高 | 1h |
+| **手机** | 删除CONNECTION_PRIORITY_HIGH | 🔴 高 | 0.1h |
+| **手机** | 删除自动重连 | 🟡 中 | 0.5h |
+| **手机** | Dump前发SNAP?确认状态 | 🟡 中 | 1h |
+| **PC** | 适配逐包ACK（可选） | 🟢 低 | 1h |
+
+---
+
+## 1️⃣ 固件端改动
+
+### 改动1：逐包ACK + 重传机制
+
+**文件**：`firmware/ESP32AbiMonitor/snap_bin.cpp`（或你放BLE传输逻辑的文件）
+
+**当前协议**：
+```text
+# BIN BLE BEGIN ... (主机不回复)
+B,0,<hex>
+B,1,<hex>
+...
+# BIN BLE END ...
+主机最后回 DUMP ACK
+```
+
+**改为**：
+```text
+# BIN BLE BEGIN ... (主机回复 ACK,BEGIN)
+B,0,<hex>  → 主机回复 ACK,0
+B,1,<hex>  → 主机回复 ACK,1
+...
+# BIN BLE END ...
+```
+
+**代码实现**：
+
+```cpp
+// snap_bin.h - 新增结构
+typedef struct {
+    uint16_t seq;
+    uint32_t send_time_ms;
+    bool waiting_ack;
+    uint8_t retry_count;
+    String pending_packet;
+} ack_state_t;
+
+// snap_bin.cpp - 新增全局变量
+static ack_state_t g_ack_state = {0, 0, false, 0, ""};
+static QueueHandle_t g_ack_queue = NULL;  // 接收主机的ACK回复
+
+#define ACK_TIMEOUT_MS    200    // 200ms超时重传
+#define MAX_RETRIES       3      // 最大重传次数
+
+// 发送一个B,seq包（带ACK等待）
+bool send_bin_packet_with_ack(uint16_t seq, const String& hex_data) {
+    String packet = "B," + String(seq) + "," + hex_data + "\n";
+    
+    int retry = 0;
+    while (retry < MAX_RETRIES) {
+        // 发送包
+        ble_send(packet.c_str());
+        
+        // 记录状态
+        g_ack_state.seq = seq;
+        g_ack_state.send_time_ms = millis();
+        g_ack_state.waiting_ack = true;
+        g_ack_state.pending_packet = packet;
+        
+        // 等待ACK，最多200ms
+        uint32_t start = millis();
+        bool ack_received = false;
+        while (millis() - start < ACK_TIMEOUT_MS) {
+            // 检查是否有ACK到达（在BLE接收回调中设置标志）
+            if (g_ack_state.waiting_ack == false) {
+                ack_received = true;
+                break;
+            }
+            delay(5);
+        }
+        
+        if (ack_received) {
+            return true;  // 成功
+        }
+        
+        retry++;
+        Serial.printf("[BLE] Retry seq=%d, retry=%d\n", seq, retry);
+    }
+    
+    Serial.printf("[BLE] Failed to send seq=%d after %d retries\n", seq, MAX_RETRIES);
+    return false;
+}
+
+// BLE接收回调中处理ACK
+void ble_rx_callback(const String& cmd) {
+    // 解析 ACK,<seq>
+    if (cmd.startsWith("ACK,")) {
+        uint16_t ack_seq = cmd.substring(4).toInt();
+        if (g_ack_state.waiting_ack && g_ack_state.seq == ack_seq) {
+            g_ack_state.waiting_ack = false;  // 收到ACK，停止等待
+        }
+    }
+    // ... 其他命令处理
+}
+
+// 主循环中检查超时重传（非阻塞）
+void check_ack_timeout() {
+    if (g_ack_state.waiting_ack) {
+        if (millis() - g_ack_state.send_time_ms > ACK_TIMEOUT_MS) {
+            // 超时，重传
+            ble_send(g_ack_state.pending_packet.c_str());
+            g_ack_state.send_time_ms = millis();
+            g_ack_state.retry_count++;
+            
+            if (g_ack_state.retry_count >= MAX_RETRIES) {
+                g_ack_state.waiting_ack = false;
+                Serial.println("[BLE] Max retries exceeded, giving up");
+            }
+        }
+    }
+}
+```
+
+**DUMP主循环改造**：
+
+```cpp
+// 原来的循环
+for (int i = 0; i < total_packets; i++) {
+    ble_send(build_packet(i));
+}
+
+// 改为带ACK的版本
+for (int i = 0; i < total_packets; i++) {
+    if (!send_bin_packet_with_ack(i, build_hex_data(i))) {
+        // 发送失败，中断dump
+        ble_send("# BIN BLE END ok=0 crc=0x...\n");
+        return false;
+    }
+    // 每10包让出CPU
+    if (i % 10 == 0) {
+        yield();  // ESP32
+    }
+}
+```
+
+---
+
+### 改动2：`SNAP?`命令返回RAM状态
+
+**文件**：`firmware/ESP32AbiMonitor/ESP32AbiMonitor.ino`（命令解析处）
+
+```cpp
+// 在命令解析循环中添加
+if (cmd == "SNAP?") {
+    bool has_ram = snap_has_data();  // 检查RAM snap是否有效
+    uint16_t snap_count = snap_get_count();
+    uint16_t total_bytes = snap_get_total_bytes();
+    
+    String reply = "# SNAP src=RAM";
+    reply += " valid=" + String(has_ram ? 1 : 0);
+    reply += " n=" + String(snap_count);
+    reply += " bytes=" + String(total_bytes);
+    reply += "\n";
+    ble_send(reply.c_str());
+    Serial.print("[BLE] "); Serial.print(reply);
+}
+```
+
+---
+
+### 改动3：`MONITOR START`加计数器日志
+
+**文件**：`firmware/ESP32AbiMonitor/ESP32AbiMonitor.ino`
+
+```cpp
+// 全局变量
+static uint32_t monitor_start_count = 0;
+
+// 在 MONITOR START 处理中
+if (cmd == "MONITOR START") {
+    monitor_start_count++;
+    Serial.printf("[EVENT] MONITOR START #%d\n", monitor_start_count);
+    
+    // BLE也发一条，方便手机端确认
+    String msg = "# MONITOR START count=" + String(monitor_start_count) + "\n";
+    ble_send(msg.c_str());
+    
+    // ... 原有逻辑
+}
+```
+
+---
+
+## 2️⃣ 手机端改动（Android/Java）
+
+### 改动1：Dump期间只用Notify，停READ
+
+**文件**：`android/.../BleClient.java`
+
+```java
+public class BleClient {
+    private boolean isDumping = false;
+    private boolean isWaitingForAck = false;
+    private int expectedSeq = 0;
+    private int totalPackets = 0;
+    private StringBuilder binBuffer = new StringBuilder();
+    
+    // Dump开始
+    public void startBinDump() {
+        isDumping = true;
+        isWaitingForAck = false;
+        binBuffer.setLength(0);
+        
+        // 开启Notify（如果还没开）
+        enableNotifications(true);
+        
+        // 发送 DUMP BIN BLE
+        writeCharacteristic("DUMP BIN BLE\n");
+        
+        // 启动超时定时器（如果5秒没收到BEGIN，重试）
+        startDumpTimeout(5000);
+    }
+    
+    // Dump结束
+    public void stopBinDump() {
+        isDumping = false;
+        enableNotifications(false);
+        cancelDumpTimeout();
+    }
+    
+    // 收到Notify回调
+    @Override
+    public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+        byte[] data = characteristic.getValue();
+        String payload = new String(data);
+        
+        if (!isDumping) {
+            // 非dump期间，正常处理
+            processNormalPayload(payload);
+            return;
+        }
+        
+        // ===== Dump期间：只处理Notify，不触发任何READ =====
+        
+        // 1. 检查BEGIN包
+        if (payload.startsWith("# BIN BLE BEGIN")) {
+            parseBegin(payload);
+            // 回复 ACK,BEGIN
+            writeCharacteristic("ACK,BEGIN\n");
+            return;
+        }
+        
+        // 2. 检查END包
+        if (payload.startsWith("# BIN BLE END")) {
+            parseEnd(payload);
+            // 回复 ACK,END
+            writeCharacteristic("ACK,END\n");
+            stopBinDump();
+            return;
+        }
+        
+        // 3. 检查数据包 B,seq,hex
+        if (payload.startsWith("B,")) {
+            String[] parts = payload.split(",");
+            if (parts.length >= 3) {
+                int seq = Integer.parseInt(parts[1]);
+                String hex = parts[2].trim();
+                
+                // 检查seq是否和期望一致（防止乱序）
+                if (seq == expectedSeq) {
+                    binBuffer.append(hex);
+                    expectedSeq++;
+                    
+                    // 回复ACK,seq
+                    writeCharacteristic("ACK," + seq + "\n");
+                } else if (seq < expectedSeq) {
+                    // 重复包，仍然回复ACK（让固件知道我们已经收到了）
+                    writeCharacteristic("ACK," + seq + "\n");
+                } else {
+                    // 跳号了，可能是丢包，回复ACK,expected-1 让固件重传
+                    writeCharacteristic("ACK," + (expectedSeq - 1) + "\n");
+                }
+            }
+            return;
+        }
+        
+        // 4. 其他包（状态/事件），正常处理
+        processNormalPayload(payload);
+    }
+    
+    // ⚠️ 关键：Dump期间禁止任何主动readCharacteristic()
+    // 删除所有在dump期间调用的 readCharacteristic(txChar)
+}
+```
+
+---
+
+### 改动2：删除`CONNECTION_PRIORITY_HIGH`
+
+**文件**：`android/.../BleClient.java`
+
+```java
+// 找到类似代码并删除
+// gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
+
+// 或者注释掉
+// 不要设置任何优先级，使用系统默认
+```
+
+---
+
+### 改动3：删除自动重连
+
+**文件**：`android/.../MainActivity.java`
+
+```java
+// 删除或注释掉自动重连逻辑
+// 断线后只弹窗提示，让用户手动点击"重连"按钮
+
+@Override
+public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+    if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+        // 不要自动重连
+        // if (autoReconnect) { gatt.connect(); }  // 删除这行
+        
+        runOnUiThread(() -> {
+            Toast.makeText(this, "BLE已断开，请手动重连", Toast.LENGTH_SHORT).show();
+            updateConnectButton(false);
+        });
+    }
+}
+```
+
+---
+
+### 改动4：Dump前发`SNAP?`确认状态
+
+**文件**：`android/.../MainActivity.java`
+
+```java
+private void performBinDump() {
+    // 先发 SNAP? 查询状态
+    bleClient.writeCharacteristic("SNAP?\n");
+    
+    // 等待回复（最多2秒）
+    // 在 onCharacteristicChanged 中处理 # SNAP 回复
+    // 如果 valid=0，走SD回退
+}
+
+// 在回调中处理
+if (payload.startsWith("# SNAP")) {
+    // 解析 valid=1 或 0
+    boolean hasRam = extractValid(payload) == 1;
+    if (hasRam) {
+        bleClient.startBinDump();  // 走RAM dump
+    } else {
+        // RAM为空，走SD回退
+        Log.w("BLE", "RAM empty, fallback to SD");
+        bleClient.writeCharacteristic("DUMP BIN BLE SD\n");
+    }
+}
+```
+
+---
+
+## 3️⃣ PC端改动（适配逐包ACK）
+
+**文件**：`pc/ble_link.py`
+
+当前PC是“先收完再回DUMP ACK”，改为逐包ACK：
+
+```python
+class BleLink:
+    def __init__(self):
+        self.is_dumping = False
+        self.expected_seq = 0
+        self.bin_data = []
+        self.total_bytes = 0
+        
+    async def _handle_bin_packet(self, payload: str):
+        """处理BIN数据包（逐包ACK）"""
+        if payload.startswith('# BIN BLE BEGIN'):
+            # 解析BEGIN
+            self.is_dumping = True
+            self.expected_seq = 0
+            self.bin_data = []
+            # 回复 ACK,BEGIN
+            await self.client.write_gatt_char(self.tx_char, b'ACK,BEGIN\n')
+            return
+        
+        if payload.startswith('# BIN BLE END'):
+            # 解析END
+            self.is_dumping = False
+            # 回复 ACK,END
+            await self.client.write_gatt_char(self.tx_char, b'ACK,END\n')
+            # 校验CRC
+            self._verify_bin()
+            return
+        
+        if payload.startswith('B,') and self.is_dumping:
+            # 解析 B,seq,hex
+            parts = payload.split(',')
+            seq = int(parts[1])
+            hex_data = parts[2].strip()
+            
+            if seq == self.expected_seq:
+                self.bin_data.append(hex_data)
+                self.expected_seq += 1
+                # 立即回复ACK
+                await self.client.write_gatt_char(
+                    self.tx_char, 
+                    f'ACK,{seq}\n'.encode()
+                )
+            elif seq < self.expected_seq:
+                # 重复包，重发ACK
+                await self.client.write_gatt_char(
+                    self.tx_char, 
+                    f'ACK,{seq}\n'.encode()
+                )
+            else:
+                # 跳号，回复上一个seq
+                await self.client.write_gatt_char(
+                    self.tx_char, 
+                    f'ACK,{self.expected_seq - 1}\n'.encode()
+                )
+```
+
+---
+
+## 4️⃣ 测试验证清单
+
+改动完成后，逐项验证：
+
+### 验证1：纯Notify收包
+
+| 步骤 | 预期 |
+|------|------|
+| 手机连接ESP32，不设CONNECTION_PRIORITY_HIGH | 连接稳定 |
+| 触发记录，等`# BLE PULL READY` | 出现该事件 |
+| App开Notify，**不发任何READ**，只等Notify | 能收齐B,seq包 |
+| 每包回复ACK,seq | 固件收到ACK不再重传 |
+
+### 验证2：RAM空时SD回退
+
+| 步骤 | 预期 |
+|------|------|
+| 手机发`SNAP?` | 返回valid=0或1 |
+| valid=0时发`DUMP BIN BLE SD` | 从SD取最新文件传输 |
+| SD传输使用同样的逐包ACK | 成功 |
+
+### 验证3：断线重连
+
+| 步骤 | 预期 |
+|------|------|
+| 手动断开BLE | 不自动重连 |
+| 手动点重连 | 连接成功，状态恢复 |
+| 重连后发`SNAP?` | 返回当前RAM状态（未被清空） |
+
+---
+
+## 5️⃣ 关键时序图
+
+改动后的Dump流程：
+
+```text
+手机(Android)                    ESP32固件
+    |                                |
+    |---- DUMP BIN BLE ------------>|
+    |                                |
+    |<--- # BIN BLE BEGIN ... ------|
+    |---- ACK,BEGIN --------------->|
+    |                                |
+    |<--- B,0,<hex> ----------------|
+    |---- ACK,0 ------------------->|  (收到ACK，继续下一包)
+    |                                |
+    |<--- B,1,<hex> ----------------|
+    |---- ACK,1 ------------------->|
+    |                                |
+    |    ... (每包都ACK)             |
+    |                                |
+    |<--- # BIN BLE END ... --------|
+    |---- ACK,END ----------------->|
+    |                                |
+    [完成]                          [完成]
+```
+
+**超时重传场景**：
+
+```text
+手机(Android)                    ESP32固件
+    |                                |
+    |<--- B,5,<hex> ----------------|
+    |    (手机没收到或没回复ACK)     |
+    |                                | 200ms超时
+    |<--- B,5,<hex> -------------->| (重传)
+    |---- ACK,5 ------------------->|
+```
+
+---
+
+## 6️⃣ 回滚方案
+
+如果逐包ACK改动后问题更严重，可以快速回滚：
+
+1. **固件**：保留`#define ACK_ENABLED 0`开关，关掉后回到旧协议
+2. **手机**：保留`isDumping`开关，关掉后回到旧逻辑
+3. **PC**：不变，新旧协议都兼容（检查是否收到ACK,BEGIN来判断）
+
+```cpp
+// 固件端开关
+#define ENABLE_ACK_MODE 1  // 改成0回滚到旧协议
+
+#if ENABLE_ACK_MODE
+    // 新逻辑：逐包ACK
+#else
+    // 旧逻辑：一次性发完
+#endif
+```
+
+---
+
+这样三端改完后，手机端应该能稳定跑通了。核心变化是：
+
+1. **Dump期间手机只收Notify不READ** —— 解决重复包问题
+2. **固件逐包等待ACK** —— 解决丢包问题，而不是靠手机端去重
+3. **删除高优先级和自动重连** —— 减少BLE中断对采样的干扰
+
+需要我补充某个文件的具体完整代码吗？

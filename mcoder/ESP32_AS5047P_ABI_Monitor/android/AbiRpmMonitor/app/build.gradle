@@ -10,8 +10,8 @@ android {
         applicationId "com.oezcon.abirpmonitor"
         minSdk 26
         targetSdk 34
-        versionCode 13
-        versionName "1.4.5"
+        versionCode 34
+        versionName "1.9.4-share-csv"
     }
 
     buildTypes {

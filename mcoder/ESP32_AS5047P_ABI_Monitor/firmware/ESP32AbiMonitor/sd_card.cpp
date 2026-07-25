@@ -141,6 +141,101 @@ bool sdWriteText(const char* path, const char* text) {
   return true;
 }
 
+bool sdFindLatestSnap(char* path_out, size_t path_sz, uint32_t* size_out) {
+  if (!path_out || path_sz < 8) return false;
+  path_out[0] = '\0';
+  if (size_out) *size_out = 0;
+  if (!g_sd_ok && !sdBegin()) return false;
+
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    return false;
+  }
+  char best[48];
+  best[0] = '\0';
+  uint32_t best_sz = 0;
+  uint8_t scanned = 0;
+  while (scanned < 40) {
+    File e = root.openNextFile();
+    if (!e) break;
+    scanned++;
+    if (e.isDirectory()) {
+      e.close();
+      continue;
+    }
+    const char* nm = e.name();
+    if (!nm) {
+      e.close();
+      continue;
+    }
+    // 兼容 "/snap_xxx.bin" 或 "snap_xxx.bin"
+    const char* base = nm;
+    if (base[0] == '/') base++;
+    size_t nlen = strlen(base);
+    if (nlen < 10 || strncmp(base, "snap_", 5) != 0) {
+      e.close();
+      continue;
+    }
+    if (strcmp(base + nlen - 4, ".bin") != 0) {
+      e.close();
+      continue;
+    }
+    uint32_t sz = (uint32_t)e.size();
+    e.close();
+    if (sz < 12) continue;
+    if (best[0] == '\0' || strcmp(base, best) > 0) {
+      strncpy(best, base, sizeof(best) - 1);
+      best[sizeof(best) - 1] = '\0';
+      best_sz = sz;
+    }
+    delay(1);
+    yield();
+  }
+  root.close();
+  if (best[0] == '\0') return false;
+  snprintf(path_out, path_sz, "/%s", best);
+  if (size_out) *size_out = best_sz;
+  Serial.printf("# SD LATEST %s bytes=%lu\n", path_out, (unsigned long)best_sz);
+  return true;
+}
+
+bool sdReadEntire(const char* path, uint8_t** out, size_t* out_len) {
+  if (out) *out = nullptr;
+  if (out_len) *out_len = 0;
+  if (!path || !out || !out_len) return false;
+  if (!g_sd_ok && !sdBegin()) return false;
+
+  File f = SD.open(path, FILE_READ);
+  if (!f) {
+    Serial.printf("# SD READ FAIL open %s\n", path);
+    return false;
+  }
+  size_t sz = (size_t)f.size();
+  if (sz == 0 || sz > 200000UL) {
+    f.close();
+    Serial.printf("# SD READ FAIL bad size %u\n", (unsigned)sz);
+    return false;
+  }
+  uint8_t* buf = (uint8_t*)malloc(sz);
+  if (!buf) {
+    f.close();
+    Serial.println("# SD READ FAIL malloc");
+    return false;
+  }
+  size_t got = f.read(buf, sz);
+  f.close();
+  if (got != sz) {
+    free(buf);
+    Serial.printf("# SD READ FAIL short %u/%u\n", (unsigned)got, (unsigned)sz);
+    return false;
+  }
+  *out = buf;
+  *out_len = sz;
+  Serial.printf("# SD READ OK %s bytes=%u\n", path, (unsigned)sz);
+  return true;
+}
+
 void sdListRoot(uint8_t max_files) {
   if (!g_sd_ok && !sdBegin()) return;
   Serial.printf("# SD LIST heap free_internal=%u\n",

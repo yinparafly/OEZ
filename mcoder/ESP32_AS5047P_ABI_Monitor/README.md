@@ -1,120 +1,84 @@
 # AS5047P ABI 转速监控（独立工程）
 
-**不修改**既有 `ESP32_AS5047P` 电机控制工程。本目录为新增：ABI 正交测速 + 板内记录 + BLE + PC/Android 显示回放。
+**不修改**既有 `ESP32_AS5047P`。当前主路径：**短时 RAM 记录 → SD 存档 → USB 读卡或蓝牙从 RAM 取回**。
 
-## 语义：开始 / 停止监控
+固件：`FW=monitor-v26-ble-ram`
+
+## 短时记录流程
 
 | 步骤 | 行为 |
 |------|------|
-| **MONITOR START** | 武装探测（不立刻写主记录） |
-| **\|RPM\| > 20** | 进入 **临时数据池**（STAGING） |
-| **净转角 ≥ 1 周** | 判定真实转动 → **追溯提交**整池到主记录 → 再继续记 **2 s** |
-| **噪声** | 掉速/反向抖动/**1 秒内未满 1 周** → **丢弃临时池**，不进主记录 |
-| **MONITOR STOP** | 解除武装；若在临时池则丢弃 |
+| **MONITOR START** | 武装，开环缓（可静止） |
+| **\|RPM\| > 10** | STAGING |
+| **I 过 1 圈** | 触发：回溯 ≤400 点 + 再记 **2 s @ 2 kHz** → INTERNAL RAM |
+| **ALIVE ~2 s** | 自动 **SD SAVE** → `/snap_*.bin` |
+| **取数** | 有 BLE：跳过 U 盘，发 `BLE PULL READY`，PC 自动 `DUMP BIN BLE`（**读 RAM**）；无 BLE：自动 `USB DISK ON` |
 
-- **板内主记录**：只含已确认段；多段同一缓冲，用 `seg` 区分。
-- **导出**：`LOG DUMP` 按段输出 `S BEGIN` / `D,...` / `S END`；PC「拉取并按段保存」→ `pc/logs/<时间>/abi_seg001_….csv` 每段一个文件。
-- 回放：选择段号后「回放该段」。
-- 清空：`LOG CLEAR`（主记录 + 临时池）。
+`REC NOW` = 强制直采（无门限），同样 RAM→SD。
 
 ## 目录
 
 | 路径 | 说明 |
 |------|------|
-| `firmware/ESP32AbiMonitor/` | ESP32-S3 固件（PCNT + esp_timer 2kHz + BLE `OEZ-ABI`） |
-| `pc/abi_monitor.py` | PC UI（USB / BLE） |
-| `android/AbiRpmMonitor/` | Android App |
+| `firmware/ESP32AbiMonitor/` | ESP32-S3 固件 |
+| `pc/abi_monitor.py` | PC UI（USB / BLE）+ 喇叭提醒 |
+| `pc/curve_studio.py` | 曲线工作室 |
+| `pc/smoke_ble_v26.py` | 引导冒烟（可 `--skip-motor`） |
+| `backups/usb-msc-stable-2026-07-25/` | USB 读卡可用版源码备份 |
+| `docs/硬件联调清单.md` | 回来联调用 |
+| `docs/蓝牙取数-RAM优先.md` | 为何 BLE 读 RAM 不读 SD |
+| `docs/Android-APK更新.md` | 手机 APK 编译安装 |
+| `android/AbiRpmMonitor/` | Android App（v1.5.0-ble-snap） |
 
-## 接线（ESP32-S3）
+## 接线
 
 | AS5047P | ESP32-S3 |
 |---------|----------|
-| A | GPIO15 |
-| B | GPIO16 |
-| I（可选） | GPIO17 |
-| VCC | 3.3V |
-| GND | GND |
+| A / B / I | GPIO15 / 16 / 17 |
+| VCC / GND | 3.3V / GND |
 
-默认按芯片 **4000 steps/rev**（decimal 最高档）。若你改过 ABIRES，请同步改固件 `ABI_STEPS_PER_REV`。
+SPI SD：`CS=10 SCK=12 MOSI=11 MISO=13`
 
-> 本固件只用 ABI，不占用原工程的 SPI/ESC 引脚约定；可与电机控制板分时烧录，或另板运行。
+## 烧录 / PC
 
-## 烧录
+```powershell
+# 烧录 COM6
+E:\OEZCON\mcoder\ESP32_AS5047P_ABI_Monitor\flash_com6.bat
 
-- 板型：`esp32:esp32:esp32s3:PSRAM=opi`（本机 8MB Embedded PSRAM；`flash_com6.bat` 已写死）
-- Sketch：`firmware/ESP32AbiMonitor`
-- 串口波特率：**921600**
-- 成功时应看到 `spiram_free=` 很大，且 `log_cap=600000 psram=1`（约 **10 min @1kHz** / **5 min @2kHz**）
-
-上电应看到：
-
-```text
-# ESP32 AS5047P ABI Monitor
-# BLE name=OEZ-ABI ...
-# ready. MONITOR START to record |rpm|>20
+cd E:\OEZCON\mcoder\ESP32_AS5047P_ABI_Monitor\pc
+pip install -r requirements.txt
+python abi_monitor.py --ble    # 或 run_ble.bat
+python test_snap_parse_offline.py   # 无硬件自检解析
 ```
 
-## 协议（USB / BLE Nordic UART）
+上电应见：`FW=monitor-v26-ble-ram`，`BLE name=OEZ-ABI`。
 
-### 实时遥测（默认约 20 Hz）
-
-```text
-L,t_ms,rpm,dir,mon,log_n,log_drop,meas_hz,counts
-```
-
-- `dir`：`+1` / `0` / `-1`
-- `mon`：`1`=监控中（可记录），`0`=不记录
-
-### 指令
+## 关键指令
 
 | 指令 | 作用 |
 |------|------|
-| `MONITOR START` | 开始监控（允许记录） |
-| `MONITOR STOP` | 停止监控（不再记录） |
-| `MONITOR?` | 查询 |
-| `LOG CLEAR` | 清空板内环 |
-| `LOG?` | 条数/容量 |
-| `LOG DUMP [n]` | 导出记录；行 `D,idx,t_ms,rpm,dir`，结束 `D END n` |
-| `ABI?` | 引脚/采样率/当前转速 |
-| `BLE RATE <5..50>` | BLE/USB 遥测频率 |
-| `PING` | `# PONG` |
+| `MONITOR START` / `STOP` | 武装 / 解除 |
+| `REC NOW` | 强制直采 |
+| `SD SAVE` | RAM→SD |
+| `DUMP BIN BLE` | 蓝牙从 **RAM** 拉二进制（hex+ACK） |
+| `DUMP BIN` | USB 串口二进制 |
+| `USB DISK ON` / `OFF` | Native USB 只读 U 盘 |
+| `TIME <unix_ms>` | 对时（文件名墙钟） |
 
-## PC（USB / 蓝牙）
+## PC 语音（仅 PC，ESP 不播）
 
-```powershell
-cd E:\OEZCON\mcoder\ESP32_AS5047P_ABI_Monitor\pc
-pip install -r requirements.txt
-python abi_monitor.py
-# 或双击 run_monitor.bat / run_ble.bat（默认选中蓝牙）
-```
+正式提醒直接说内容，例如：`已经开始监控，请加油`、`探测到了`、`记录完毕`。  
+冒烟脚本里的系统步骤才说：`测试，测试，xxxx`。
 
-界面顶部 **连接方式**：
+## Android APK（v1.5.0-ble-snap）
 
-| 方式 | 操作 |
-|------|------|
-| **USB串口** | 选 COM → 连接 |
-| **蓝牙BLE** | 点「扫描蓝牙」→ 选 `OEZ-ABI` → 连接 |
-
-- 依赖：`bleak`（已在 `requirements.txt`）
-- 连上后自动发 `TIME` 对时；状态栏显示收包数
-- 注意：同一时间板子只能被 **手机或 PC 一方** 蓝牙连接
-## Android
+已与固件 v26 对齐：监控 → SD → 自动 `DUMP BIN BLE`（读 RAM）。说明见 `docs/Android-APK更新.md`。
 
 ```bat
-cd android\AbiRpmMonitor
-gradlew.bat assembleDebug
+cd /d E:\OEZCON\mcoder\ESP32_AS5047P_ABI_Monitor\android\AbiRpmMonitor
+build_apk.bat
+adb install -r E:\OEZCON\mcoder\AbiRpmMonitor-debug.apk
 ```
 
-APK：`app\build\outputs\apk\debug\app-debug.apk`  
-手机：扫描 → 选 **OEZ-ABI** → 连接 → **开始监控** / **停止监控** → **拉取回放**。
-
-## 板内容量
-
-编译打开 **OPI PSRAM** 后优先分配约 **600000** 点（≈3.6MB）：
-
-| 写入率 | 满环时长 |
-|--------|----------|
-| 1 kHz | ≈ **600 s（10 min）** |
-| 2 kHz（当前采样/记录） | ≈ **300 s（5 min）** |
-
-无 PSRAM 时回退 12k/4k。环满覆盖最旧，`log_drop` 累加。清空：`LOG CLEAR` / UI「清空记录」。
+手机：扫描 **OEZ-ABI** → 连接 → **开始监控** → 加油 → 自动取回（或点 **拉取RAM**）。  
+注意：同一时间板子只能被 **PC 或手机一方** 蓝牙连接。
