@@ -7,7 +7,7 @@ a = Analysis(
     ['abi_monitor.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('help', 'help')],
     hiddenimports=[
         'ble_link',
         'curve_studio',

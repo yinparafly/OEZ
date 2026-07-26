@@ -1,15 +1,12 @@
 # 蓝牙取数策略：RAM→SD 存档，BLE 读 RAM（空则 SD 回退）
 
 日期：2026-07-25（下午修订）  
-固件：**`FW=monitor-v37-keep-shot`**（上午基线曾为 `v26-ble-ram`）
+固件：**`FW=monitor-v38-vel-win`**（上一可用冻结：`v37-keep-shot`；更早：`v26-ble-ram`）
 
 ## 备份
 
-可用的 USB 读卡版已冻结在：
-
-`backups/usb-msc-stable-2026-07-25/`
-
-（含当时 `firmware/` + `pc/` + docs。出问题可整目录拷回。）
+- keep-shot + BLE 可用冻结：`backups/v37-keep-shot-2026-07-26/`（见 `BACKUP_README.md`）
+- USB 读卡版：`backups/usb-msc-stable-2026-07-25/`
 
 下午手机 BLE 详志：`docs/工作日志与总结-2026-07-25下午-手机BLE.md`。
 

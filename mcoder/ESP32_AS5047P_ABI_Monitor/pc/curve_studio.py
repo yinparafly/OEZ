@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-曲线工作室（Sony Vegas 风格）：
-  - 时间线由若干 Clip 组成
-  - Cut 刀片：在曲线上点击切开，分成两段
-  - 选中一段 → 删除（剪掉不要的部分）
-  - 单图：仅 RPM / 仅 S / 仅 a / 三线归一化
+曲线工作室（Sony Vegas + MATLAB/Origin 式毛刺处理）：
+  - Cut / 选择 / 圈毛刺
+  - 圈毛刺：单击 / 矩形框 / 套索；动作=排除(掩码红叉) 或 删除点(其余 xy 不变)
+  - 平滑重算在后台线程，避免 2kHz 大数据卡 UI
+  - 导出：同一 X + Y原始 + Y平滑
 """
 
 from __future__ import annotations
 
 import csv
+import threading
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,11 +37,31 @@ from snap_edit import (
 )
 
 
+def _point_in_poly(x: float, y: float, poly: Sequence[tuple[float, float]]) -> bool:
+    """射线法：点是否在多边形内（含边界近似）。"""
+    n = len(poly)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-30) + xi
+        ):
+            inside = not inside
+        j = i
+    return inside
+
+
 @dataclass
 class Clip:
     rows: list
     name: str = ""
     uid: int = 0
+    # 排除索引（相对本段 rows）；不改 rows 数值，仅拟合时跳过
+    excluded: set = field(default_factory=set)
 
 
 def _norm01(ys: list[float], *, signed: bool = False) -> tuple[list[float], float, float]:
@@ -110,13 +131,21 @@ class CurveStudio(tk.Toplevel):
         self._on_commit = on_commit
         self._title = title
         self._clips: list[Clip] = [
-            Clip(rows=list(rows), name="Clip1", uid=CurveStudio._uid)
+            Clip(rows=list(rows), name="Clip1", uid=CurveStudio._uid, excluded=set())
         ]
         CurveStudio._uid += 1
         self._active = 0
-        self._tool = tk.StringVar(value="cut")  # cut | select | spike
+        self._tool = tk.StringVar(value="cut")  # cut | select | exclude
+        self._exclude_action = tk.StringVar(value="mask")  # mask | delete
+        self._select_shape = tk.StringVar(value="rect")  # rect | lasso
         self._drag_start_px: tuple[float, float] | None = None
-        self._spike_undo: list[list] = []  # 每项 = 各 clip.rows 深拷贝
+        self._lasso_px: list[tuple[float, float]] = []
+        self._lasso_item: int | None = None
+        # 撤销：每项 = [(rows, excluded), ...] 各 clip
+        self._spike_undo: list[list[tuple[list, set]]] = []
+        self._refresh_seq = 0
+        self._refresh_lock = threading.Lock()
+        self._refreshing = False
 
         self.var_i0 = tk.StringVar(value="auto")
         self.var_len = tk.StringVar(value="1.0")
@@ -142,20 +171,24 @@ class CurveStudio(tk.Toplevel):
         self.var_cut_t = tk.StringVar(value="—")
         self.var_playhead = 0.0
         self._last_plot_view: str | None = None
+        self._smooth_refresh_job: str | None = None
 
         self._build()
+        self._bind_smooth_auto_refresh()
         self._i0_first(refresh=False)
         self.refresh()
         self.bind("<KeyPress-c>", lambda e: self._set_tool("cut"))
         self.bind("<KeyPress-C>", lambda e: self._set_tool("cut"))
         self.bind("<KeyPress-v>", lambda e: self._set_tool("select"))
         self.bind("<KeyPress-V>", lambda e: self._set_tool("select"))
-        self.bind("<KeyPress-b>", lambda e: self._set_tool("spike"))
-        self.bind("<KeyPress-B>", lambda e: self._set_tool("spike"))
+        self.bind("<KeyPress-e>", lambda e: self._set_tool("exclude"))
+        self.bind("<KeyPress-E>", lambda e: self._set_tool("exclude"))
+        self.bind("<KeyPress-b>", lambda e: self._set_tool("exclude"))  # 兼容旧快捷键
+        self.bind("<KeyPress-B>", lambda e: self._set_tool("exclude"))
         self.bind("<Control-z>", lambda e: self._undo_spike())
         self.bind("<Control-Z>", lambda e: self._undo_spike())
-        self.bind("<Delete>", lambda e: self._delete_active())
-        self.bind("<BackSpace>", lambda e: self._delete_active())
+        self.bind("<Delete>", lambda e: self._on_delete_key())
+        self.bind("<BackSpace>", lambda e: self._on_delete_key())
         self.focus_set()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -165,32 +198,76 @@ class CurveStudio(tk.Toplevel):
         ttk.Label(top, text=self._title, font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT)
         ttk.Label(top, textvariable=self.var_status, foreground="#333").pack(side=tk.LEFT, padx=12)
 
-        tools = ttk.LabelFrame(self, text="工具（Vegas 风格）", padding=6)
+        tools = ttk.LabelFrame(self, text="工具", padding=6)
         tools.pack(fill=tk.X, padx=8, pady=2)
+        # 两行布局，避免窄屏把「圈毛刺」挤出窗口
+        row1 = ttk.Frame(tools)
+        row1.pack(fill=tk.X, pady=2)
+        row2 = ttk.Frame(tools)
+        row2.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row1, text="模式:").pack(side=tk.LEFT, padx=(0, 4))
+        # tk.Button 才能稳定改底色，突出「圈毛刺」
+        self.btn_tool_cut = tk.Button(
+            row1, text="Cut刀片 (C)", width=12, command=lambda: self._set_tool("cut")
+        )
+        self.btn_tool_cut.pack(side=tk.LEFT, padx=3)
+        self.btn_tool_sel = tk.Button(
+            row1, text="选择 (V)", width=10, command=lambda: self._set_tool("select")
+        )
+        self.btn_tool_sel.pack(side=tk.LEFT, padx=3)
+        self.btn_tool_excl = tk.Button(
+            row1,
+            text="圈毛刺 (E)",
+            width=12,
+            command=lambda: self._set_tool("exclude"),
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.btn_tool_excl.pack(side=tk.LEFT, padx=6)
+        ttk.Label(row1, text="刀口 t=").pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Label(row1, textvariable=self.var_cut_t, width=10).pack(side=tk.LEFT)
+
+        row1b = ttk.Frame(tools)
+        row1b.pack(fill=tk.X, pady=2)
+        ttk.Label(row1b, text="圈毛刺动作:").pack(side=tk.LEFT)
         ttk.Radiobutton(
-            tools, text="✂ Cut 刀片 (C)", variable=self._tool, value="cut", command=self._tool_hint
-        ).pack(side=tk.LEFT, padx=6)
-        ttk.Radiobutton(
-            tools, text="▸ 选择 (V)", variable=self._tool, value="select", command=self._tool_hint
-        ).pack(side=tk.LEFT, padx=6)
-        ttk.Radiobutton(
-            tools,
-            text="○ 圈毛刺 (B)",
-            variable=self._tool,
-            value="spike",
+            row1b, text="排除(红叉/掩码)", variable=self._exclude_action, value="mask",
             command=self._tool_hint,
-        ).pack(side=tk.LEFT, padx=6)
-        ttk.Button(tools, text="在刀口切开", command=self._cut_at_playhead).pack(side=tk.LEFT, padx=8)
-        ttk.Button(tools, text="删除选中段 Del", command=self._delete_active).pack(side=tk.LEFT, padx=4)
-        ttk.Button(tools, text="合并全部段", command=self._merge_all).pack(side=tk.LEFT, padx=4)
-        ttk.Button(tools, text="撤销剔刺 Ctrl+Z", command=self._undo_spike).pack(side=tk.LEFT, padx=4)
-        ttk.Label(tools, text="刀口 t=").pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Label(tools, textvariable=self.var_cut_t, width=10).pack(side=tk.LEFT)
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(
+            row1b,
+            text="删除点(其余xy不变)",
+            variable=self._exclude_action,
+            value="delete",
+            command=self._tool_hint,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row1b, text="  选区:").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Radiobutton(
+            row1b, text="矩形", variable=self._select_shape, value="rect",
+            command=self._tool_hint,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(
+            row1b, text="套索", variable=self._select_shape, value="lasso",
+            command=self._tool_hint,
+        ).pack(side=tk.LEFT, padx=4)
         ttk.Label(
-            tools,
-            text="  圈毛刺：拖框选中 → 松手用前后点均值替换（不删采样时刻）",
+            row1b,
+            text="单击切换排除；框/套索批量；删除=从序列去掉该点",
             foreground="#555",
-        ).pack(side=tk.LEFT, padx=8)
+        ).pack(side=tk.LEFT, padx=10)
+
+        ttk.Button(row2, text="在刀口切开", command=self._cut_at_playhead).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row2, text="删除选中段", command=self._delete_active).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row2, text="合并全部段", command=self._merge_all).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row2, text="清除排除", command=self._clear_exclusions).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row2, text="删除已排除点", command=self._delete_excluded_points).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(row2, text="固化排除→邻点", command=self._bake_exclusions).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(row2, text="撤销 Ctrl+Z", command=self._undo_spike).pack(side=tk.LEFT, padx=3)
+        self._paint_tool_buttons()
 
         view = ttk.LabelFrame(self, text="显示", padding=4)
         view.pack(fill=tk.X, padx=8, pady=2)
@@ -256,7 +333,6 @@ class CurveStudio(tk.Toplevel):
             values=("7", "11", "21", "41", "81"),
         )
         self.cmb_rpm_win.pack(side=tk.LEFT, padx=2)
-        self.cmb_rpm_win.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
         ttk.Label(sm, text="Hampel窗").pack(side=tk.LEFT, padx=(6, 0))
         self.ent_despike_win = ttk.Combobox(
             sm,
@@ -277,8 +353,9 @@ class CurveStudio(tk.Toplevel):
         ttk.Label(sm, text="限幅RPM/s").pack(side=tk.LEFT, padx=(6, 0))
         self.ent_rate = ttk.Entry(sm, textvariable=self.var_max_rpm_per_s, width=7)
         self.ent_rate.pack(side=tk.LEFT, padx=2)
-        ttk.Button(sm, text="应用", command=self.refresh).pack(side=tk.LEFT, padx=6)
+        ttk.Label(sm, text="改参数即重绘", foreground="#555").pack(side=tk.LEFT, padx=6)
         ttk.Button(sm, text="❓", width=3, command=self._show_smooth_help).pack(side=tk.LEFT, padx=2)
+        ttk.Button(sm, text="转速算法", command=self._show_counts_rpm_help).pack(side=tk.LEFT, padx=4)
         self._on_rpm_method_change(refresh=False)
 
         gate = ttk.LabelFrame(self, text="启动段门控（裁掉脏启动，2kHz 原始点保留到裁切前）", padding=4)
@@ -344,14 +421,14 @@ class CurveStudio(tk.Toplevel):
         ttk.Entry(opts, textvariable=self.var_post_smooth, width=3).pack(side=tk.LEFT, padx=2)
         ttk.Button(opts, text="重算a", command=self.refresh).pack(side=tk.LEFT, padx=4)
         ttk.Button(opts, text="❓", width=3, command=self._show_diff_help).pack(side=tk.LEFT, padx=4)
-        ttk.Button(opts, text="导出时间线 CSV", command=self._export_csv).pack(side=tk.LEFT, padx=8)
+        ttk.Button(opts, text="导出重算曲线", command=self._export_csv).pack(side=tk.LEFT, padx=8)
         ttk.Button(opts, text="写回主列表", command=self._commit).pack(side=tk.LEFT, padx=2)
         ttk.Button(opts, text="恢复原片", command=self._restore).pack(side=tk.LEFT, padx=2)
 
         # 主曲线
         chart_fr = ttk.LabelFrame(
             self,
-            text="监视器 · Cut点击切开 / 选择点刀口 / 圈毛刺拖框剔除",
+            text="监视器 · 先点上方「圈毛刺」再点选/拖框毛刺点（红叉）",
             padding=4,
         )
         chart_fr.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
@@ -399,7 +476,7 @@ class CurveStudio(tk.Toplevel):
         ms = w * 0.5  # 2 kHz
         msg = (
             "【为何要平滑】\n"
-            "板内 RPM 已是 ABI 计数的一次差分（数字台阶）。\n"
+            "板内 / 上位机：v40 起 BIN 存 counts；蓝线 RPM 由 PC 多拍差分得到。\n"
             "再对 RPM 求导得加速度 a=d(RPM)/dt，会放大台阶噪声，\n"
             "所以必须先平滑 / 用更稳的差分，而不是裸前向差分。\n"
             "\n"
@@ -435,7 +512,12 @@ class CurveStudio(tk.Toplevel):
         messagebox.showinfo("微分方法备注", msg)
 
     def _show_smooth_help(self) -> None:
-        lines = ["【电机转速平滑方法】\n"]
+        lines = [
+            "【电机转速平滑方法】\n"
+            "蓝线 rpm_raw：v40 起由 PC 从 counts 多拍差分得到（默认窗 32≈16ms），"
+            "详见「转速算法」按钮。\n"
+            "橙线：在蓝线（及排除掩码）上再平滑。\n\n"
+        ]
         for key, lab in RPM_SMOOTH_METHODS:
             lines.append(f"• {key}\n    {lab}\n")
         lines.append(
@@ -447,12 +529,36 @@ class CurveStudio(tk.Toplevel):
             "  限幅RPM/s — rate_clamp / rate_clamp_ma：最大 |dRPM/dt|\n"
             "    默认 80000 → @2kHz 约 ±40 RPM/点（夹传感器跳变，非朋友文中的 500/点）\n"
             "\n"
-            "启动段：检测 |RPM| 门 + 可选 I+1，再「裁掉启动前」；ESP32 仍存 2kHz 原始。\n"
+            "启动段：检测 |RPM| 门 + 可选 I+1，再「裁掉启动前」；BIN 仍存 2kHz counts。\n"
             "\n"
-            "圈毛刺：选「○ 圈毛刺」后在原始曲线上拖框，松手用前后点均值\n"
-            "替换框内点（连续段做线性插值），时间轴不删点。Ctrl+Z 撤销。"
+            "圈毛刺：选「圈毛刺」后点选/拖框/套索；动作=排除(红叉) 或 删除点。\n"
+            "排除不改 counts；「固化排除」才改表内数值。Ctrl+Z 撤销。"
         )
         messagebox.showinfo("转速平滑备注", "".join(lines))
+
+    def _show_counts_rpm_help(self) -> None:
+        try:
+            from abi_monitor import help_text
+        except Exception:  # noqa: BLE001
+            help_text = None  # type: ignore
+        body = (
+            help_text("转速计算方法.md")
+            if help_text
+            else "请从主窗口打开「帮助·转速计算」。"
+        )
+        win = tk.Toplevel(self)
+        win.title("帮助 · 转速计算方法")
+        win.geometry("720x560")
+        frm = ttk.Frame(win, padding=8)
+        frm.pack(fill=tk.BOTH, expand=True)
+        txt = tk.Text(frm, wrap=tk.WORD, undo=False)
+        sb = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.insert("1.0", body)
+        txt.configure(state=tk.DISABLED)
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=6)
 
     def _show_only_raw(self) -> None:
         self.var_show_raw.set(True)
@@ -491,6 +597,53 @@ class CurveStudio(tk.Toplevel):
         """鼠标在曲线图上时：向前滚放大、向后滚缩小（光标为中心）。"""
         self.chart._on_mousewheel(evt)
         return "break"
+
+    def _schedule_smooth_refresh(self, *_args) -> None:
+        """平滑参数变更后防抖重绘（打字时约 200ms 合并一次）。"""
+        if self._smooth_refresh_job is not None:
+            try:
+                self.after_cancel(self._smooth_refresh_job)
+            except tk.TclError:
+                pass
+        self._smooth_refresh_job = self.after(200, self._do_smooth_refresh)
+
+    def _do_smooth_refresh(self) -> None:
+        self._smooth_refresh_job = None
+        self.refresh()
+
+    def _bind_smooth_auto_refresh(self) -> None:
+        """方法/窗/σ/EMA/IIR/限幅等一改就自动重绘，无需点应用。"""
+        for var in (
+            self.var_rpm_method,
+            self.var_rpm_smooth,
+            self.var_despike_win,
+            self.var_despike_sigma,
+            self.var_ema_alpha,
+            self.var_iir_fc,
+            self.var_max_rpm_per_s,
+            self.var_smooth,
+            self.var_diff_method,
+            self.var_post_smooth,
+        ):
+            var.trace_add("write", self._schedule_smooth_refresh)
+        for w in (
+            getattr(self, "cmb_rpm_method", None),
+            getattr(self, "cmb_rpm_win", None),
+            getattr(self, "ent_despike_win", None),
+            getattr(self, "cmb_diff", None),
+            getattr(self, "cmb_smooth", None),
+        ):
+            if w is not None:
+                w.bind("<<ComboboxSelected>>", lambda _e: self._schedule_smooth_refresh(), add="+")
+        for w in (
+            getattr(self, "ent_despike_sigma", None),
+            getattr(self, "ent_ema", None),
+            getattr(self, "ent_iir", None),
+            getattr(self, "ent_rate", None),
+        ):
+            if w is not None:
+                w.bind("<Return>", lambda _e: self._schedule_smooth_refresh(), add="+")
+                w.bind("<FocusOut>", lambda _e: self._schedule_smooth_refresh(), add="+")
 
     def _on_rpm_method_change(self, refresh: bool = True) -> None:
         m = (self.var_rpm_method.get() or "hampel_ma").strip()
@@ -632,19 +785,99 @@ class CurveStudio(tk.Toplevel):
 
     def _set_tool(self, name: str) -> None:
         self._tool.set(name)
+        self._paint_tool_buttons()
         self._tool_hint()
+
+    def _paint_tool_buttons(self) -> None:
+        """高亮当前工具；圈毛刺用醒目红色。"""
+        idle = {"bg": "#e8e8e8", "fg": "#222", "relief": tk.RAISED, "activebackground": "#ddd"}
+        on = {"bg": "#2d6cdf", "fg": "#fff", "relief": tk.SUNKEN, "activebackground": "#1f5bb8"}
+        on_ex = {"bg": "#c0392b", "fg": "#fff", "relief": tk.SUNKEN, "activebackground": "#a93226"}
+        tool = self._tool.get()
+        if hasattr(self, "btn_tool_cut"):
+            self.btn_tool_cut.configure(**(on if tool == "cut" else idle))
+            self.btn_tool_sel.configure(**(on if tool == "select" else idle))
+            self.btn_tool_excl.configure(**(on_ex if tool == "exclude" else idle))
 
     def _tool_hint(self) -> None:
         tool = self._tool.get()
         if tool == "cut":
             self.chart.canvas.configure(cursor="crosshair")
             self.var_status.set("Cut 模式：在曲线上点击切开")
-        elif tool == "spike":
+        elif tool == "exclude":
             self.chart.canvas.configure(cursor="tcross")
-            self.var_status.set("圈毛刺：按住拖框 → 松手剔除（邻点均值替换）")
+            act = "删除点" if self._exclude_action.get() == "delete" else "排除(红叉)"
+            shape = "套索" if self._select_shape.get() == "lasso" else "矩形"
+            self.var_status.set(
+                f"圈毛刺：动作={act} 选区={shape} · 单击点 / 拖选 · 后台平滑重算"
+            )
+            try:
+                self.chart.canvas.focus_set()
+            except tk.TclError:
+                pass
         else:
             self.chart.canvas.configure(cursor="arrow")
             self.var_status.set("选择模式：点曲线设刀口，点时间线选段")
+
+    def _on_delete_key(self) -> None:
+        """排除模式下 Del=删除已排除点；否则删选中段。"""
+        if self._tool.get() == "exclude":
+            if self._total_excluded() > 0:
+                self._delete_excluded_points()
+            else:
+                self._clear_exclusions()
+        else:
+            self._delete_active()
+
+    def _clear_lasso_overlay(self) -> None:
+        if self._lasso_item is not None:
+            try:
+                self.chart.canvas.delete(self._lasso_item)
+            except tk.TclError:
+                pass
+            self._lasso_item = None
+        self._lasso_px = []
+
+    def _draw_lasso_overlay(self) -> None:
+        c = self.chart.canvas
+        if self._lasso_item is not None:
+            c.delete(self._lasso_item)
+            self._lasso_item = None
+        if len(self._lasso_px) < 2:
+            return
+        flat: list[float] = []
+        for x, y in self._lasso_px:
+            flat.extend((x, y))
+        # 闭合预览
+        flat.extend(self._lasso_px[0])
+        self._lasso_item = c.create_line(
+            *flat, fill="#e74c3c", width=2, dash=(4, 2), tags="lasso"
+        )
+
+    def _total_excluded(self) -> int:
+        return sum(len(c.excluded) for c in self._clips)
+
+    def _excluded_global_mask(self, rows: list, spans: list[tuple[int, float, float]]) -> list[bool]:
+        """与 concat_timeline(rows) 对齐的排除掩码。"""
+        mask = [False] * len(rows)
+        gi = 0
+        for ci, (_i, _t0, _t1) in enumerate(spans):
+            clip = self._clips[ci]
+            n = len(clip.rows)
+            for li in range(n):
+                if gi < len(mask) and li in clip.excluded:
+                    mask[gi] = True
+                gi += 1
+        return mask
+
+    def _rpm_for_fit(self, rows: list, mask: list[bool]) -> list[float]:
+        """拟合用转速：排除点用邻点线性填充，原始 rows 不动。"""
+        rpm = [float(r[1]) for r in rows]
+        idx = [i for i, m in enumerate(mask) if m]
+        if not idx:
+            return rpm
+        filled, _ = replace_indices_neighbor_avg(rpm, idx)
+        return filled
 
     def _i0_first(self, refresh: bool = True) -> None:
         rows = self._timeline_rows()
@@ -741,18 +974,27 @@ class CurveStudio(tk.Toplevel):
         self.refresh()
 
     def _on_chart_press(self, evt) -> None:
-        if self._tool.get() == "spike":
+        if self._tool.get() == "exclude":
             self._drag_start_px = (float(evt.x), float(evt.y))
-            pt = self.chart.data_from_pixel(evt.x, evt.y)
-            if pt:
-                t, y = pt
-                self.chart.set_selection_rect((t, t, y, y))
+            if self._select_shape.get() == "lasso":
+                self._clear_lasso_overlay()
+                self._lasso_px = [(float(evt.x), float(evt.y))]
+                self._draw_lasso_overlay()
+            else:
+                pt = self.chart.data_from_pixel(evt.x, evt.y)
+                if pt:
+                    t, y = pt
+                    self.chart.set_selection_rect((t, t, y, y))
             return
-        # cut / select：按下即定位（与旧单击一致）
         self._on_chart_click(evt)
 
     def _on_chart_motion(self, evt) -> None:
-        if self._tool.get() != "spike" or not self._drag_start_px:
+        if self._tool.get() != "exclude" or not self._drag_start_px:
+            return
+        if self._select_shape.get() == "lasso":
+            self._lasso_px.append((float(evt.x), float(evt.y)))
+            if len(self._lasso_px) % 2 == 0:
+                self._draw_lasso_overlay()
             return
         x0, y0 = self._drag_start_px
         p0 = self.chart.data_from_pixel(x0, y0)
@@ -762,20 +1004,35 @@ class CurveStudio(tk.Toplevel):
         self.chart.set_selection_rect((p0[0], p1[0], p0[1], p1[1]))
 
     def _on_chart_release(self, evt) -> None:
-        if self._tool.get() != "spike" or not self._drag_start_px:
+        if self._tool.get() != "exclude" or not self._drag_start_px:
             return
         x0, y0 = self._drag_start_px
         self._drag_start_px = None
+        if self._select_shape.get() == "lasso":
+            self._lasso_px.append((float(evt.x), float(evt.y)))
+            poly = list(self._lasso_px)
+            self._clear_lasso_overlay()
+            dx = abs(float(evt.x) - x0)
+            dy = abs(float(evt.y) - y0)
+            if dx < 6 and dy < 6 and len(poly) < 8:
+                self._apply_hits_or_click(float(evt.x), float(evt.y), None)
+                return
+            hits = self._hit_points_in_lasso(poly)
+            self._apply_hits_or_click(float(evt.x), float(evt.y), hits)
+            return
+
         p0 = self.chart.data_from_pixel(x0, y0)
         p1 = self.chart.data_from_pixel(evt.x, evt.y)
         self.chart.set_selection_rect(None)
         if not p0 or not p1:
             return
-        # 太小的框忽略（误点）
-        if abs(p1[0] - p0[0]) < 0.002 and abs(p1[1] - p0[1]) < 5:
-            self.var_status.set("框太小，请拖大一点圈住毛刺")
+        dx = abs(float(evt.x) - x0)
+        dy = abs(float(evt.y) - y0)
+        if dx < 6 and dy < 6:
+            self._apply_hits_or_click(float(evt.x), float(evt.y), None)
             return
-        self._despike_box(p0[0], p1[0], p0[1], p1[1])
+        hits = self._hit_points_in_box(p0[0], p1[0], p0[1], p1[1])
+        self._apply_hits_or_click(float(evt.x), float(evt.y), hits)
 
     def _on_chart_click(self, evt) -> None:
         t = self.chart.x_from_pixel(evt.x)
@@ -794,26 +1051,35 @@ class CurveStudio(tk.Toplevel):
             self.refresh()
 
     def _push_spike_undo(self) -> None:
-        snap = [list(c.rows) for c in self._clips]
+        snap = [(list(c.rows), set(c.excluded)) for c in self._clips]
         self._spike_undo.append(snap)
         if len(self._spike_undo) > 30:
             self._spike_undo.pop(0)
 
     def _undo_spike(self) -> None:
         if not self._spike_undo:
-            self.var_status.set("没有可撤销的剔刺")
+            self.var_status.set("没有可撤销的操作")
             return
         snap = self._spike_undo.pop()
-        for c, rows in zip(self._clips, snap):
-            c.rows = list(rows)
-        self.var_status.set("已撤销上一次剔刺")
+        if len(snap) != len(self._clips):
+            # 段数变了则尽量按顺序恢复
+            n = min(len(snap), len(self._clips))
+            for i in range(n):
+                self._clips[i].rows = list(snap[i][0])
+                self._clips[i].excluded = set(snap[i][1])
+        else:
+            for c, (rows, excl) in zip(self._clips, snap):
+                c.rows = list(rows)
+                c.excluded = set(excl)
+        self.var_status.set("已撤销上一次排除/固化")
         self.refresh()
 
-    def _despike_box(self, t_a: float, t_b: float, y_a: float, y_b: float) -> None:
-        """框选毛刺：邻点均值/段内线性插值替换，不删时间点。"""
+    def _hit_points_in_box(
+        self, t_a: float, t_b: float, y_a: float, y_b: float
+    ) -> list[tuple[int, int]]:
+        """返回 (clip_i, local_i) 列表。转速视图用 |RPM| 匹配框。"""
         t0, t1 = min(t_a, t_b), max(t_a, t_b)
         view = self.var_view.get()
-        # 转速图：t+y 双约束；其它视图：仅按时间（避免用 a/S 坐标误伤）
         if view in ("rpm", "all"):
             y_lo, y_hi = min(y_a, y_b), max(y_a, y_b)
             use_abs = True
@@ -821,32 +1087,227 @@ class CurveStudio(tk.Toplevel):
             y_lo, y_hi = float("-inf"), float("inf")
             use_abs = False
         _, _, spans = concat_timeline(self._clips)
-        self._push_spike_undo()
-        total_n = 0
+        hits: list[tuple[int, int]] = []
         for ci, (_i, t_start, _t_end) in enumerate(spans):
             clip = self._clips[ci]
             if not clip.rows:
                 continue
             base = t_base_ms(clip.rows)
-            rpms = [float(r[1]) for r in clip.rows]
-            indices: list[int] = []
             for li, r in enumerate(clip.rows):
                 tg = t_start + (float(r[0]) - base) / 1000.0
                 if tg < t0 or tg > t1:
                     continue
-                yv = abs(rpms[li]) if use_abs else rpms[li]
+                yv = abs(float(r[1])) if use_abs else float(r[1])
                 if y_lo <= yv <= y_hi:
-                    indices.append(li)
-            if not indices:
-                continue
-            new_rpms, n_rep = replace_indices_neighbor_avg(rpms, indices)
-            clip.rows = apply_rpm_replacements(clip.rows, new_rpms)
-            total_n += n_rep
-        if total_n == 0:
-            self._spike_undo.pop()  # 无改动不占撤销栈
-            self.var_status.set("框内无点命中（建议在「仅转速」视图圈原始曲线）")
+                    hits.append((ci, li))
+        return hits
+
+    def _exclude_nearest_click(self, px: float, py: float) -> None:
+        """单击：切换最近采样点的排除状态（像素距离阈值）。"""
+        rows, _, spans = concat_timeline(self._clips)
+        if not rows:
+            return
+        base = t_base_ms(rows)
+        best: tuple[float, int, int] | None = None  # dist2, ci, li
+        gi = 0
+        for ci, (_i, t_start, _t_end) in enumerate(spans):
+            clip = self._clips[ci]
+            cbase = t_base_ms(clip.rows) if clip.rows else 0.0
+            for li, r in enumerate(clip.rows):
+                tg = t_start + (float(r[0]) - cbase) / 1000.0
+                yv = abs(float(r[1]))
+                # 用数据→像素近似：通过 chart 当前变换
+                # 在视窗内找最近点
+                cx = None
+                # 反算：用 x_from/y 的逆 — 直接用 data 坐标差归一化不稳，改用像素
+                if self.chart._xf and self.chart._yf:
+                    x0, x1, pl, pw = self.chart._xf
+                    y0, y1, pt, ph = self.chart._yf
+                    if pw > 0 and ph > 0:
+                        sx = pl + (tg - x0) / (x1 - x0) * pw
+                        sy = pt + ph - (yv - y0) / (y1 - y0) * ph
+                        d2 = (sx - px) ** 2 + (sy - py) ** 2
+                        if best is None or d2 < best[0]:
+                            best = (d2, ci, li)
+                gi += 1
+        if best is None or best[0] > 14 ** 2:
+            self.var_status.set("未点中采样点（请靠近曲线上的点再点，或拖框）")
+            return
+        _d2, ci, li = best
+        self._push_spike_undo()
+        excl = self._clips[ci].excluded
+        if li in excl:
+            excl.discard(li)
+            self.var_status.set(f"已恢复点（段{ci} #{li}）· 排除总数={self._total_excluded()}")
         else:
-            self.var_status.set(f"已剔除毛刺 {total_n} 点（邻点均值/线性插值，时刻保留）")
+            excl.add(li)
+            self.var_status.set(f"已排除点（段{ci} #{li}）· 排除总数={self._total_excluded()}")
+        self.refresh()
+
+    def _exclude_box(self, t_a: float, t_b: float, y_a: float, y_b: float) -> None:
+        """框选：将框内点加入排除集（不改原始数值）。"""
+        hits = self._hit_points_in_box(t_a, t_b, y_a, y_b)
+        self._apply_hits_or_click(0.0, 0.0, hits if hits else [])
+
+    def _apply_hits_or_click(
+        self, px: float, py: float, hits: list[tuple[int, int]] | None
+    ) -> None:
+        """hits=None → 单击最近点；否则批量排除或删除。"""
+        if hits is None:
+            if self._exclude_action.get() == "delete":
+                one = self._nearest_hit(px, py)
+                if one is None:
+                    self.var_status.set("未点中采样点")
+                    return
+                self._delete_point_hits([one])
+            else:
+                self._exclude_nearest_click(px, py)
+            return
+        if not hits:
+            self.var_status.set("选区内无点命中（建议「仅转速」视图）")
+            return
+        if self._exclude_action.get() == "delete":
+            self._delete_point_hits(hits)
+        else:
+            self._exclude_hits(hits)
+
+    def _nearest_hit(self, px: float, py: float) -> tuple[int, int] | None:
+        _, _, spans = concat_timeline(self._clips)
+        best: tuple[float, int, int] | None = None
+        if not self.chart._xf or not self.chart._yf:
+            return None
+        x0, x1, pl, pw = self.chart._xf
+        y0, y1, pt, ph = self.chart._yf
+        if pw <= 0 or ph <= 0:
+            return None
+        for ci, (_i, t_start, _t_end) in enumerate(spans):
+            clip = self._clips[ci]
+            if not clip.rows:
+                continue
+            cbase = t_base_ms(clip.rows)
+            for li, r in enumerate(clip.rows):
+                tg = t_start + (float(r[0]) - cbase) / 1000.0
+                yv = abs(float(r[1]))
+                sx = pl + (tg - x0) / (x1 - x0) * pw
+                sy = pt + ph - (yv - y0) / (y1 - y0) * ph
+                d2 = (sx - px) ** 2 + (sy - py) ** 2
+                if best is None or d2 < best[0]:
+                    best = (d2, ci, li)
+        if best is None or best[0] > 14 ** 2:
+            return None
+        return best[1], best[2]
+
+    def _hit_points_in_lasso(
+        self, poly_px: list[tuple[float, float]]
+    ) -> list[tuple[int, int]]:
+        if len(poly_px) < 3 or not self.chart._xf or not self.chart._yf:
+            return []
+        _, _, spans = concat_timeline(self._clips)
+        x0, x1, pl, pw = self.chart._xf
+        y0, y1, pt, ph = self.chart._yf
+        if pw <= 0 or ph <= 0:
+            return []
+        hits: list[tuple[int, int]] = []
+        for ci, (_i, t_start, _t_end) in enumerate(spans):
+            clip = self._clips[ci]
+            if not clip.rows:
+                continue
+            cbase = t_base_ms(clip.rows)
+            for li, r in enumerate(clip.rows):
+                tg = t_start + (float(r[0]) - cbase) / 1000.0
+                yv = abs(float(r[1]))
+                sx = pl + (tg - x0) / (x1 - x0) * pw
+                sy = pt + ph - (yv - y0) / (y1 - y0) * ph
+                if _point_in_poly(sx, sy, poly_px):
+                    hits.append((ci, li))
+        return hits
+
+    def _exclude_hits(self, hits: list[tuple[int, int]]) -> None:
+        self._push_spike_undo()
+        n_new = 0
+        for ci, li in hits:
+            if li not in self._clips[ci].excluded:
+                self._clips[ci].excluded.add(li)
+                n_new += 1
+        self.var_status.set(
+            f"排除 +{n_new}（命中{len(hits)}）· 总数={self._total_excluded()} · 表未改"
+        )
+        self.refresh()
+
+    def _delete_point_hits(self, hits: list[tuple[int, int]]) -> None:
+        """从序列删除点；其余点 x/y 原样保留。"""
+        if not hits:
+            return
+        self._push_spike_undo()
+        by_clip: dict[int, set[int]] = {}
+        for ci, li in hits:
+            by_clip.setdefault(ci, set()).add(li)
+        total = 0
+        for ci, idxs in by_clip.items():
+            clip = self._clips[ci]
+            keep = [r for i, r in enumerate(clip.rows) if i not in idxs]
+            new_excl: set[int] = set()
+            new_i = 0
+            for old_i in range(len(clip.rows)):
+                if old_i in idxs:
+                    continue
+                if old_i in clip.excluded:
+                    new_excl.add(new_i)
+                new_i += 1
+            total += len(clip.rows) - len(keep)
+            clip.rows = keep
+            clip.excluded = new_excl
+        self.var_status.set(f"已删除 {total} 个噪点（其余点 xy 未改）")
+        self.refresh()
+
+    def _delete_excluded_points(self) -> None:
+        """把当前所有红叉排除点从序列中删掉。"""
+        hits: list[tuple[int, int]] = []
+        for ci, clip in enumerate(self._clips):
+            for li in sorted(clip.excluded):
+                hits.append((ci, li))
+        if not hits:
+            self.var_status.set("没有排除点可删")
+            return
+        if not messagebox.askyesno(
+            "删除已排除点",
+            f"将从数据中删除 {len(hits)} 个已排除点，其余点的 x/y 不变。确定？",
+        ):
+            return
+        self._delete_point_hits(hits)
+
+    def _clear_exclusions(self) -> None:
+        if self._total_excluded() == 0:
+            self.var_status.set("当前没有排除点")
+            return
+        self._push_spike_undo()
+        for c in self._clips:
+            c.excluded.clear()
+        self.var_status.set("已清除全部排除标记")
+        self.refresh()
+
+    def _bake_exclusions(self) -> None:
+        """可选：把排除点固化为邻点插值写入 rows（真正改数值）。"""
+        if self._total_excluded() == 0:
+            messagebox.showinfo("固化排除", "没有排除点可固化")
+            return
+        if not messagebox.askyesno(
+            "固化排除",
+            "将把已排除点用邻点线性插值写入数据表（不可靠「仅标记」撤销以外的恢复）。\n"
+            "确定？",
+        ):
+            return
+        self._push_spike_undo()
+        total = 0
+        for clip in self._clips:
+            if not clip.excluded or not clip.rows:
+                continue
+            rpms = [float(r[1]) for r in clip.rows]
+            new_rpms, n_rep = replace_indices_neighbor_avg(rpms, sorted(clip.excluded))
+            clip.rows = apply_rpm_replacements(clip.rows, new_rpms)
+            clip.excluded.clear()
+            total += n_rep
+        self.var_status.set(f"已固化 {total} 点到数据表（排除标记已清）")
         self.refresh()
 
     def _cut_at_playhead(self) -> None:
@@ -872,15 +1333,22 @@ class CurveStudio(tk.Toplevel):
         i, t0, _t1 = hit
         local_t = t_global - t0
         rows = self._clips[i].rows
+        excl = set(self._clips[i].excluded)
         left, right = split_at_time(rows, local_t)
         # 避免切在端点产生空段
         if len(left) < 2 or len(right) < 2:
             messagebox.showinfo("Cut", "刀口太靠边，无法切开（两端至少各留一点）")
             return
+        # 排除索引随切开重映射
+        base = t_base_ms(rows)
+        left_idx = [j for j, r in enumerate(rows) if (float(r[0]) - base) / 1000.0 <= local_t]
+        right_idx = [j for j, r in enumerate(rows) if (float(r[0]) - base) / 1000.0 > local_t]
+        left_excl = {ni for ni, oi in enumerate(left_idx) if oi in excl}
+        right_excl = {ni for ni, oi in enumerate(right_idx) if oi in excl}
         name = self._clips[i].name
-        c1 = Clip(rows=left, name=f"{name}a", uid=CurveStudio._uid)
+        c1 = Clip(rows=left, name=f"{name}a", uid=CurveStudio._uid, excluded=left_excl)
         CurveStudio._uid += 1
-        c2 = Clip(rows=right, name=f"{name}b", uid=CurveStudio._uid)
+        c2 = Clip(rows=right, name=f"{name}b", uid=CurveStudio._uid, excluded=right_excl)
         CurveStudio._uid += 1
         self._clips[i : i + 1] = [c1, c2]
         self._active = i + 1  # 选中右段，方便继续删
@@ -907,7 +1375,16 @@ class CurveStudio(tk.Toplevel):
         rows = self._timeline_rows()
         if not rows:
             return
-        self._clips = [Clip(rows=rows, name="Merged", uid=CurveStudio._uid)]
+        # 拼接排除索引
+        merged_excl: set[int] = set()
+        off = 0
+        for c in self._clips:
+            for li in c.excluded:
+                merged_excl.add(off + li)
+            off += len(c.rows)
+        self._clips = [
+            Clip(rows=rows, name="Merged", uid=CurveStudio._uid, excluded=merged_excl)
+        ]
         CurveStudio._uid += 1
         self._active = 0
         self.var_playhead = 0.0
@@ -925,14 +1402,18 @@ class CurveStudio(tk.Toplevel):
             messagebox.showinfo("过滤", "过滤后为空，未改动")
             return
         self._clips[self._active].rows = rows
+        self._clips[self._active].excluded.clear()  # 索引已失效
         self.refresh()
 
     def _restore(self) -> None:
-        self._clips = [Clip(rows=list(self._raw), name="Clip1", uid=CurveStudio._uid)]
+        self._clips = [
+            Clip(rows=list(self._raw), name="Clip1", uid=CurveStudio._uid, excluded=set())
+        ]
         CurveStudio._uid += 1
         self._active = 0
         self.var_playhead = 0.0
         self._last_plot_view = None  # 强制复位缩放
+        self._spike_undo.clear()
         self.refresh()
         self.chart.reset_view()
 
@@ -958,62 +1439,169 @@ class CurveStudio(tk.Toplevel):
         except ValueError:
             post = 5
         method = (self.var_diff_method.get() or "ma_central").strip()
-
-        base = t_base_ms(rows)
-        xs = [(float(r[0]) - base) / 1000.0 for r in rows]
+        sp = self._read_rpm_smooth_params()
+        excl_mask = self._excluded_global_mask(rows, spans)
+        s_mode = self.var_s_mode.get()
+        active = self._active
+        a_rows = list(self._clips[active].rows) if 0 <= active < len(self._clips) else []
+        a_excl = set(self._clips[active].excluded) if 0 <= active < len(self._clips) else set()
+        a_name = self._clips[active].name if 0 <= active < len(self._clips) else "-"
+        t0g = spans[active][1] if 0 <= active < len(spans) else 0.0
+        n_clips = len(self._clips)
         show_raw = bool(self.var_show_raw.get())
         show_sm = bool(self.var_show_smooth.get())
-        if not show_raw and not show_sm:
-            show_raw = True  # 至少一条
-        sp = self._read_rpm_smooth_params()
-        # 有符号平滑转速：S / a 一律以此为初值，不用原始 rpm
+        view = self.var_view.get()
+        ph = self.var_playhead
+        preserve_view = self._last_plot_view == view
+        self._last_plot_view = view
+
+        self._refresh_seq += 1
+        seq = self._refresh_seq
+        snap = {
+            "seq": seq,
+            "rows": list(rows),
+            "spans": list(spans),
+            "total": total,
+            "i0": i0,
+            "length": length,
+            "smooth": smooth,
+            "post": post,
+            "method": method,
+            "sp": dict(sp),
+            "excl_mask": list(excl_mask),
+            "s_mode": s_mode,
+            "a_rows": a_rows,
+            "a_excl": a_excl,
+            "a_name": a_name,
+            "t0g": t0g,
+            "n_clips": n_clips,
+            "show_raw": show_raw,
+            "show_sm": show_sm,
+            "view": view,
+            "ph": ph,
+            "preserve_view": preserve_view,
+        }
+
+        def work() -> None:
+            try:
+                payload = CurveStudio._compute_plot_payload(snap)
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda: self.var_status.set(f"重算失败: {exc}"))
+                return
+            self.after(0, lambda p=payload, s=seq: self._apply_plot_payload(s, p))
+
+        if len(rows) < 600:
+            self._apply_plot_payload(seq, CurveStudio._compute_plot_payload(snap))
+        else:
+            self.var_status.set(f"后台重算平滑 n={len(rows)}…")
+            threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _compute_plot_payload(snap: dict) -> dict:
+        """后台线程：平滑 / S / a 重算（不碰 Tk）。"""
+        rows = snap["rows"]
+        excl_mask = snap["excl_mask"]
+        sp = snap["sp"]
+        length = snap["length"]
+        i0 = snap["i0"]
+        base = t_base_ms(rows)
+        xs = [(float(r[0]) - base) / 1000.0 for r in rows]
         rpm_signed = [float(r[1]) for r in rows]
-        rpm_sm_signed, n_spike = smooth_rpm_series(rpm_signed, **sp)
+        idx = [i for i, m in enumerate(excl_mask) if m]
+        if idx:
+            rpm_for_fit, _ = replace_indices_neighbor_avg(rpm_signed, idx)
+        else:
+            rpm_for_fit = list(rpm_signed)
+        rpm_sm_signed, n_spike = smooth_rpm_series(rpm_for_fit, **sp)
         rows_sm = apply_rpm_replacements(rows, rpm_sm_signed)
         ys_rpm = [abs(v) for v in rpm_signed]
         ys_rpm_sm = [abs(v) for v in rpm_sm_signed]
+        n_excl = sum(1 for m in excl_mask if m)
+        excl_marks = [(xs[i], ys_rpm[i]) for i, m in enumerate(excl_mask) if m]
         sm_tag = sp["method"]
-        if self.var_s_mode.get() == "rpm":
+        if snap["s_mode"] == "rpm":
             ser = integrate_rpm_distance(rows_sm, length_per_rev=length)
             ys_s = [p[2] for p in ser]
             s_lab = f"S←∫rpm_smooth×{length}"
         else:
-            # I 计数与 rpm 无关；仍用原 index。距离若要从转速来请选 S←∫rpm
             ser = distance_series(rows, i0=i0, length_per_i=length)
             ys_s = [p[2] for p in ser]
             s_lab = f"S←(I-{i0})×{length}"
 
-        # 加速度：对选中段的「平滑转速」求导（不再用原始 rpm）
-        if 0 <= self._active < len(self._clips) and self._clips[self._active].rows:
-            a_rows = self._clips[self._active].rows
-            t0g = spans[self._active][1] if self._active < len(spans) else 0.0
+        a_rows = snap["a_rows"]
+        a_excl = snap["a_excl"]
+        tx: list[float] = []
+        ay: list[float] = []
+        if a_rows:
             abase = t_base_ms(a_rows)
             a_rpm = [float(r[1]) for r in a_rows]
+            if a_excl:
+                a_rpm, _ = replace_indices_neighbor_avg(a_rpm, sorted(a_excl))
             a_rpm_sm, _ = smooth_rpm_series(a_rpm, **sp)
             a_disp = []
+            t0g = snap["t0g"]
             for r, rpm_v in zip(a_rows, a_rpm_sm):
                 rel = (float(r[0]) - abase) / 1000.0
-                a_disp.append(
-                    ((t0g + rel) * 1000.0, rpm_v, r[2], r[3], r[4])
-                )
+                a_disp.append(((t0g + rel) * 1000.0, rpm_v, r[2], r[3], r[4]))
             tx, ay = accel_from_rows(
-                a_disp, smooth=smooth, method=method, post_smooth=post, use_signed=True
+                a_disp,
+                smooth=snap["smooth"],
+                method=snap["method"],
+                post_smooth=snap["post"],
+                use_signed=True,
             )
-            ay_sm, n_a_sp = ay, 0  # 已由 rpm_smooth 起步；ay_sm 与 ay 同（兼容旧绘图）
-        else:
-            tx, ay, ay_sm, n_a_sp = [], [], [], 0
+        return {
+            "xs": xs,
+            "ys_rpm": ys_rpm,
+            "ys_rpm_sm": ys_rpm_sm,
+            "ys_s": ys_s,
+            "s_lab": s_lab,
+            "tx": tx,
+            "ay": ay,
+            "n_spike": n_spike,
+            "n_excl": n_excl,
+            "excl_marks": excl_marks,
+            "sm_tag": sm_tag,
+            "n_rows": len(rows),
+            "total": snap["total"],
+            "n_clips": snap["n_clips"],
+            "show_raw": snap["show_raw"],
+            "show_sm": snap["show_sm"],
+            "view": snap["view"],
+            "ph": snap["ph"],
+            "preserve_view": snap["preserve_view"],
+            "smooth": snap["smooth"],
+            "post": snap["post"],
+            "method": snap["method"],
+            "a_name": snap["a_name"],
+        }
 
-        view = self.var_view.get()
-        preserve_view = self._last_plot_view == view
-        self._last_plot_view = view
+    def _apply_plot_payload(self, seq: int, p: dict) -> None:
+        if seq != self._refresh_seq:
+            return
+        xs = p["xs"]
+        ys_rpm = p["ys_rpm"]
+        ys_rpm_sm = p["ys_rpm_sm"]
+        ys_s = p["ys_s"]
+        tx, ay = p["tx"], p["ay"]
+        n_spike, n_excl = p["n_spike"], p["n_excl"]
+        sm_tag = p["sm_tag"]
+        total = p["total"]
+        show_raw, show_sm = p["show_raw"], p["show_sm"]
+        if not show_raw and not show_sm:
+            show_raw = True
+        view = p["view"]
+        preserve_view = p["preserve_view"]
         peak = max(ys_rpm) if ys_rpm else 0.0
         peak_sm = max(ys_rpm_sm) if ys_rpm_sm else 0.0
         s_end = ys_s[-1] if ys_s else 0.0
         apeak = max((abs(v) for v in ay), default=0.0)
-        ph = self.var_playhead
-        mark_in = ph
-        mark_out = ph
-        ms_win = smooth * 0.5  # 2kHz → 每点 0.5ms
+        ph = p["ph"]
+        mark_in = mark_out = ph
+        ms_win = p["smooth"] * 0.5
+        method = p["method"]
+        smooth, post = p["smooth"], p["post"]
+        s_lab = p["s_lab"]
 
         if view == "rpm":
             series = []
@@ -1023,13 +1611,10 @@ class CurveStudio(tk.Toplevel):
                 yhi = max(yhi, peak * 1.15)
             if show_sm:
                 extra = f" 刺={n_spike}" if n_spike else ""
+                if n_excl:
+                    extra += f" 排除={n_excl}"
                 series.append(
-                    (
-                        xs,
-                        ys_rpm_sm,
-                        "#e67e22",
-                        f"|RPM|平滑后[{sm_tag}]{extra} peak={peak_sm:.0f}",
-                    )
+                    (xs, ys_rpm_sm, "#e67e22", f"|RPM|平滑后[{sm_tag}]{extra} peak={peak_sm:.0f}")
                 )
                 yhi = max(yhi, peak_sm * 1.15)
             if not series:
@@ -1038,7 +1623,10 @@ class CurveStudio(tk.Toplevel):
                 series,
                 xlim=(0.0, max(total, 0.01)),
                 ylim=(0.0, yhi),
-                title=f"时间线 n={len(rows)} 段数={len(self._clips)}  黄线=刀口",
+                title=(
+                    f"时间线 n={p['n_rows']} 段数={p['n_clips']}  黄线=刀口"
+                    + (f"  红叉=排除{n_excl}" if n_excl else "")
+                ),
                 xlabel="t (s)",
                 ylabel="|RPM|",
                 mark_in=mark_in,
@@ -1061,22 +1649,14 @@ class CurveStudio(tk.Toplevel):
                 preserve_view=preserve_view,
             )
         elif view == "a":
-            # 仅一条：a = d(rpm_smooth)/dt
             if tx and ay:
                 self.chart.set_series(
-                    [
-                        (
-                            tx,
-                            ay,
-                            "#c0392b",
-                            f"a←rpm_smooth[{sm_tag}] |peak|={apeak:.1f}",
-                        )
-                    ],
+                    [(tx, ay, "#c0392b", f"a←rpm_smooth[{sm_tag}] |peak|={apeak:.1f}")],
                     xlim=(min(tx), max(tx) + 1e-3),
                     ylim=(-apeak * 1.2 - 1, apeak * 1.2 + 1),
                     title=(
                         f"加速度←平滑转速 [{method}] 窗{smooth}(~{ms_win:.0f}ms) "
-                        f"后再滑{post} · {self._clips[self._active].name}"
+                        f"后再滑{post} · {p['a_name']}"
                     ),
                     xlabel="t (s)",
                     ylabel="a (RPM/s)",
@@ -1118,7 +1698,7 @@ class CurveStudio(tk.Toplevel):
                 preserve_view=preserve_view,
             )
 
-        act = self._clips[self._active].name if self._clips else "-"
+        self.chart.set_excluded_marks(p["excl_marks"] if view == "rpm" else [])
         layers = []
         if show_raw:
             layers.append("平滑前")
@@ -1126,9 +1706,9 @@ class CurveStudio(tk.Toplevel):
             layers.append("平滑后")
         self.var_cut_t.set(f"{ph:.3f}")
         self.var_status.set(
-            f"显示={'+'.join(layers) or '-'}  工具={self._tool.get()}  选中={act}  "
-            f"段数={len(self._clips)}  总长={total:.3f}s  S末={s_end:.3f}  "
-            f"|a|peak={apeak:.1f}  RPM刺={n_spike}"
+            f"显示={'+'.join(layers) or '-'}  工具={self._tool.get()}  选中={p['a_name']}  "
+            f"段数={p['n_clips']}  总长={total:.3f}s  S末={s_end:.3f}  "
+            f"|a|peak={apeak:.1f}  RPM刺={n_spike}  排除={n_excl}"
         )
 
     def _commit(self) -> None:
@@ -1140,49 +1720,28 @@ class CurveStudio(tk.Toplevel):
             messagebox.showinfo("写回", "无主列表回调")
 
     def _export_csv(self) -> None:
-        rows = self._timeline_rows()
+        """导出点集：同一原始 X，两个 Y（原始转速 + 平滑后转速）。"""
+        rows, _bounds, spans = concat_timeline(self._clips)
         if not rows:
             messagebox.showinfo("导出", "时间线为空")
             return
-        i0, length = self._read_i0_len()
         sp = self._read_rpm_smooth_params()
-        rpm_signed = [float(r[1]) for r in rows]
-        rpm_sm_signed, _ = smooth_rpm_series(rpm_signed, **sp)
-        rows_sm = apply_rpm_replacements(rows, rpm_sm_signed)
-        # S：∫rpm 用平滑转速；I 模式仍用 index
-        if self.var_s_mode.get() == "rpm":
-            ser_s = integrate_rpm_distance(rows_sm, length_per_rev=length)
-            # 对齐成与 distance_series 相近的导出字段
-            series = distance_series(rows, i0=i0, length_per_i=length)
-            s_vals = [p[2] for p in ser_s]
-        else:
-            series = distance_series(rows, i0=i0, length_per_i=length)
-            s_vals = [p[2] for p in series]
-        try:
-            smooth = int(float(self.var_smooth.get().strip() or "21"))
-        except ValueError:
-            smooth = 21
-        try:
-            post = int(float(self.var_post_smooth.get().strip() or "5"))
-        except ValueError:
-            post = 5
-        method = (self.var_diff_method.get() or "ma_central").strip()
-        # a 只从平滑转速求
-        tx, ay = accel_from_rows(
-            rows_sm, smooth=max(3, smooth), method=method, post_smooth=post
-        )
-        a_map = list(zip(tx, ay))
-
-        def a_at(t: float) -> float:
-            if not a_map:
-                return 0.0
-            return min(a_map, key=lambda p: abs(p[0] - t))[1]
+        excl_mask = self._excluded_global_mask(rows, spans)
+        n_excl = sum(1 for m in excl_mask if m)
+        # Y1：原始（数据表未改）
+        rpm_raw = [float(r[1]) for r in rows]
+        # Y2：排除毛刺后重算的平滑曲线（与图上橙色线同源）
+        rpm_for_fit = self._rpm_for_fit(rows, excl_mask)
+        rpm_sm, _ = smooth_rpm_series(rpm_for_fit, **sp)
+        base = t_base_ms(rows)
+        # X：原始时间轴
+        xs = [(float(r[0]) - base) / 1000.0 for r in rows]
 
         path = filedialog.asksaveasfilename(
-            title="导出时间线 CSV",
+            title="导出曲线点集（X=原始时间，Y原始 + Y平滑）",
             defaultextension=".csv",
             filetypes=[("CSV", "*.csv")],
-            initialfile=f"timeline_{len(rows)}.csv",
+            initialfile=f"curve_raw_smooth_{len(rows)}.csv",
         )
         if not path:
             return
@@ -1190,35 +1749,32 @@ class CurveStudio(tk.Toplevel):
             w = csv.writer(f)
             w.writerow(
                 [
-                    "t_rel_s",
-                    "rpm",
-                    "rpm_smooth",
-                    "index_n",
-                    "i_rel",
-                    "S",
-                    "a_from_rpm_smooth",
-                    "I0",
-                    "length_per_I",
+                    "t_rel_s",  # X：原始时间 (s)
+                    "rpm_raw",  # Y1：原始转速
+                    "rpm_smooth",  # Y2：平滑后转速
+                    "rpm_raw_abs",  # |Y1|（与图蓝线一致）
+                    "rpm_smooth_abs",  # |Y2|（与图橙线一致）
+                    "excluded",  # 1=该点被排除毛刺（不影响 rpm_raw）
+                    "t_ms",
                     "smooth_method",
                 ]
             )
             for i, r in enumerate(rows):
-                tr = series[i][0]
                 w.writerow(
                     [
-                        f"{tr:.6f}",
-                        f"{float(r[1]):.2f}",
-                        f"{rpm_sm_signed[i]:.2f}",
-                        int(r[4]),
-                        series[i][4],
-                        f"{s_vals[i]:.6f}",
-                        f"{a_at(tr):.4f}",
-                        i0,
-                        length,
+                        f"{xs[i]:.6f}",
+                        f"{rpm_raw[i]:.4f}",
+                        f"{rpm_sm[i]:.4f}",
+                        f"{abs(rpm_raw[i]):.4f}",
+                        f"{abs(rpm_sm[i]):.4f}",
+                        1 if excl_mask[i] else 0,
+                        f"{float(r[0]):.3f}",
                         sp["method"],
                     ]
                 )
-        self.var_status.set(f"已导出 {path}（S/a 基于平滑转速）")
+        self.var_status.set(
+            f"已导出 {len(rows)} 点 → {path}（X + Y原始 + Y平滑；排除={n_excl}）"
+        )
 
 
 def open_curve_studio(

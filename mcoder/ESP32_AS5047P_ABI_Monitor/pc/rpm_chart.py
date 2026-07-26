@@ -30,6 +30,8 @@ class RpmChart(ttk.Frame):
         self._mark_in: float | None = None
         self._mark_out: float | None = None
         self._sel_rect: tuple[float, float, float, float] | None = None  # t0,t1,y0,y1
+        # 排除点标记（数据坐标），MATLAB Curve Fitter 风格红叉
+        self._excluded_marks: list[tuple[float, float]] = []
         self._line = "#1a6fb5"
         self._grid = "#d0d7de"
         self._bg = "#f7f9fc"
@@ -160,9 +162,15 @@ class RpmChart(ttk.Frame):
         self._sel_rect = rect
         self.redraw()
 
+    def set_excluded_marks(self, marks: Sequence[tuple[float, float]] | None) -> None:
+        """排除的毛刺点 (t, y)，图上画红色叉号；不改曲线数据。"""
+        self._excluded_marks = list(marks or [])
+        self.redraw()
+
     def clear(self) -> None:
         self._series.clear()
         self._sel_rect = None
+        self._excluded_marks = []
         self._full_xlim = None
         self._full_ylim = None
         self._view_xlim = None
@@ -506,3 +514,17 @@ class RpmChart(ttk.Frame):
             c.create_text(
                 xo + 3, pt + 4, anchor="nw", text="Out", fill="#8e44ad", font=("Segoe UI", 8)
             )
+
+        # 排除异常值：红色叉号（保留原曲线点，只标记不参与拟合）
+        for tx, ty in self._excluded_marks:
+            if tx < x0 - x_pad or tx > x1 + x_pad:
+                continue
+            if ty < min(y0, y1) or ty > max(y0, y1):
+                # 仍画：纵轴略出视窗时夹到边
+                pass
+            px, py = sx(tx), sy(ty)
+            if py < pt - 4 or py > pt + ph + 4:
+                continue
+            r = 5
+            c.create_line(px - r, py - r, px + r, py + r, fill="#e74c3c", width=2)
+            c.create_line(px - r, py + r, px + r, py - r, fill="#e74c3c", width=2)

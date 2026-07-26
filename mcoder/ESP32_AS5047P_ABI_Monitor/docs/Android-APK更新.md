@@ -1,6 +1,6 @@
 # Android APK 更新说明（1.9.4-share-csv）
 
-与固件 **`FW=monitor-v37-keep-shot`** / PC 蓝牙路径对齐。下午 BLE 踩坑与规则见：  
+与固件 **`FW=monitor-v40-counts-bin`**（BIN 存 counts，手机算转速）/ PC 对齐。下午 BLE 踩坑与规则见：  
 `docs/工作日志与总结-2026-07-25下午-手机BLE.md`。
 
 ## 当前能力

@@ -35,7 +35,7 @@ static const int ABI_STEPS_PER_REV = 4000;
 
 static const uint32_t SAMPLE_HZ = 2000;  // 2kHz → 记 1s ≈ 2000 点
 static const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_HZ;
-static uint32_t g_rec_duration_ms = 2000;  // 确认后正式段 2s@2kHz
+static uint32_t g_rec_duration_ms = 1000;  // 正式段默认 1s@2kHz（弹射够用；可用 REC MS 改）
 static const float RPM_GATE = 10.0f;       // |RPM|>10 且 I 过 1 圈 → 触发
 static const uint16_t BACKTRACK_N = 400;   // 触发时向前保留 400 点
 static const uint32_t NOISE_BELOW_MS = 80;       // 旧路径残留
@@ -561,10 +561,26 @@ static void sampleCb(void* arg) {
   uint32_t now_us = t0;
   uint32_t now_ms = millis();
 
-  // 正式 SNAP 记录中：整数路径，禁止 float/Serial
+  // 正式 SNAP 记录中：仍更新本地转速窗（将来电机控制用）；BIN 只存 counts
   if (snapIsRecording()) {
     uint32_t index_n = g_index_irq;
     snapOnSampleCounts(counts, index_n, now_us);
+    // 本地 live 速度（与下方非记录路径相同算法）
+    cb_hist_c[cb_hist_i] = counts;
+    cb_hist_us[cb_hist_i] = now_us;
+    cb_hist_i = (cb_hist_i + 1) % VEL_WINDOW;
+    if (cb_hist_n < VEL_WINDOW) cb_hist_n++;
+    float rpm_loc = 0.0f;
+    if (cb_hist_n >= VEL_WINDOW) {
+      int i_old = cb_hist_i;
+      int64_t dc = counts - cb_hist_c[i_old];
+      uint32_t dt = now_us - cb_hist_us[i_old];
+      if (dt > 0) {
+        rpm_loc = ((float)dc / (float)ABI_STEPS_PER_REV) * (1e6f / (float)dt) * 60.0f;
+      }
+    }
+    cb_rpm_filt = 0.85f * cb_rpm_filt + 0.15f * rpm_loc;
+    g_rpm_for_index = cb_rpm_filt;
     portENTER_CRITICAL(&g_snap_mux);
     g_snap.counts = counts;
     g_snap.t_ms = now_ms;
@@ -1423,10 +1439,10 @@ static void dumpBinBlePayload(const uint8_t* payload, size_t plen, uint16_t n, u
     hostPrintln("# DUMP BIN BLE fail: empty payload");
     return;
   }
-  if (plen != (size_t)n * 12u) {
-    // SD 裸文件按 12B 对齐；尾部残片丢弃
-    n = (uint16_t)(plen / 12u);
-    plen = (size_t)n * 12u;
+  if (plen != (size_t)n * snapPointSize()) {
+    // SD 裸文件按点阵对齐；尾部残片丢弃
+    n = (uint16_t)(plen / snapPointSize());
+    plen = (size_t)n * snapPointSize();
     if (n == 0) {
       hostPrintln("# DUMP BIN BLE fail: payload not snap points");
       return;
@@ -1434,10 +1450,10 @@ static void dumpBinBlePayload(const uint8_t* payload, size_t plen, uint16_t n, u
   }
   if (hz == 0) hz = 2000;
 
-  static const uint32_t SNAP_MAGIC = 0xAB1C0001UL;
+  uint32_t file_magic = snapFileMagic();
   uint32_t crc = snapCrc32(payload, plen);
   uint8_t head[8];
-  memcpy(head, &SNAP_MAGIC, 4);
+  memcpy(head, &file_magic, 4);
   memcpy(head + 4, &n, 2);
   memcpy(head + 6, &hz, 2);
   uint8_t crc_le[4];
@@ -1455,10 +1471,11 @@ static void dumpBinBlePayload(const uint8_t* payload, size_t plen, uint16_t n, u
   g_ble_ack_wait_ms = 900;
 
   const char* src_tag = (src && src[0]) ? src : "RAM";
-  char mark[180];
+  char mark[200];
   snprintf(mark, sizeof(mark),
-           "# BIN BLE BEGIN src=%s n=%u hz=%u bytes=%u crc=0x%08lX\n", src_tag, (unsigned)n,
-           (unsigned)hz, (unsigned)(8 + plen + 4), (unsigned long)crc);
+           "# BIN BLE BEGIN src=%s n=%u hz=%u steps=%ld pt=%u bytes=%u crc=0x%08lX\n", src_tag,
+           (unsigned)n, (unsigned)hz, (long)snapStepsPerRev(), (unsigned)snapPointSize(),
+           (unsigned)(8 + plen + 4), (unsigned long)crc);
   Serial.print(mark);
   bool ok = bleDumpSendLine(mark);
 
@@ -1517,8 +1534,8 @@ static void dumpBinBleFromSd() {
     return;
   }
   hostPrintf("# DUMP BIN BLE SD file=%s bytes=%u → BLE\n", path, (unsigned)len);
-  uint16_t n = (uint16_t)(len / 12u);
-  dumpBinBlePayload(buf, (size_t)n * 12u, n, 2000, "SD");
+  uint16_t n = (uint16_t)(len / snapPointSize());
+  dumpBinBlePayload(buf, (size_t)n * snapPointSize(), n, 2000, "SD");
   free(buf);
 }
 
@@ -1792,7 +1809,7 @@ static void handleCmd(char* line) {
     return;
   }
   if (!strcasecmp(line, "FW?") || !strcasecmp(line, "VERSION")) {
-    hostPrintln("# FW=monitor-v37-keep-shot snap=RAM→SD ble_pull=RAM|SD");
+    hostPrintln("# FW=monitor-v40-counts-bin snap=counts→host ble_pull=RAM|SD pt=16");
     return;
   }
   if (!strncasecmp(line, "TIME", 4)) {
@@ -1970,7 +1987,7 @@ void setup() {
   Serial.begin(921600);
   delay(300);
   Serial.println();
-  Serial.println("# ESP32 AS5047P ABI Monitor FW=monitor-v37-keep-shot");
+  Serial.println("# ESP32 AS5047P ABI Monitor FW=monitor-v40-counts-bin");
   Serial.println("# Policy: idle=BLE live RPM; MONITOR armed=BLE telem OFF (events only)");
   Serial.println("# Shot: once STAGING/triggered, keep full REC window even if RPM→0");
   Serial.println("# Android tip: dump = Notify + DUMP ACK; avoid continuous GATT READ");

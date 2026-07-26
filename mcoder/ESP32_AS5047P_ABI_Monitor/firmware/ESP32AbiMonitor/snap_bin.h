@@ -14,6 +14,9 @@ bool snapAlloc();
 void snapFree();
 
 void snapSetStepsPerRev(int32_t steps);
+int32_t snapStepsPerRev();
+uint32_t snapFileMagic();
+size_t snapPointSize();
 
 /** 强制直采（无门限） */
 bool snapRecStart(uint32_t duration_ms, uint32_t sample_hz);

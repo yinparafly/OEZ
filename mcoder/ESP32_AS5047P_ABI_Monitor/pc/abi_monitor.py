@@ -13,6 +13,7 @@ AS5047P ABI 转速监控 — PC 端（独立工程）
 from __future__ import annotations
 
 import csv
+import os
 import queue
 import struct
 import threading
@@ -100,12 +101,20 @@ class SegmentRecord:
 
 
 
-SNAP_MAGIC = 0xAB1C0001
-SNAP_POINT_SIZE = 12
+SNAP_MAGIC_V1 = 0xAB1C0001  # t_us,rpm_x10,dir,pad,index_n (12B) — 旧
+SNAP_MAGIC_V2 = 0xAB1C0002  # t_us,counts,index_n (16B) — 转速由上位机算
+SNAP_MAGIC = SNAP_MAGIC_V2
+SNAP_POINT_SIZE_V1 = 12
+SNAP_POINT_SIZE_V2 = 16
+SNAP_POINT_SIZE = SNAP_POINT_SIZE_V2
 SNAP_PREAMBLE = bytes([0xAA] * 10 + [0x55])
-# struct: t_us u32, rpm_x10 i16, dir i8, pad u8, index_n u32
-_SNAP_FMT = "<IhbBI"
-assert struct.calcsize(_SNAP_FMT) == SNAP_POINT_SIZE
+ABI_STEPS_PER_REV = 4000
+# 上位机默认差分窗（与 v39 板端接近；可在曲线工作室再平滑）
+HOST_VEL_WIN = 32
+_SNAP_FMT_V1 = "<IhbBI"
+_SNAP_FMT_V2 = "<IqI"  # t_us u32, counts i64, index_n u32
+assert struct.calcsize(_SNAP_FMT_V1) == SNAP_POINT_SIZE_V1
+assert struct.calcsize(_SNAP_FMT_V2) == SNAP_POINT_SIZE_V2
 
 
 def app_dir() -> Path:
@@ -120,62 +129,143 @@ def app_dir() -> Path:
 SERIAL_LOG_DIR = app_dir() / "serial_logs"
 
 
+def help_dir() -> Path:
+    """源码 → pc/help；打包 exe → _MEIPASS/help。"""
+    import sys
+
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / "help"
+    return Path(__file__).resolve().parent / "help"
+
+
+def help_text(name: str = "转速计算方法.md") -> str:
+    p = help_dir() / name
+    if not p.is_file():
+        return (
+            f"（未找到帮助文件：{p}）\n\n"
+            "v40：BIN 存 counts；rpm = (Δc/4000)*(1e6/Δt)*60，默认窗 32 点≈16ms。"
+        )
+    return p.read_text(encoding="utf-8")
+
+
 def snap_crc32(data: bytes) -> int:
     """与固件 snapCrc32 一致（IEEE CRC32 / zlib）。"""
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
-def _points_to_rows(payload: bytes, n: int) -> list[tuple]:
+def rpm_from_counts_series(
+    t_us: list[int],
+    counts: list[int],
+    *,
+    steps: int = ABI_STEPS_PER_REV,
+    vel_win: int = HOST_VEL_WIN,
+) -> list[float]:
+    """由 counts/时间序列算 RPM（多拍差分，无 EMA；后续平滑交给曲线工作室）。"""
+    n = len(counts)
+    out = [0.0] * n
+    if n == 0 or steps <= 0:
+        return out
+    w = max(1, int(vel_win))
+    for i in range(n):
+        j = i - w if i >= w else 0
+        if i == j:
+            out[i] = 0.0
+            continue
+        dc = counts[i] - counts[j]
+        dt = t_us[i] - t_us[j]
+        if dt <= 0:
+            out[i] = out[i - 1] if i else 0.0
+            continue
+        out[i] = (dc / steps) * (1_000_000.0 / dt) * 60.0
+    return out
+
+
+def _points_to_rows_v1(payload: bytes, n: int) -> list[tuple]:
     rows: list[tuple] = []
     for i in range(n):
         t_us, rpm_x10, direc, _pad, index_n = struct.unpack_from(
-            _SNAP_FMT, payload, i * SNAP_POINT_SIZE
+            _SNAP_FMT_V1, payload, i * SNAP_POINT_SIZE_V1
         )
-        # (t_ms, rpm, dir, seg, index_n, t_rel, unix)
         rows.append((t_us / 1000.0, rpm_x10 / 10.0, int(direc), 1, int(index_n), 0, 0))
     return rows
 
 
+def _points_to_rows_v2(
+    payload: bytes,
+    n: int,
+    *,
+    steps: int = ABI_STEPS_PER_REV,
+    vel_win: int = HOST_VEL_WIN,
+) -> list[tuple]:
+    t_list: list[int] = []
+    c_list: list[int] = []
+    idx_list: list[int] = []
+    for i in range(n):
+        t_us, counts, index_n = struct.unpack_from(
+            _SNAP_FMT_V2, payload, i * SNAP_POINT_SIZE_V2
+        )
+        t_list.append(int(t_us))
+        c_list.append(int(counts))
+        idx_list.append(int(index_n))
+    rpms = rpm_from_counts_series(t_list, c_list, steps=steps, vel_win=vel_win)
+    rows: list[tuple] = []
+    for i in range(n):
+        rpm = rpms[i]
+        direc = 1 if rpm > 0.5 else (-1 if rpm < -0.5 else 0)
+        rows.append((t_list[i] / 1000.0, rpm, direc, 1, idx_list[i], 0, 0))
+    return rows
+
+
 def parse_snap_bindump(raw: bytes) -> tuple[int, int, list[tuple]]:
-    """解析 magic+n+hz+payload+crc（raw 已去掉 preamble）。"""
+    """解析 magic+n+hz+payload+crc（raw 已去掉 preamble）。支持 v1/v2。"""
     if len(raw) < 12:
         raise ValueError(f"bin too short: {len(raw)}")
     magic, n, hz = struct.unpack_from("<IHH", raw, 0)
-    if magic != SNAP_MAGIC:
-        raise ValueError(f"bad magic 0x{magic:08X}")
-    need = 8 + n * SNAP_POINT_SIZE + 4
-    if len(raw) < need:
-        raise ValueError(f"bin len {len(raw)} < need {need}")
-    payload = raw[8 : 8 + n * SNAP_POINT_SIZE]
-    (crc,) = struct.unpack_from("<I", raw, 8 + n * SNAP_POINT_SIZE)
-    got = snap_crc32(payload)
-    if got != crc:
-        raise ValueError(f"CRC mismatch got=0x{got:08X} expect=0x{crc:08X}")
-    return n, hz, _points_to_rows(payload, n)
+    if magic == SNAP_MAGIC_V2:
+        pt = SNAP_POINT_SIZE_V2
+        need = 8 + n * pt + 4
+        if len(raw) < need:
+            raise ValueError(f"bin len {len(raw)} < need {need}")
+        payload = raw[8 : 8 + n * pt]
+        (crc,) = struct.unpack_from("<I", raw, 8 + n * pt)
+        got = snap_crc32(payload)
+        if got != crc:
+            raise ValueError(f"CRC mismatch got=0x{got:08X} expect=0x{crc:08X}")
+        return n, hz, _points_to_rows_v2(payload, n)
+    if magic == SNAP_MAGIC_V1:
+        pt = SNAP_POINT_SIZE_V1
+        need = 8 + n * pt + 4
+        if len(raw) < need:
+            raise ValueError(f"bin len {len(raw)} < need {need}")
+        payload = raw[8 : 8 + n * pt]
+        (crc,) = struct.unpack_from("<I", raw, 8 + n * pt)
+        got = snap_crc32(payload)
+        if got != crc:
+            raise ValueError(f"CRC mismatch got=0x{got:08X} expect=0x{crc:08X}")
+        return n, hz, _points_to_rows_v1(payload, n)
+    raise ValueError(f"bad magic 0x{magic:08X}")
 
 
 def parse_snap_file(raw: bytes) -> tuple[int, int, list[tuple]]:
     """
-    打开 SD 上的 /snap_*.bin（纯 12B×N 点阵），或 USB DUMP BIN（含 magic/CRC）。
-    返回 (n, hz, rows)。
+    打开 SD 上的 /snap_*.bin（裸点阵），或 USB DUMP BIN（含 magic/CRC）。
+    返回 (n, hz, rows)。v2 裸文件按 16B；旧 12B 仍可按 v1 解。
     """
     if not raw:
         raise ValueError("empty file")
-    # 去掉可能残留的 preamble
     if raw.startswith(SNAP_PREAMBLE):
         raw = raw[len(SNAP_PREAMBLE) :]
     if len(raw) >= 12:
         magic = struct.unpack_from("<I", raw, 0)[0]
-        if magic == SNAP_MAGIC:
+        if magic in (SNAP_MAGIC_V1, SNAP_MAGIC_V2):
             return parse_snap_bindump(raw)
-    if len(raw) % SNAP_POINT_SIZE != 0:
-        raise ValueError(
-            f"raw snap size {len(raw)} not multiple of {SNAP_POINT_SIZE}"
-        )
-    n = len(raw) // SNAP_POINT_SIZE
-    if n == 0:
-        raise ValueError("no points")
-    return n, 2000, _points_to_rows(raw, n)
+    if len(raw) % SNAP_POINT_SIZE_V2 == 0 and len(raw) >= SNAP_POINT_SIZE_V2:
+        n = len(raw) // SNAP_POINT_SIZE_V2
+        return n, 2000, _points_to_rows_v2(raw, n)
+    if len(raw) % SNAP_POINT_SIZE_V1 == 0 and len(raw) >= SNAP_POINT_SIZE_V1:
+        n = len(raw) // SNAP_POINT_SIZE_V1
+        return n, 2000, _points_to_rows_v1(raw, n)
+    raise ValueError(f"raw snap size {len(raw)} not multiple of 12 or 16")
 
 
 def filter_snap_rows(
@@ -300,11 +390,13 @@ class SerialLink(threading.Thread):
                         self._bin_got_preamble = False
                         continue
                     _magic, n, _hz = struct.unpack_from("<IHH", buf, 0)
-                    if n > 3000:
+                    if n > 6000:
                         del buf[0]
                         self._bin_got_preamble = False
                         continue
-                    need = 8 + n * SNAP_POINT_SIZE + 4
+                    # v2=16B；若收到旧 v1 magic 仍按 12B（极少走 USB 串口）
+                    pt = SNAP_POINT_SIZE_V2 if _magic == SNAP_MAGIC_V2 else SNAP_POINT_SIZE_V1
+                    need = 8 + n * pt + 4
                     if len(buf) < need:
                         if not chunk:
                             time.sleep(0.001)
@@ -739,7 +831,38 @@ class App(tk.Tk):
         bot.pack(fill=tk.X)
         ttk.Button(bot, text="ABI?", command=lambda: self._send("ABI?")).pack(side=tk.LEFT)
         ttk.Button(bot, text="停止回放", command=self._stop_play).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bot, text="帮助·转速计算", command=self._show_rpm_help).pack(side=tk.LEFT, padx=8)
         ttk.Label(bot, textvariable=self.var_info).pack(side=tk.LEFT, padx=12)
+
+    def _show_rpm_help(self) -> None:
+        """打开打包内帮助：转速从 counts 如何计算。"""
+        win = tk.Toplevel(self)
+        win.title("帮助 · 转速计算方法")
+        win.geometry("720x560")
+        win.minsize(480, 360)
+        frm = ttk.Frame(win, padding=8)
+        frm.pack(fill=tk.BOTH, expand=True)
+        txt = tk.Text(frm, wrap=tk.WORD, undo=False)
+        sb = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        body = help_text("转速计算方法.md")
+        txt.insert("1.0", body)
+        txt.configure(state=tk.DISABLED)
+        bar = ttk.Frame(win, padding=6)
+        bar.pack(fill=tk.X)
+        def _open_file() -> None:
+            p = help_dir() / "转速计算方法.md"
+            try:
+                if p.is_file():
+                    os.startfile(str(p))  # type: ignore[attr-defined]
+                else:
+                    messagebox.showinfo("帮助", f"文件不在磁盘旁路：{p}\n（内容已在上方窗口）")
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showwarning("帮助", str(exc))
+        ttk.Button(bar, text="用系统打开 .md", command=_open_file).pack(side=tk.LEFT)
+        ttk.Button(bar, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
 
     def _is_ble_mode(self) -> bool:
         v = self.var_link.get()
