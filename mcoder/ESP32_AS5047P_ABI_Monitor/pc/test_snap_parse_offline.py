@@ -52,6 +52,7 @@ def main() -> int:
     assert gn == n2 and ghz == hz
     # 满窗后应接近 30 RPM
     assert abs(rows2[-1][1] - 30.0) < 0.5, rows2[-1][1]
+    assert len(rows2[-1]) >= 8 and rows2[-1][7] == n2 - 1
 
     print(f"OK offline parse v1+v2 n={got_n}/{gn} last_rpm≈{rows2[-1][1]:.2f}")
     return 0

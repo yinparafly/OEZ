@@ -36,6 +36,22 @@ from snap_edit import (
     trim_before_t,
 )
 
+try:
+    from abi_monitor import (
+        recompute_rows_rpm_from_counts,
+        row_counts,
+        row_has_counts,
+    )
+except Exception:  # noqa: BLE001 — 独立跑 curve_studio 时可能无完整 abi_monitor
+    def row_has_counts(row: tuple) -> bool:
+        return len(row) > 7 and row[7] is not None
+
+    def row_counts(row: tuple):
+        return int(row[7]) if row_has_counts(row) else None
+
+    def recompute_rows_rpm_from_counts(rows: list, **_kw) -> list:
+        return list(rows)
+
 
 def _point_in_poly(x: float, y: float, poly: Sequence[tuple[float, float]]) -> bool:
     """射线法：点是否在多边形内（含边界近似）。"""
@@ -241,7 +257,12 @@ class CurveStudio(tk.Toplevel):
             value="delete",
             command=self._tool_hint,
         ).pack(side=tk.LEFT, padx=4)
-        ttk.Label(row1b, text="  选区:").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(
+            row1b,
+            text="  建议：先切「counts-t」删异常，再回看转速",
+            foreground="#555",
+        ).pack(side=tk.LEFT, padx=8)
+        ttk.Label(row1b, text="  选区:").pack(side=tk.LEFT, padx=(8, 0))
         ttk.Radiobutton(
             row1b, text="矩形", variable=self._select_shape, value="rect",
             command=self._tool_hint,
@@ -273,6 +294,7 @@ class CurveStudio(tk.Toplevel):
         view.pack(fill=tk.X, padx=8, pady=2)
         for text, val in (
             ("仅转速", "rpm"),
+            ("counts-t", "counts"),
             ("仅距离 S", "s"),
             ("仅加速度 a", "a"),
             ("三线同图", "all"),
@@ -280,6 +302,11 @@ class CurveStudio(tk.Toplevel):
             ttk.Radiobutton(
                 view, text=text, variable=self.var_view, value=val, command=self.refresh
             ).pack(side=tk.LEFT, padx=6)
+        ttk.Label(
+            view,
+            text="counts=原始累计步数，便于圈删台阶/跳变",
+            foreground="#555",
+        ).pack(side=tk.LEFT, padx=8)
 
         overlay = ttk.LabelFrame(self, text="曲线叠加（勾选要画的线）", padding=4)
         overlay.pack(fill=tk.X, padx=8, pady=2)
@@ -1074,18 +1101,31 @@ class CurveStudio(tk.Toplevel):
         self.var_status.set("已撤销上一次排除/固化")
         self.refresh()
 
+    def _y_for_edit(self, r: tuple) -> float:
+        """圈毛刺命中用的 Y：counts 视图用累计 counts，否则 |RPM|。"""
+        if self.var_view.get() == "counts" and row_has_counts(r):
+            return float(r[7])
+        return abs(float(r[1]))
+
+    def _clip_has_counts(self, clip: Clip) -> bool:
+        return bool(clip.rows) and row_has_counts(clip.rows[0])
+
+    def _recompute_clip_rpm(self, clip: Clip) -> None:
+        if self._clip_has_counts(clip):
+            clip.rows = recompute_rows_rpm_from_counts(clip.rows)
+
     def _hit_points_in_box(
         self, t_a: float, t_b: float, y_a: float, y_b: float
     ) -> list[tuple[int, int]]:
-        """返回 (clip_i, local_i) 列表。转速视图用 |RPM| 匹配框。"""
+        """返回 (clip_i, local_i) 列表。转速视图用 |RPM|；counts 视图用 counts。"""
         t0, t1 = min(t_a, t_b), max(t_a, t_b)
         view = self.var_view.get()
-        if view in ("rpm", "all"):
+        if view in ("rpm", "all", "counts"):
             y_lo, y_hi = min(y_a, y_b), max(y_a, y_b)
-            use_abs = True
+            use_y = True
         else:
             y_lo, y_hi = float("-inf"), float("inf")
-            use_abs = False
+            use_y = False
         _, _, spans = concat_timeline(self._clips)
         hits: list[tuple[int, int]] = []
         for ci, (_i, t_start, _t_end) in enumerate(spans):
@@ -1097,7 +1137,10 @@ class CurveStudio(tk.Toplevel):
                 tg = t_start + (float(r[0]) - base) / 1000.0
                 if tg < t0 or tg > t1:
                     continue
-                yv = abs(float(r[1])) if use_abs else float(r[1])
+                if not use_y:
+                    hits.append((ci, li))
+                    continue
+                yv = self._y_for_edit(r)
                 if y_lo <= yv <= y_hi:
                     hits.append((ci, li))
         return hits
@@ -1107,19 +1150,13 @@ class CurveStudio(tk.Toplevel):
         rows, _, spans = concat_timeline(self._clips)
         if not rows:
             return
-        base = t_base_ms(rows)
         best: tuple[float, int, int] | None = None  # dist2, ci, li
-        gi = 0
         for ci, (_i, t_start, _t_end) in enumerate(spans):
             clip = self._clips[ci]
             cbase = t_base_ms(clip.rows) if clip.rows else 0.0
             for li, r in enumerate(clip.rows):
                 tg = t_start + (float(r[0]) - cbase) / 1000.0
-                yv = abs(float(r[1]))
-                # 用数据→像素近似：通过 chart 当前变换
-                # 在视窗内找最近点
-                cx = None
-                # 反算：用 x_from/y 的逆 — 直接用 data 坐标差归一化不稳，改用像素
+                yv = self._y_for_edit(r)
                 if self.chart._xf and self.chart._yf:
                     x0, x1, pl, pw = self.chart._xf
                     y0, y1, pt, ph = self.chart._yf
@@ -1129,7 +1166,6 @@ class CurveStudio(tk.Toplevel):
                         d2 = (sx - px) ** 2 + (sy - py) ** 2
                         if best is None or d2 < best[0]:
                             best = (d2, ci, li)
-                gi += 1
         if best is None or best[0] > 14 ** 2:
             self.var_status.set("未点中采样点（请靠近曲线上的点再点，或拖框）")
             return
@@ -1144,34 +1180,7 @@ class CurveStudio(tk.Toplevel):
             self.var_status.set(f"已排除点（段{ci} #{li}）· 排除总数={self._total_excluded()}")
         self.refresh()
 
-    def _exclude_box(self, t_a: float, t_b: float, y_a: float, y_b: float) -> None:
-        """框选：将框内点加入排除集（不改原始数值）。"""
-        hits = self._hit_points_in_box(t_a, t_b, y_a, y_b)
-        self._apply_hits_or_click(0.0, 0.0, hits if hits else [])
-
-    def _apply_hits_or_click(
-        self, px: float, py: float, hits: list[tuple[int, int]] | None
-    ) -> None:
-        """hits=None → 单击最近点；否则批量排除或删除。"""
-        if hits is None:
-            if self._exclude_action.get() == "delete":
-                one = self._nearest_hit(px, py)
-                if one is None:
-                    self.var_status.set("未点中采样点")
-                    return
-                self._delete_point_hits([one])
-            else:
-                self._exclude_nearest_click(px, py)
-            return
-        if not hits:
-            self.var_status.set("选区内无点命中（建议「仅转速」视图）")
-            return
-        if self._exclude_action.get() == "delete":
-            self._delete_point_hits(hits)
-        else:
-            self._exclude_hits(hits)
-
-    def _nearest_hit(self, px: float, py: float) -> tuple[int, int] | None:
+    def _nearest_point(self, px: float, py: float) -> tuple[int, int] | None:
         _, _, spans = concat_timeline(self._clips)
         best: tuple[float, int, int] | None = None
         if not self.chart._xf or not self.chart._yf:
@@ -1187,7 +1196,7 @@ class CurveStudio(tk.Toplevel):
             cbase = t_base_ms(clip.rows)
             for li, r in enumerate(clip.rows):
                 tg = t_start + (float(r[0]) - cbase) / 1000.0
-                yv = abs(float(r[1]))
+                yv = self._y_for_edit(r)
                 sx = pl + (tg - x0) / (x1 - x0) * pw
                 sy = pt + ph - (yv - y0) / (y1 - y0) * ph
                 d2 = (sx - px) ** 2 + (sy - py) ** 2
@@ -1215,7 +1224,7 @@ class CurveStudio(tk.Toplevel):
             cbase = t_base_ms(clip.rows)
             for li, r in enumerate(clip.rows):
                 tg = t_start + (float(r[0]) - cbase) / 1000.0
-                yv = abs(float(r[1]))
+                yv = self._y_for_edit(r)
                 sx = pl + (tg - x0) / (x1 - x0) * pw
                 sy = pt + ph - (yv - y0) / (y1 - y0) * ph
                 if _point_in_poly(sx, sy, poly_px):
@@ -1235,7 +1244,7 @@ class CurveStudio(tk.Toplevel):
         self.refresh()
 
     def _delete_point_hits(self, hits: list[tuple[int, int]]) -> None:
-        """从序列删除点；其余点 x/y 原样保留。"""
+        """从序列删除点；若有 counts 则删后重算该段 RPM。"""
         if not hits:
             return
         self._push_spike_undo()
@@ -1257,8 +1266,39 @@ class CurveStudio(tk.Toplevel):
             total += len(clip.rows) - len(keep)
             clip.rows = keep
             clip.excluded = new_excl
-        self.var_status.set(f"已删除 {total} 个噪点（其余点 xy 未改）")
+            self._recompute_clip_rpm(clip)
+        self.var_status.set(
+            f"已删除 {total} 个点"
+            + ("；已按剩余 counts 重算 RPM" if any(self._clip_has_counts(c) for c in self._clips) else "")
+        )
         self.refresh()
+
+    def _exclude_box(self, t_a: float, t_b: float, y_a: float, y_b: float) -> None:
+        """框选：将框内点加入排除集（不改原始数值）。"""
+        hits = self._hit_points_in_box(t_a, t_b, y_a, y_b)
+        self._apply_hits_or_click(0.0, 0.0, hits if hits else [])
+
+    def _apply_hits_or_click(
+        self, px: float, py: float, hits: list[tuple[int, int]] | None
+    ) -> None:
+        """hits=None → 单击最近点；否则批量排除或删除。"""
+        if hits is None:
+            if self._exclude_action.get() == "delete":
+                one = self._nearest_point(px, py)
+                if one is None:
+                    self.var_status.set("未点中采样点")
+                    return
+                self._delete_point_hits([one])
+            else:
+                self._exclude_nearest_click(px, py)
+            return
+        if not hits:
+            self.var_status.set("选区内无点命中（建议「仅转速」或「counts-t」视图）")
+            return
+        if self._exclude_action.get() == "delete":
+            self._delete_point_hits(hits)
+        else:
+            self._exclude_hits(hits)
 
     def _delete_excluded_points(self) -> None:
         """把当前所有红叉排除点从序列中删掉。"""
@@ -1271,7 +1311,7 @@ class CurveStudio(tk.Toplevel):
             return
         if not messagebox.askyesno(
             "删除已排除点",
-            f"将从数据中删除 {len(hits)} 个已排除点，其余点的 x/y 不变。确定？",
+            f"将从数据中删除 {len(hits)} 个已排除点；有 counts 时会重算 RPM。确定？",
         ):
             return
         self._delete_point_hits(hits)
@@ -1287,14 +1327,14 @@ class CurveStudio(tk.Toplevel):
         self.refresh()
 
     def _bake_exclusions(self) -> None:
-        """可选：把排除点固化为邻点插值写入 rows（真正改数值）。"""
+        """把排除点固化为邻点插值写入 rows；有 counts 时先修 counts 再重算 RPM。"""
         if self._total_excluded() == 0:
             messagebox.showinfo("固化排除", "没有排除点可固化")
             return
         if not messagebox.askyesno(
             "固化排除",
-            "将把已排除点用邻点线性插值写入数据表（不可靠「仅标记」撤销以外的恢复）。\n"
-            "确定？",
+            "将把已排除点用邻点线性插值写入数据表。\n"
+            "有 counts 时优先插值 counts 并重算 RPM。确定？",
         ):
             return
         self._push_spike_undo()
@@ -1302,11 +1342,23 @@ class CurveStudio(tk.Toplevel):
         for clip in self._clips:
             if not clip.excluded or not clip.rows:
                 continue
-            rpms = [float(r[1]) for r in clip.rows]
-            new_rpms, n_rep = replace_indices_neighbor_avg(rpms, sorted(clip.excluded))
-            clip.rows = apply_rpm_replacements(clip.rows, new_rpms)
+            idxs = sorted(clip.excluded)
+            if self._clip_has_counts(clip):
+                cs = [float(r[7]) for r in clip.rows]
+                new_c, n_rep = replace_indices_neighbor_avg(cs, idxs)
+                new_rows = []
+                for i, r in enumerate(clip.rows):
+                    lst = list(r)
+                    lst[7] = int(round(new_c[i]))
+                    new_rows.append(tuple(lst))
+                clip.rows = recompute_rows_rpm_from_counts(new_rows)
+                total += n_rep
+            else:
+                rpms = [float(r[1]) for r in clip.rows]
+                new_rpms, n_rep = replace_indices_neighbor_avg(rpms, idxs)
+                clip.rows = apply_rpm_replacements(clip.rows, new_rpms)
+                total += n_rep
             clip.excluded.clear()
-            total += n_rep
         self.var_status.set(f"已固化 {total} 点到数据表（排除标记已清）")
         self.refresh()
 
@@ -1516,8 +1568,14 @@ class CurveStudio(tk.Toplevel):
         rows_sm = apply_rpm_replacements(rows, rpm_sm_signed)
         ys_rpm = [abs(v) for v in rpm_signed]
         ys_rpm_sm = [abs(v) for v in rpm_sm_signed]
+        ys_counts = [float(r[7]) if len(r) > 7 and r[7] is not None else 0.0 for r in rows]
+        has_counts = bool(rows) and len(rows[0]) > 7 and rows[0][7] is not None
         n_excl = sum(1 for m in excl_mask if m)
-        excl_marks = [(xs[i], ys_rpm[i]) for i, m in enumerate(excl_mask) if m]
+        view = snap["view"]
+        if view == "counts" and has_counts:
+            excl_marks = [(xs[i], ys_counts[i]) for i, m in enumerate(excl_mask) if m]
+        else:
+            excl_marks = [(xs[i], ys_rpm[i]) for i, m in enumerate(excl_mask) if m]
         sm_tag = sp["method"]
         if snap["s_mode"] == "rpm":
             ser = integrate_rpm_distance(rows_sm, length_per_rev=length)
@@ -1554,6 +1612,8 @@ class CurveStudio(tk.Toplevel):
             "xs": xs,
             "ys_rpm": ys_rpm,
             "ys_rpm_sm": ys_rpm_sm,
+            "ys_counts": ys_counts,
+            "has_counts": has_counts,
             "ys_s": ys_s,
             "s_lab": s_lab,
             "tx": tx,
@@ -1633,6 +1693,46 @@ class CurveStudio(tk.Toplevel):
                 mark_out=mark_out,
                 preserve_view=preserve_view,
             )
+        elif view == "counts":
+            ys_c = p.get("ys_counts") or []
+            if not p.get("has_counts"):
+                self.chart.set_series(
+                    [([0, total], [0, 0], "#6c3483", "无 counts")],
+                    xlim=(0.0, max(total, 0.01)),
+                    ylim=(-1, 1),
+                    title="本段无 counts（需 v40 BIN / magic 0xAB1C0002）",
+                    xlabel="t (s)",
+                    ylabel="counts",
+                    allow_negative=True,
+                    preserve_view=False,
+                )
+            else:
+                clo = min(ys_c) if ys_c else 0.0
+                chi = max(ys_c) if ys_c else 1.0
+                pad = max(abs(chi - clo) * 0.08, 10.0)
+                self.chart.set_series(
+                    [
+                        (
+                            xs,
+                            ys_c,
+                            "#6c3483",
+                            f"counts 原始 [{clo:.0f}~{chi:.0f}]"
+                            + (f" 排除={n_excl}" if n_excl else ""),
+                        )
+                    ],
+                    xlim=(0.0, max(total, 0.01)),
+                    ylim=(clo - pad, chi + pad),
+                    title=(
+                        f"counts vs t · n={p['n_rows']} · 圈毛刺可删异常点后自动重算 RPM"
+                        + (f" · 红叉={n_excl}" if n_excl else "")
+                    ),
+                    xlabel="t (s)",
+                    ylabel="counts",
+                    mark_in=mark_in,
+                    mark_out=mark_out,
+                    allow_negative=True,
+                    preserve_view=preserve_view,
+                )
         elif view == "s":
             smin = min(ys_s) if ys_s else 0.0
             smax = max(abs(y) for y in ys_s) if ys_s else 1.0
@@ -1698,7 +1798,9 @@ class CurveStudio(tk.Toplevel):
                 preserve_view=preserve_view,
             )
 
-        self.chart.set_excluded_marks(p["excl_marks"] if view == "rpm" else [])
+        self.chart.set_excluded_marks(
+            p["excl_marks"] if view in ("rpm", "counts") else []
+        )
         layers = []
         if show_raw:
             layers.append("平滑前")
@@ -1752,14 +1854,18 @@ class CurveStudio(tk.Toplevel):
                     "t_rel_s",  # X：原始时间 (s)
                     "rpm_raw",  # Y1：原始转速
                     "rpm_smooth",  # Y2：平滑后转速
-                    "rpm_raw_abs",  # |Y1|（与图蓝线一致）
-                    "rpm_smooth_abs",  # |Y2|（与图橙线一致）
-                    "excluded",  # 1=该点被排除毛刺（不影响 rpm_raw）
+                    "rpm_raw_abs",
+                    "rpm_smooth_abs",
+                    "counts",  # v40 原始累计步数（无则空）
+                    "excluded",
                     "t_ms",
                     "smooth_method",
                 ]
             )
             for i, r in enumerate(rows):
+                cval = ""
+                if len(r) > 7 and r[7] is not None:
+                    cval = str(int(r[7]))
                 w.writerow(
                     [
                         f"{xs[i]:.6f}",
@@ -1767,6 +1873,7 @@ class CurveStudio(tk.Toplevel):
                         f"{rpm_sm[i]:.4f}",
                         f"{abs(rpm_raw[i]):.4f}",
                         f"{abs(rpm_sm[i]):.4f}",
+                        cval,
                         1 if excl_mask[i] else 0,
                         f"{float(r[0]):.3f}",
                         sp["method"],

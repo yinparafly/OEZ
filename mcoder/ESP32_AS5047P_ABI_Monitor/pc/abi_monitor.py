@@ -180,6 +180,40 @@ def rpm_from_counts_series(
     return out
 
 
+def row_has_counts(row: tuple) -> bool:
+    """v2 行：(t_ms,rpm,dir,seg,index_n,t_rel,unix,counts)。"""
+    return len(row) > 7 and row[7] is not None
+
+
+def row_counts(row: tuple) -> int | None:
+    if not row_has_counts(row):
+        return None
+    return int(row[7])
+
+
+def recompute_rows_rpm_from_counts(
+    rows: list[tuple],
+    *,
+    steps: int = ABI_STEPS_PER_REV,
+    vel_win: int = HOST_VEL_WIN,
+) -> list[tuple]:
+    """根据行内 counts 与 t_ms 重算 rpm/dir；无 counts 则原样返回。"""
+    if not rows or not row_has_counts(rows[0]):
+        return list(rows)
+    t_us = [int(round(float(r[0]) * 1000.0)) for r in rows]
+    c_list = [int(r[7]) for r in rows]
+    rpms = rpm_from_counts_series(t_us, c_list, steps=steps, vel_win=vel_win)
+    out: list[tuple] = []
+    for r, rpm in zip(rows, rpms):
+        direc = 1 if rpm > 0.5 else (-1 if rpm < -0.5 else 0)
+        lst = list(r)
+        lst[1] = float(rpm)
+        if len(lst) > 2:
+            lst[2] = direc
+        out.append(tuple(lst))
+    return out
+
+
 def _points_to_rows_v1(payload: bytes, n: int) -> list[tuple]:
     rows: list[tuple] = []
     for i in range(n):
@@ -212,7 +246,7 @@ def _points_to_rows_v2(
     for i in range(n):
         rpm = rpms[i]
         direc = 1 if rpm > 0.5 else (-1 if rpm < -0.5 else 0)
-        rows.append((t_list[i] / 1000.0, rpm, direc, 1, idx_list[i], 0, 0))
+        rows.append((t_list[i] / 1000.0, rpm, direc, 1, idx_list[i], 0, 0, c_list[i]))
     return rows
 
 
