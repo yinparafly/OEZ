@@ -49,3 +49,10 @@ backup/
 
 # Accidental junk directory (bad path created by mistake)
 /D/
+
+# Reference projects (not part of this repo)
+/stem32 F103/
+/android/
+
+# Opencode/Superpowers working state
+.superpowers/
