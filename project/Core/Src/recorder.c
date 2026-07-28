@@ -78,6 +78,9 @@ void Recorder_MainLoop(uint32_t now_ms) {
 bool Recorder_IsTriggered(void) { return record_ready; }
 RecorderState_t Recorder_GetState(void) { return state; }
 
+static FATFS g_fs;
+static bool g_fs_mounted = false;
+
 void Record_SaveToSD(void) {
     if (g_buffer.count < TOTAL_RECORD_SAMPLES) {
         state = RECORDER_MONITOR;
@@ -86,17 +89,14 @@ void Record_SaveToSD(void) {
 
     TIM_ITConfig(TIM3, TIM_IT_Update, DISABLE);
 
-    uint32_t samples[TOTAL_RECORD_SAMPLES];
     uint32_t start = (g_trigger_index - PRE_TRIGGER_SAMPLES) & RING_BUFFER_MASK;
-    for (uint32_t i = 0; i < TOTAL_RECORD_SAMPLES; i++) {
-        uint32_t pos = (start + i) & RING_BUFFER_MASK;
-        samples[i] = g_buffer.data[pos];
-    }
 
     TIM_ITConfig(TIM3, TIM_IT_Update, ENABLE);
 
-    FATFS fs;
-    if (f_mount(0, &fs) != FR_OK) { state = RECORDER_MONITOR; return; }
+    if (!g_fs_mounted) {
+        if (f_mount(0, &g_fs) != FR_OK) { state = RECORDER_MONITOR; return; }
+        g_fs_mounted = true;
+    }
 
     FIL fil;
     if (f_open(&fil, "0:TEST.CSV", FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) {
@@ -104,9 +104,12 @@ void Record_SaveToSD(void) {
     }
 
     f_printf(&fil, "index,count\n");
+    TIM_ITConfig(TIM3, TIM_IT_Update, DISABLE);
     for (uint32_t i = 0; i < TOTAL_RECORD_SAMPLES; i++) {
-        f_printf(&fil, "%lu,%lu\n", i, samples[i]);
+        uint32_t pos = (start + i) & RING_BUFFER_MASK;
+        f_printf(&fil, "%lu,%lu\n", i, g_buffer.data[pos]);
     }
+    TIM_ITConfig(TIM3, TIM_IT_Update, ENABLE);
     f_close(&fil);
 
     record_ready = false;

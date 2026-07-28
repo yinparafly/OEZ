@@ -13,15 +13,6 @@ uint8_t SD_ReadWriteByte(uint8_t data) {
     return (uint8_t)SPI1->DR;
 }
 
-static void SD_CS_Select(void) {
-    SD_CS_LOW();
-}
-
-static void SD_CS_Release(void) {
-    SD_CS_HIGH();
-    SD_ReadWriteByte(0xFF);
-}
-
 static void SD_SPI_Init(uint16_t prescaler) {
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_SPI1, ENABLE);
 
@@ -56,7 +47,7 @@ static void SD_SPI_Init(uint16_t prescaler) {
     SPI_Cmd(SPI1, ENABLE);
 }
 
-static uint8_t SD_SendCmd(uint8_t cmd, uint32_t arg, uint8_t crc) {
+static uint8_t SD_SendCmdRaw(uint8_t cmd, uint32_t arg, uint8_t crc) {
     uint8_t frame[6];
     frame[0] = 0x40 | cmd;
     frame[1] = (uint8_t)(arg >> 24);
@@ -64,19 +55,20 @@ static uint8_t SD_SendCmd(uint8_t cmd, uint32_t arg, uint8_t crc) {
     frame[3] = (uint8_t)(arg >> 8);
     frame[4] = (uint8_t)arg;
     frame[5] = crc;
-
-    SD_CS_Select();
     for (int i = 0; i < 6; i++)
         SD_ReadWriteByte(frame[i]);
-
     uint8_t resp;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 10; i++) {
         resp = SD_ReadWriteByte(0xFF);
-        if (!(resp & 0x80))
-            break;
+        if (!(resp & 0x80)) break;
     }
-    SD_CS_Release();
     return resp;
+}
+
+static bool SD_WaitReady(void) {
+    uint16_t timeout = 500;
+    while (SD_ReadWriteByte(0xFF) != 0xFF && timeout) timeout--;
+    return timeout != 0;
 }
 
 bool SD_Init(void) {
@@ -84,110 +76,89 @@ bool SD_Init(void) {
     uint16_t timeout;
 
     SD_SPI_Init(SPI_LOW_SPEED);
-
+    SD_CS_HIGH();
     for (int i = 0; i < 10; i++)
         SD_ReadWriteByte(0xFF);
+    SD_CS_LOW();
 
     timeout = 200;
     do {
-        resp = SD_SendCmd(0, 0, 0x95);
+        resp = SD_SendCmdRaw(0, 0, 0x95);
         timeout--;
     } while (resp != 0x01 && timeout);
-    if (timeout == 0) return false;
+    if (timeout == 0) { SD_CS_HIGH(); return false; }
 
-    resp = SD_SendCmd(8, 0x1AA, 0x87);
+    resp = SD_SendCmdRaw(8, 0x1AA, 0x87);
     if (resp == 0x01) {
         uint8_t buf[4];
-        SD_CS_Select();
-        for (int i = 0; i < 4; i++) {
-            SD_ReadWriteByte(0xFF);
-            buf[i] = SD_ReadWriteByte(0xFF);
-        }
-        SD_CS_Release();
+        for (int i = 0; i < 4; i++) buf[i] = SD_ReadWriteByte(0xFF);
         if (buf[2] == 0x01 && buf[3] == 0xAA) {
             timeout = 1000;
             do {
-                SD_SendCmd(55, 0, 0x01);
-                resp = SD_SendCmd(41, 0x40000000, 0x01);
+                SD_SendCmdRaw(55, 0, 0x01);
+                resp = SD_SendCmdRaw(41, 0x40000000, 0x01);
                 timeout--;
             } while (resp != 0x00 && timeout);
-            if (timeout == 0) return false;
-            SD_card_type = 2;
+            if (timeout == 0) { SD_CS_HIGH(); return false; }
+            SD_card_type = 6;
         }
     } else {
         timeout = 1000;
         do {
-            SD_SendCmd(55, 0, 0x01);
-            resp = SD_SendCmd(41, 0, 0x01);
+            SD_SendCmdRaw(55, 0, 0x01);
+            resp = SD_SendCmdRaw(41, 0, 0x01);
             timeout--;
         } while (resp != 0x00 && timeout);
-        if (timeout == 0) return false;
-        SD_card_type = 1;
+        if (timeout == 0) { SD_CS_HIGH(); return false; }
+        SD_card_type = 2;
     }
 
-    resp = SD_SendCmd(16, 512, 0x01);
-    if (resp != 0x00) return false;
+    SD_SendCmdRaw(16, 512, 0x01);
+    SD_CS_HIGH();
+    SD_ReadWriteByte(0xFF);
 
     SD_SPI_Init(SPI_HIGH_SPEED);
     return true;
 }
 
 bool SD_ReadSector(uint32_t sector, uint8_t* buffer) {
-    if (SD_card_type == 2)
-        sector <<= 9;
-    else
-        sector *= 512;
+    if (!(SD_card_type & 4)) sector *= 512;
 
-    uint8_t resp = SD_SendCmd(17, sector, 0x01);
-    if (resp != 0x00) return false;
+    SD_CS_LOW();
+    uint8_t resp = SD_SendCmdRaw(17, sector, 0x01);
+    if (resp != 0x00) { SD_CS_HIGH(); return false; }
 
     uint16_t timeout = 500;
-    SD_CS_Select();
-    while (SD_ReadWriteByte(0xFF) != 0xFE && timeout)
-        timeout--;
-    if (timeout == 0) {
-        SD_CS_Release();
-        return false;
-    }
+    while (SD_ReadWriteByte(0xFF) != 0xFE && timeout) timeout--;
+    if (timeout == 0) { SD_CS_HIGH(); return false; }
 
     for (int i = 0; i < 512; i++)
         buffer[i] = SD_ReadWriteByte(0xFF);
-
     SD_ReadWriteByte(0xFF);
     SD_ReadWriteByte(0xFF);
-
-    SD_CS_Release();
+    SD_CS_HIGH();
+    SD_ReadWriteByte(0xFF);
     return true;
 }
 
 bool SD_WriteSector(uint32_t sector, const uint8_t* buffer) {
-    if (SD_card_type == 2)
-        sector <<= 9;
-    else
-        sector *= 512;
+    if (!(SD_card_type & 4)) sector *= 512;
 
-    uint8_t resp = SD_SendCmd(24, sector, 0x01);
-    if (resp != 0x00) return false;
+    SD_CS_LOW();
+    if (!SD_WaitReady()) { SD_CS_HIGH(); return false; }
 
-    SD_CS_Select();
-    SD_ReadWriteByte(0xFF);
+    uint8_t resp = SD_SendCmdRaw(24, sector, 0x01);
+    if (resp != 0x00) { SD_CS_HIGH(); return false; }
+
     SD_ReadWriteByte(0xFE);
-
     for (int i = 0; i < 512; i++)
         SD_ReadWriteByte(buffer[i]);
-
     SD_ReadWriteByte(0xFF);
     SD_ReadWriteByte(0xFF);
 
     resp = SD_ReadWriteByte(0xFF);
-    if ((resp & 0x1F) != 0x05) {
-        SD_CS_Release();
-        return false;
-    }
-
-    while (!SD_ReadWriteByte(0xFF))
-        ;
-
-    SD_CS_Release();
+    SD_CS_HIGH();
+    SD_ReadWriteByte(0xFF);
+    if ((resp & 0x1F) != 0x05) return false;
     return true;
 }
