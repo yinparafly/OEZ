@@ -19,6 +19,7 @@ void Encoder_Init(void) {
     TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
     TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
     TIM_TimeBaseInit(TIM2, &TIM_TimeBaseStructure);
+    *(uint32_t*)&TIM2->ARR = 0xFFFFFFFF;
 
     TIM_EncoderInterfaceConfig(TIM2, TIM_EncoderMode_TI12,
                                TIM_ICPolarity_Rising, TIM_ICPolarity_Rising);
