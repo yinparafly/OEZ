@@ -2,6 +2,9 @@
 #define __STM32F10x_IT_H
 
 #include "stm32f10x.h"
+#include <stdbool.h>
+
+extern volatile bool g_z_signal_occurred;
 
 void NMI_Handler(void);
 void HardFault_Handler(void);

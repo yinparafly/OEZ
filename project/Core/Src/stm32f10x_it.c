@@ -16,8 +16,6 @@ void UsageFault_Handler(void) { while (1); }
 void SVC_Handler(void) {}
 void DebugMon_Handler(void) {}
 void PendSV_Handler(void) {}
-void SysTick_Handler(void) {}
-
 void TIM3_IRQHandler(void) {
     if (TIM_GetITStatus(TIM3, TIM_IT_Update)) {
         TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
