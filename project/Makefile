@@ -41,7 +41,7 @@ INCLUDES = \
 	-IFatFS/src
 
 CFLAGS = -mcpu=cortex-m3 -mthumb -DSTM32F10X_MD -DUSE_STDPERIPH_DRIVER \
-	-Os -Wall -fdata-sections -ffunction-sections $(INCLUDES)
+	-Os -Wall -fdata-sections -ffunction-sections -MMD -MP $(INCLUDES)
 
 LDFLAGS = -Tlinker.ld --specs=nano.specs -Wl,--gc-sections -Wl,-Map=$(TARGET).map
 
@@ -61,6 +61,8 @@ $(TARGET).hex: $(TARGET).elf
 
 %.o: %.c
 	$(CC) -c $(CFLAGS) $< -o $@
+
+-include $(SRCS:.c=.d)
 
 clean:
 	-$(RM) $(subst /,\,$(OBJS))
