@@ -53,6 +53,7 @@ backup/
 # Reference projects (not part of this repo)
 /stem32 F103/
 /android/
+/references/
 
 # Opencode/Superpowers working state
 .superpowers/
