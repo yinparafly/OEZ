@@ -1,4 +1,5 @@
 #include "main.h"
+#include "encoder.h"
 
 static void LED_GPIO_Init(void) {
     GPIO_InitTypeDef GPIO_InitStructure;
@@ -16,6 +17,7 @@ void Delay(uint32_t ms) {
 
 int main(void) {
     LED_GPIO_Init();
+    Encoder_Init();
     while (1) {
         LED_TOGGLE();
         Delay(500);

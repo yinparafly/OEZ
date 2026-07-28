@@ -1,7 +1,8 @@
 TARGET = firmware
-CC = arm-none-eabi-gcc
-OBJCOPY = arm-none-eabi-objcopy
-SIZE  = arm-none-eabi-size
+TOOLCHAIN = D:/arm-official/arm-gnu-toolchain-13.2.Rel1-mingw-w64-i686-arm-none-eabi/bin/
+CC = $(TOOLCHAIN)arm-none-eabi-gcc
+OBJCOPY = $(TOOLCHAIN)arm-none-eabi-objcopy
+SIZE  = $(TOOLCHAIN)arm-none-eabi-size
 RM = del /q
 
 STDPERIPH_SRC = Drivers/STM32F10x_StdPeriph_Driver/src
