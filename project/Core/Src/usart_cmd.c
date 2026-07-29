@@ -1,4 +1,5 @@
 #include "usart_cmd.h"
+#include "main.h"
 
 static volatile bool start_flag = false;
 
@@ -39,5 +40,19 @@ bool Cmd_GetStartFlag(void) { return start_flag; }
 void Cmd_ClearStartFlag(void) { start_flag = false; }
 
 void Cmd_ProcessChar(uint8_t c) {
-    if (c == CMD_START_CHAR) start_flag = true;
+    if (c == CMD_START_CHAR) {
+        start_flag = true;
+    } else if (c == '1') {
+        GREEN_LED_ON();
+    } else if (c == '2') {
+        GREEN_LED_OFF();
+    } else if (c == '3') {
+        RED_LED_ON();
+    } else if (c == '4') {
+        RED_LED_OFF();
+    } else if (c == 'g') {
+        GREEN_LED_TOGGLE();
+    } else if (c == 'r') {
+        RED_LED_TOGGLE();
+    }
 }

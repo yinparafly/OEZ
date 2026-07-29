@@ -2,6 +2,7 @@
 #include "encoder.h"
 #include "ring_buffer.h"
 #include "usart_cmd.h"
+#include "recorder.h"
 
 volatile uint32_t g_last_count = 0;
 volatile uint32_t g_last_time = 0;
@@ -19,7 +20,9 @@ void PendSV_Handler(void) {}
 void TIM3_IRQHandler(void) {
     if (TIM_GetITStatus(TIM3, TIM_IT_Update)) {
         TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
-        Buffer_Write(Encoder_GetCount());
+        uint32_t cnt = Encoder_GetCount();
+        Buffer_Write(cnt);
+        Recorder_ISR_Check(cnt);
     }
 }
 
@@ -29,9 +32,9 @@ void USART1_IRQHandler(void) {
     }
 }
 
-void EXTI0_IRQHandler(void) {
-    if (EXTI_GetITStatus(EXTI_Line0)) {
-        EXTI_ClearITPendingBit(EXTI_Line0);
+void EXTI15_10_IRQHandler(void) {
+    if (EXTI_GetITStatus(EXTI_Line10)) {
+        EXTI_ClearITPendingBit(EXTI_Line10);
         g_z_signal_occurred = true;
     }
 }

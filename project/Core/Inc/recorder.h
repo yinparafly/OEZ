@@ -12,22 +12,27 @@
 #define POST_TRIGGER_SAMPLES    3200
 #define TOTAL_RECORD_SAMPLES    (PRE_TRIGGER_SAMPLES + POST_TRIGGER_SAMPLES)
 
+#define PATTERN_FAST_TICKS      1600
+#define PATTERN_SLOW_TICKS      8000
+#define PATTERN_TOTAL_TICKS     9600
+
 typedef enum {
+    RECORDER_STARTUP_DELAY,
     RECORDER_IDLE,
     RECORDER_MONITOR,
     RECORDER_TRIGGERED,
     RECORDER_WRITING,
-    RECORDER_DONE
+    RECORDER_PATTERN_DONE
 } RecorderState_t;
 
 void Recorder_Init(void);
 void Recorder_ISR_Check(uint32_t count);
-void Recorder_MainLoop(uint32_t now_ms);
-bool Recorder_IsTriggered(void);
 RecorderState_t Recorder_GetState(void);
-void Recorder_StartMonitor(void);
 void Record_SaveToSD(void);
+void Recorder_ReadFileIndex(void);
+void Recorder_WriteFileIndex(void);
 
 extern volatile uint32_t g_trigger_index;
+extern uint16_t g_file_index;
 
 #endif
