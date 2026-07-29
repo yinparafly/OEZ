@@ -88,8 +88,28 @@ void Delay(uint32_t ms) {
     while (g_sys_tick < target);
 }
 
-static void TestPin(GPIO_TypeDef* port, uint16_t pin, uint32_t port_clk) {
-    RCC_APB2PeriphClockCmd(port_clk, ENABLE);
+static void blink_green(int count) {
+    for (int i = 0; i < count; i++) {
+        GREEN_LED_ON();
+        Delay(200);
+        GREEN_LED_OFF();
+        Delay(200);
+    }
+}
+
+typedef struct {
+    GPIO_TypeDef* port;
+    uint16_t pin;
+    uint32_t clk;
+    const char* name;
+} PinEntry;
+
+#define PINA(n)  {GPIOA, GPIO_Pin_##n,  RCC_APB2Periph_GPIOA, "PA" #n}
+#define PINB(n)  {GPIOB, GPIO_Pin_##n,  RCC_APB2Periph_GPIOB, "PB" #n}
+#define PINC(n)  {GPIOC, GPIO_Pin_##n,  RCC_APB2Periph_GPIOC, "PC" #n}
+
+static void test_candidate_pin(GPIO_TypeDef* port, uint16_t pin, uint32_t clk) {
+    RCC_APB2PeriphClockCmd(clk, ENABLE);
     GPIO_InitTypeDef gpio;
     gpio.GPIO_Pin = pin;
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
@@ -106,26 +126,67 @@ static void TestPin(GPIO_TypeDef* port, uint16_t pin, uint32_t port_clk) {
 
     gpio.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(port, &gpio);
+    RCC_APB2PeriphClockCmd(clk, DISABLE);
 }
 
-static void LED_Test(void) {
+static void LED_Scan(void) {
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB | RCC_APB2Periph_GPIOC, ENABLE);
+
+    PinEntry pins[] = {
+        PINA(2), PINA(3), PINA(8), PINA(11), PINA(12), PINA(15),
+        PINB(1), PINB(2), PINB(5), PINB(6), PINB(7), PINB(8), PINB(9),
+        PINB(12), PINB(13), PINB(14), PINB(15),
+        PINC(0), PINC(1), PINC(2), PINC(3), PINC(4),
+        PINC(5), PINC(6), PINC(7), PINC(8), PINC(9),
+        PINC(10), PINC(11), PINC(12), PINC(14), PINC(15),
+    };
+    int count = sizeof(pins) / sizeof(pins[0]);
+
     GREEN_LED_ON();
-    RED_LED_ON();
     Delay(2000);
-    for (int i = 0; i < 5; i++) {
-        Delay(400);
-        GREEN_LED_TOGGLE();
-        RED_LED_TOGGLE();
-    }
     GREEN_LED_OFF();
+    Delay(2000);
+
+    for (int round = 0; round < 3; round++) {
+        for (int idx = 0; idx < count; idx++) {
+            int tens = idx / 10;
+            int ones = idx % 10;
+
+            if (tens > 0) blink_green(tens);
+            Delay(600);
+
+            if (ones > 0 || tens == 0) blink_green(ones);
+            Delay(1000);
+
+            test_candidate_pin(pins[idx].port, pins[idx].pin, pins[idx].clk);
+
+            Delay(1500);
+        }
+
+        GREEN_LED_ON();
+        Delay(2000);
+        GREEN_LED_OFF();
+        Delay(1500);
+    }
+
     RED_LED_OFF();
+    GREEN_LED_OFF();
     STATUS_LED_OFF();
 }
 
 int main(void) {
     LED_GPIO_Init();
     SysTick_Config(SystemCoreClock / 1000);
-    LED_Test();
+
+    GREEN_LED_ON();
+    RED_LED_ON();
+    Delay(1000);
+    GREEN_LED_OFF();
+    RED_LED_OFF();
+    Delay(500);
+
+    LED_Scan();
+
     START_GPIO_Init();
     Z_EXTI_Init();
     Encoder_Init();
@@ -137,21 +198,18 @@ int main(void) {
 
     while (1) {
         IWDG_ReloadCounter();
-        uint8_t tport;
-        uint16_t tpin;
+        if (Recorder_GetState() == RECORDER_WRITING) {
+            Record_SaveToSD();
+        }
+        uint8_t tport; uint16_t tpin;
         if (Cmd_GetPinTest(&tport, &tpin)) {
             GPIO_TypeDef* port;
             uint32_t clk;
             if (tport == 0) { port = GPIOA; clk = RCC_APB2Periph_GPIOA; }
             else if (tport == 1) { port = GPIOB; clk = RCC_APB2Periph_GPIOB; }
             else { port = GPIOC; clk = RCC_APB2Periph_GPIOC; }
-            TestPin(port, tpin, clk);
+            test_candidate_pin(port, tpin, clk);
             LED_GPIO_Init();
-            GREEN_LED_OFF();
-            RED_LED_OFF();
-        }
-        if (Recorder_GetState() == RECORDER_WRITING) {
-            Record_SaveToSD();
         }
     }
 }
