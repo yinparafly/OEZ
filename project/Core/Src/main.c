@@ -3,6 +3,7 @@
 #include "ring_buffer.h"
 #include "usart_cmd.h"
 #include "recorder.h"
+#include "stm32f10x_it.h"
 
 static void LED_GPIO_Init(void) {
     GPIO_InitTypeDef GPIO_InitStructure;
@@ -82,8 +83,28 @@ static void IWDG_Init(void) {
     IWDG_Enable();
 }
 
+void Delay(uint32_t ms) {
+    uint32_t target = g_sys_tick + ms;
+    while (g_sys_tick < target);
+}
+
+static void LED_Test(void) {
+    GREEN_LED_ON();
+    RED_LED_ON();
+    Delay(5000);
+    for (int i = 0; i < 25; i++) {
+        Delay(200);
+        GREEN_LED_TOGGLE();
+        RED_LED_TOGGLE();
+    }
+    GREEN_LED_OFF();
+    RED_LED_OFF();
+}
+
 int main(void) {
     LED_GPIO_Init();
+    SysTick_Config(SystemCoreClock / 1000);
+    LED_Test();
     START_GPIO_Init();
     Z_EXTI_Init();
     Encoder_Init();
@@ -92,7 +113,6 @@ int main(void) {
     USART1_Init(115200);
     Recorder_Init();
     IWDG_Init();
-    SysTick_Config(SystemCoreClock / 1000);
 
     while (1) {
         IWDG_ReloadCounter();

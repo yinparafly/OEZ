@@ -8,6 +8,7 @@ volatile uint32_t g_last_count = 0;
 volatile uint32_t g_last_time = 0;
 volatile float g_current_rpm = 0.0f;
 volatile bool g_z_signal_occurred = false;
+volatile uint32_t g_sys_tick = 0;
 
 void NMI_Handler(void) {}
 void HardFault_Handler(void) { while (1); }
@@ -17,6 +18,8 @@ void UsageFault_Handler(void) { while (1); }
 void SVC_Handler(void) {}
 void DebugMon_Handler(void) {}
 void PendSV_Handler(void) {}
+
+void SysTick_Handler(void) { g_sys_tick++; }
 void TIM3_IRQHandler(void) {
     if (TIM_GetITStatus(TIM3, TIM_IT_Update)) {
         TIM_ClearITPendingBit(TIM3, TIM_IT_Update);

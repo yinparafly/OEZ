@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 extern volatile bool g_z_signal_occurred;
+extern volatile uint32_t g_sys_tick;
 
 void NMI_Handler(void);
 void HardFault_Handler(void);
