@@ -185,8 +185,6 @@ int main(void) {
     RED_LED_OFF();
     Delay(500);
 
-    LED_Scan();
-
     START_GPIO_Init();
     Z_EXTI_Init();
     Encoder_Init();
