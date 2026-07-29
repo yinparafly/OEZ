@@ -12,5 +12,6 @@ void Cmd_ClearStartFlag(void);
 void Cmd_ProcessChar(uint8_t c);
 bool Cmd_GetPinTest(uint8_t* port, uint16_t* pin_mask);
 bool Cmd_GetVerify(uint8_t* port, uint16_t* pin_mask);
+bool Cmd_GetKill(void);
 
 #endif

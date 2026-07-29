@@ -5,6 +5,7 @@ static volatile bool start_flag = false;
 
 static volatile bool test_pending = false;
 static volatile bool verify_pending = false;
+static volatile bool kill_pending = false;
 static uint8_t test_port = 0;
 static uint16_t test_pin_mask = 0;
 static uint8_t cmd_buf[4];
@@ -62,6 +63,12 @@ bool Cmd_GetVerify(uint8_t* port, uint16_t* pin_mask) {
     return true;
 }
 
+bool Cmd_GetKill(void) {
+    if (!kill_pending) return false;
+    kill_pending = false;
+    return true;
+}
+
 void Cmd_ProcessChar(uint8_t c) {
     if (c == CMD_START_CHAR) {
         start_flag = true;
@@ -73,6 +80,14 @@ void Cmd_ProcessChar(uint8_t c) {
     if (c == '4') { RED_LED_OFF(); return; }
     if (c == 'g') { GREEN_LED_TOGGLE(); return; }
     if (c == 'r') { RED_LED_TOGGLE(); return; }
+
+    if (c == 'K') {
+        kill_pending = true;
+        cmd_len = 0;
+        test_pending = false;
+        verify_pending = false;
+        return;
+    }
 
     if (c == 'T' || c == 'V') {
         cmd_len = 1;

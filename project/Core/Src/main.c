@@ -143,13 +143,13 @@ static void test_candidate_pin(GPIO_TypeDef* port, uint16_t pin, uint32_t clk) {
     gpio.GPIO_Mode = GPIO_Mode_Out_PP;
     GPIO_Init(port, &gpio);
 
-    for (int j = 0; j < 5; j++) {
-        GPIO_SetBits(port, pin);
-        Delay(300);
-        GPIO_ResetBits(port, pin);
-        Delay(700);
-    }
+    GPIO_SetBits(port, pin);
+}
 
+static void kill_candidate_pin(GPIO_TypeDef* port, uint16_t pin, uint32_t clk) {
+    GPIO_InitTypeDef gpio;
+    gpio.GPIO_Pin = pin;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
     gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
     GPIO_Init(port, &gpio);
     RCC_APB2PeriphClockCmd(clk, DISABLE);
@@ -166,10 +166,12 @@ static void verify_candidate_pin(GPIO_TypeDef* port, uint16_t pin, uint32_t clk)
     GPIO_Init(port, &gpio);
 
     for (int j = 0; j < 3; j++) {
+        IWDG_ReloadCounter();
         GPIO_SetBits(port, pin);
-        Delay(700);
+        Delay(500);
+        IWDG_ReloadCounter();
         GPIO_ResetBits(port, pin);
-        Delay(300);
+        Delay(500);
     }
 
     gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
@@ -223,15 +225,9 @@ static void LED_Scan(void) {
 }
 
 int main(void) {
-    LED_GPIO_Init();
     SysTick_Config(SystemCoreClock / 1000);
 
-    GREEN_LED_ON();
-    RED_LED_ON();
-    Delay(1000);
-    GREEN_LED_OFF();
-    RED_LED_OFF();
-    Delay(500);
+    disable_all_test_pins();
 
     START_GPIO_Init();
     Z_EXTI_Init();
@@ -255,7 +251,6 @@ int main(void) {
             else if (tport == 1) { port = GPIOB; clk = RCC_APB2Periph_GPIOB; }
             else { port = GPIOC; clk = RCC_APB2Periph_GPIOC; }
             test_candidate_pin(port, tpin, clk);
-            LED_GPIO_Init();
         }
         if (Cmd_GetVerify(&tport, &tpin)) {
             GPIO_TypeDef* port;
@@ -264,7 +259,9 @@ int main(void) {
             else if (tport == 1) { port = GPIOB; clk = RCC_APB2Periph_GPIOB; }
             else { port = GPIOC; clk = RCC_APB2Periph_GPIOC; }
             verify_candidate_pin(port, tpin, clk);
-            LED_GPIO_Init();
+        }
+        if (Cmd_GetKill()) {
+            disable_all_test_pins();
         }
     }
 }
