@@ -88,17 +88,38 @@ void Delay(uint32_t ms) {
     while (g_sys_tick < target);
 }
 
+static void TestPin(GPIO_TypeDef* port, uint16_t pin, uint32_t port_clk) {
+    RCC_APB2PeriphClockCmd(port_clk, ENABLE);
+    GPIO_InitTypeDef gpio;
+    gpio.GPIO_Pin = pin;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_Init(port, &gpio);
+
+    uint16_t on_times[] = {500, 400, 300, 200, 100};
+    for (int j = 0; j < 5; j++) {
+        GPIO_SetBits(port, pin);
+        Delay(on_times[j]);
+        GPIO_ResetBits(port, pin);
+        Delay(100);
+    }
+
+    gpio.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_Init(port, &gpio);
+}
+
 static void LED_Test(void) {
     GREEN_LED_ON();
     RED_LED_ON();
-    Delay(5000);
-    for (int i = 0; i < 25; i++) {
-        Delay(200);
+    Delay(2000);
+    for (int i = 0; i < 5; i++) {
+        Delay(400);
         GREEN_LED_TOGGLE();
         RED_LED_TOGGLE();
     }
     GREEN_LED_OFF();
     RED_LED_OFF();
+    STATUS_LED_OFF();
 }
 
 int main(void) {
@@ -116,6 +137,19 @@ int main(void) {
 
     while (1) {
         IWDG_ReloadCounter();
+        uint8_t tport;
+        uint16_t tpin;
+        if (Cmd_GetPinTest(&tport, &tpin)) {
+            GPIO_TypeDef* port;
+            uint32_t clk;
+            if (tport == 0) { port = GPIOA; clk = RCC_APB2Periph_GPIOA; }
+            else if (tport == 1) { port = GPIOB; clk = RCC_APB2Periph_GPIOB; }
+            else { port = GPIOC; clk = RCC_APB2Periph_GPIOC; }
+            TestPin(port, tpin, clk);
+            LED_GPIO_Init();
+            GREEN_LED_OFF();
+            RED_LED_OFF();
+        }
         if (Recorder_GetState() == RECORDER_WRITING) {
             Record_SaveToSD();
         }

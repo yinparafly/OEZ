@@ -10,5 +10,6 @@ void USART1_Init(uint32_t baud);
 bool Cmd_GetStartFlag(void);
 void Cmd_ClearStartFlag(void);
 void Cmd_ProcessChar(uint8_t c);
+bool Cmd_GetPinTest(uint8_t* port, uint16_t* pin_mask);
 
 #endif

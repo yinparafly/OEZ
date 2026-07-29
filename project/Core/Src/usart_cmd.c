@@ -3,6 +3,12 @@
 
 static volatile bool start_flag = false;
 
+static volatile bool test_pending = false;
+static uint8_t test_port = 0;
+static uint16_t test_pin_mask = 0;
+static uint8_t cmd_buf[4];
+static uint8_t cmd_len = 0;
+
 void USART1_Init(uint32_t baud) {
     GPIO_InitTypeDef GPIO_InitStructure;
     USART_InitTypeDef USART_InitStructure;
@@ -39,20 +45,40 @@ void USART1_Init(uint32_t baud) {
 bool Cmd_GetStartFlag(void) { return start_flag; }
 void Cmd_ClearStartFlag(void) { start_flag = false; }
 
+bool Cmd_GetPinTest(uint8_t* port, uint16_t* pin_mask) {
+    if (!test_pending) return false;
+    *port = test_port;
+    *pin_mask = test_pin_mask;
+    test_pending = false;
+    return true;
+}
+
 void Cmd_ProcessChar(uint8_t c) {
     if (c == CMD_START_CHAR) {
         start_flag = true;
-    } else if (c == '1') {
-        GREEN_LED_ON();
-    } else if (c == '2') {
-        GREEN_LED_OFF();
-    } else if (c == '3') {
-        RED_LED_ON();
-    } else if (c == '4') {
-        RED_LED_OFF();
-    } else if (c == 'g') {
-        GREEN_LED_TOGGLE();
-    } else if (c == 'r') {
-        RED_LED_TOGGLE();
+        return;
+    }
+    if (c == '1') { GREEN_LED_ON(); return; }
+    if (c == '2') { GREEN_LED_OFF(); return; }
+    if (c == '3') { RED_LED_ON(); return; }
+    if (c == '4') { RED_LED_OFF(); return; }
+    if (c == 'g') { GREEN_LED_TOGGLE(); return; }
+    if (c == 'r') { RED_LED_TOGGLE(); return; }
+
+    if (c == 'T') {
+        cmd_len = 1;
+        cmd_buf[0] = 'T';
+        test_pending = false;
+        return;
+    }
+
+    if (cmd_len > 0 && cmd_buf[0] == 'T') {
+        cmd_buf[cmd_len++] = c;
+        if (cmd_len >= 4) {
+            test_port = cmd_buf[1];
+            test_pin_mask = ((uint16_t)cmd_buf[2] << 8) | cmd_buf[3];
+            test_pending = true;
+            cmd_len = 0;
+        }
     }
 }

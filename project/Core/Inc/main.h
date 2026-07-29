@@ -13,14 +13,14 @@
 
 #define GREEN_LED_PIN       GPIO_Pin_0
 #define GREEN_LED_PORT      GPIOB
-#define GREEN_LED_ON()      GPIO_ResetBits(GREEN_LED_PORT, GREEN_LED_PIN)
-#define GREEN_LED_OFF()     GPIO_SetBits(GREEN_LED_PORT, GREEN_LED_PIN)
+#define GREEN_LED_ON()      GPIO_SetBits(GREEN_LED_PORT, GREEN_LED_PIN)
+#define GREEN_LED_OFF()     GPIO_ResetBits(GREEN_LED_PORT, GREEN_LED_PIN)
 #define GREEN_LED_TOGGLE()  (GREEN_LED_PORT->ODR ^= GREEN_LED_PIN)
 
 #define RED_LED_PIN         GPIO_Pin_1
 #define RED_LED_PORT        GPIOB
-#define RED_LED_ON()        GPIO_ResetBits(RED_LED_PORT, RED_LED_PIN)
-#define RED_LED_OFF()       GPIO_SetBits(RED_LED_PORT, RED_LED_PIN)
+#define RED_LED_ON()        GPIO_SetBits(RED_LED_PORT, RED_LED_PIN)
+#define RED_LED_OFF()       GPIO_ResetBits(RED_LED_PORT, RED_LED_PIN)
 #define RED_LED_TOGGLE()    (RED_LED_PORT->ODR ^= RED_LED_PIN)
 
 #define START_PIN           GPIO_Pin_11
