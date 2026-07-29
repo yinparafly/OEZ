@@ -108,7 +108,34 @@ typedef struct {
 #define PINB(n)  {GPIOB, GPIO_Pin_##n,  RCC_APB2Periph_GPIOB, "PB" #n}
 #define PINC(n)  {GPIOC, GPIO_Pin_##n,  RCC_APB2Periph_GPIOC, "PC" #n}
 
+static void disable_all_test_pins(void) {
+    GPIO_InitTypeDef gpio;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    gpio.GPIO_Pin = GPIO_Pin_2 | GPIO_Pin_3 | GPIO_Pin_8 |
+                    GPIO_Pin_11 | GPIO_Pin_12 | GPIO_Pin_15;
+    GPIO_Init(GPIOA, &gpio);
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+    gpio.GPIO_Pin = GPIO_Pin_0 | GPIO_Pin_1 | GPIO_Pin_2 |
+                    GPIO_Pin_5 | GPIO_Pin_6 | GPIO_Pin_7 |
+                    GPIO_Pin_8 | GPIO_Pin_9 | GPIO_Pin_12 |
+                    GPIO_Pin_13 | GPIO_Pin_14 | GPIO_Pin_15;
+    GPIO_Init(GPIOB, &gpio);
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+    gpio.GPIO_Pin = GPIO_Pin_0 | GPIO_Pin_1 | GPIO_Pin_2 | GPIO_Pin_3 |
+                    GPIO_Pin_4 | GPIO_Pin_5 | GPIO_Pin_6 | GPIO_Pin_7 |
+                    GPIO_Pin_8 | GPIO_Pin_9 | GPIO_Pin_10 | GPIO_Pin_11 |
+                    GPIO_Pin_12 | GPIO_Pin_14 | GPIO_Pin_15;
+    GPIO_Init(GPIOC, &gpio);
+}
+
 static void test_candidate_pin(GPIO_TypeDef* port, uint16_t pin, uint32_t clk) {
+    disable_all_test_pins();
+
     RCC_APB2PeriphClockCmd(clk, ENABLE);
     GPIO_InitTypeDef gpio;
     gpio.GPIO_Pin = pin;
@@ -116,15 +143,36 @@ static void test_candidate_pin(GPIO_TypeDef* port, uint16_t pin, uint32_t clk) {
     gpio.GPIO_Mode = GPIO_Mode_Out_PP;
     GPIO_Init(port, &gpio);
 
-    uint16_t on_times[] = {500, 400, 300, 200, 100};
     for (int j = 0; j < 5; j++) {
         GPIO_SetBits(port, pin);
-        Delay(on_times[j]);
+        Delay(300);
         GPIO_ResetBits(port, pin);
-        Delay(100);
+        Delay(700);
     }
 
-    gpio.GPIO_Mode = GPIO_Mode_IPU;
+    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(port, &gpio);
+    RCC_APB2PeriphClockCmd(clk, DISABLE);
+}
+
+static void verify_candidate_pin(GPIO_TypeDef* port, uint16_t pin, uint32_t clk) {
+    disable_all_test_pins();
+
+    RCC_APB2PeriphClockCmd(clk, ENABLE);
+    GPIO_InitTypeDef gpio;
+    gpio.GPIO_Pin = pin;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_Init(port, &gpio);
+
+    for (int j = 0; j < 3; j++) {
+        GPIO_SetBits(port, pin);
+        Delay(700);
+        GPIO_ResetBits(port, pin);
+        Delay(300);
+    }
+
+    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
     GPIO_Init(port, &gpio);
     RCC_APB2PeriphClockCmd(clk, DISABLE);
 }
@@ -207,6 +255,15 @@ int main(void) {
             else if (tport == 1) { port = GPIOB; clk = RCC_APB2Periph_GPIOB; }
             else { port = GPIOC; clk = RCC_APB2Periph_GPIOC; }
             test_candidate_pin(port, tpin, clk);
+            LED_GPIO_Init();
+        }
+        if (Cmd_GetVerify(&tport, &tpin)) {
+            GPIO_TypeDef* port;
+            uint32_t clk;
+            if (tport == 0) { port = GPIOA; clk = RCC_APB2Periph_GPIOA; }
+            else if (tport == 1) { port = GPIOB; clk = RCC_APB2Periph_GPIOB; }
+            else { port = GPIOC; clk = RCC_APB2Periph_GPIOC; }
+            verify_candidate_pin(port, tpin, clk);
             LED_GPIO_Init();
         }
     }

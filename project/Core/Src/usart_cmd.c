@@ -4,6 +4,7 @@
 static volatile bool start_flag = false;
 
 static volatile bool test_pending = false;
+static volatile bool verify_pending = false;
 static uint8_t test_port = 0;
 static uint16_t test_pin_mask = 0;
 static uint8_t cmd_buf[4];
@@ -53,6 +54,14 @@ bool Cmd_GetPinTest(uint8_t* port, uint16_t* pin_mask) {
     return true;
 }
 
+bool Cmd_GetVerify(uint8_t* port, uint16_t* pin_mask) {
+    if (!verify_pending) return false;
+    *port = test_port;
+    *pin_mask = test_pin_mask;
+    verify_pending = false;
+    return true;
+}
+
 void Cmd_ProcessChar(uint8_t c) {
     if (c == CMD_START_CHAR) {
         start_flag = true;
@@ -65,19 +74,21 @@ void Cmd_ProcessChar(uint8_t c) {
     if (c == 'g') { GREEN_LED_TOGGLE(); return; }
     if (c == 'r') { RED_LED_TOGGLE(); return; }
 
-    if (c == 'T') {
+    if (c == 'T' || c == 'V') {
         cmd_len = 1;
-        cmd_buf[0] = 'T';
+        cmd_buf[0] = c;
         test_pending = false;
+        verify_pending = false;
         return;
     }
 
-    if (cmd_len > 0 && cmd_buf[0] == 'T') {
+    if (cmd_len > 0 && (cmd_buf[0] == 'T' || cmd_buf[0] == 'V')) {
         cmd_buf[cmd_len++] = c;
         if (cmd_len >= 4) {
             test_port = cmd_buf[1];
             test_pin_mask = ((uint16_t)cmd_buf[2] << 8) | cmd_buf[3];
-            test_pending = true;
+            if (cmd_buf[0] == 'T') test_pending = true;
+            else verify_pending = true;
             cmd_len = 0;
         }
     }
