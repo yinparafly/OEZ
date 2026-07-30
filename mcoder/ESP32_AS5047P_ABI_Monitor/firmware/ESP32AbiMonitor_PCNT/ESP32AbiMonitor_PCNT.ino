@@ -1,0 +1,2155 @@
+/************************************************
+ * ESP32-S3 + AS5047P ABI 转速监控（PCNT A+I 版）
+ *
+ * 核心差异：仅读 A 相上升沿 + I 相（Z 信号），B 相仅作为
+ * PCNT 方向电平输入。使用 ESP32 PCNT 硬件计数器实现：
+ *   - A 相上升沿计数（PCNT 边沿模式）
+ *   - B 相电平决定方向（PCNT 控制信号）
+ *   - I 相 GPIO 上升沿中断做零位校准
+ *   - PCNT 观察点（Watch Point）实现等角度采样
+ *
+ * 监控状态机（与原版一致）：
+ *   IDLE  → |RPM|>20 进入 STAGING
+ *   STAGING → 净转角达标 / 超时 → RECORD 或丢弃
+ *   RECORD → 满时长自动停
+ *
+ * PC/Android 通信协议与原版完全兼容。
+ ************************************************/
+#include <Arduino.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "driver/gpio.h"
+#include "driver/pulse_cnt.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+
+#include "ble_nus.h"
+#include "cap_long.h"
+#include "snap_bin.h"
+#include "sd_card.h"
+#include "sd_usb_msc.h"
+
+static const int PIN_A = 15;
+static const int PIN_B = 16;
+static const int PIN_I = 17;
+
+// A 相仅上升沿，含方向控制：1000 脉冲/转
+// （原版四倍频 4000 → 单边沿 1000，根据编码器线数调整）
+static const int ABI_STEPS_PER_REV = 1000;
+
+static const uint32_t SAMPLE_HZ = 2000;
+static const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_HZ;
+static uint32_t g_rec_duration_ms = 1000;
+static const float RPM_GATE = 10.0f;
+static const uint16_t BACKTRACK_N = 400;
+static const uint32_t NOISE_BELOW_MS = 80;
+static const uint32_t STAGING_TIMEOUT_MS = 8000;
+static const int64_t CONFIRM_COUNTS = (int64_t)ABI_STEPS_PER_REV;
+static const int VEL_WINDOW = 8;
+
+static const size_t POOL_CAP = 2000;
+
+typedef struct __attribute__((packed)) {
+  uint32_t t_ms;
+  int16_t rpm_x10;
+  uint16_t seg;
+  uint32_t index_n;
+} LogSample;
+
+typedef struct __attribute__((packed)) {
+  uint32_t t_ms;
+  uint32_t dt_ms;
+  uint32_t index_n;
+  int16_t rpm_x10;
+  int16_t rpm_i_x10;
+  uint16_t seg;
+} IndexEvent;
+
+enum RecPhase : uint8_t {
+  PH_IDLE = 0,
+  PH_STAGING = 1,
+  PH_RECORD = 2,
+};
+
+static const size_t LOG_CAP_PSRAM = 300000;
+static const size_t LOG_CAP_PSRAM_MID = 180000;
+static const size_t LOG_CAP_INTERNAL = 6000;
+static const size_t ILOG_CAP = 4000;
+static const size_t IPOOL_CAP = 2000;
+static LogSample* g_log = nullptr;
+static size_t g_log_cap = 0;
+static volatile size_t g_log_w = 0;
+static volatile size_t g_log_n = 0;
+static volatile uint32_t g_log_drop = 0;
+static bool g_log_in_psram = false;
+static portMUX_TYPE g_log_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static LogSample* g_pool = nullptr;
+static size_t g_pool_n = 0;
+
+static IndexEvent* g_ilog = nullptr;
+static size_t g_ilog_cap = 0;
+static size_t g_ilog_w = 0;
+static size_t g_ilog_n = 0;
+static uint32_t g_ilog_drop = 0;
+static IndexEvent* g_ipool = nullptr;
+static size_t g_ipool_n = 0;
+static uint32_t g_index_evt_seen = 0;
+static uint32_t g_last_i_ms = 0;
+static portMUX_TYPE g_ilog_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static volatile bool g_armed = false;
+static volatile RecPhase g_phase = PH_IDLE;
+static volatile uint16_t g_seg_cur = 0;
+static volatile uint16_t g_seg_count = 0;
+static volatile uint32_t g_stage_start_ms = 0;
+static volatile uint32_t g_rec_start_ms = 0;
+static volatile int64_t g_stage_counts0 = 0;
+static volatile uint32_t g_stage_index0 = 0;
+static volatile int g_stage_sign = 0;
+static volatile uint32_t g_below_ms = 0;
+static volatile uint32_t g_flip_cnt = 0;
+
+static volatile bool g_evt_pending = false;
+static volatile uint8_t g_evt_code = 0;
+static volatile uint8_t g_noise_why = 0;
+static volatile uint16_t g_evt_seg = 0;
+static volatile uint32_t g_evt_n = 0;
+static volatile float g_evt_revs = 0;
+static volatile bool g_dumping = false;
+static volatile bool g_sample_freeze = false;
+static volatile bool g_need_auto_dump = false;
+static volatile uint16_t g_auto_dump_seg = 0;
+static volatile uint32_t g_auto_dump_expect = 0;
+static uint32_t g_ready_ms = 0;
+static volatile bool g_dump_started = false;
+
+static uint32_t g_session_board_t0 = 0;
+static uint64_t g_session_unix_t0 = 0;
+static bool g_time_synced = false;
+
+static pcnt_unit_handle_t g_pcnt = nullptr;
+static pcnt_channel_handle_t g_chan_a = nullptr;
+static esp_timer_handle_t g_timer = nullptr;
+
+static portMUX_TYPE g_snap_mux = portMUX_INITIALIZER_UNLOCKED;
+struct Snap {
+  int64_t counts;
+  float rpm;
+  int8_t dir;
+  uint32_t t_ms;
+  uint32_t seq;
+  uint32_t sample_hz_meas;
+  float revs_total;
+  float revs_abs;
+  uint32_t index_n;
+  int32_t index_signed;
+};
+static Snap g_snap = {};
+
+static int64_t cb_counts_base = 0;
+static int64_t g_counts_zero = 0;
+static double g_revs_abs_acc = 0.0;
+static int64_t g_abs_counts_last = 0;
+static bool g_abs_inited = false;
+static int64_t cb_hist_c[VEL_WINDOW];
+static uint32_t cb_hist_us[VEL_WINDOW];
+static int cb_hist_i = 0;
+static int cb_hist_n = 0;
+static float cb_rpm_filt = 0.0f;
+static uint32_t cb_n = 0;
+static uint32_t cb_last_diag_ms = 0;
+static uint32_t meas_hz = 0;
+static volatile uint32_t g_index_irq = 0;
+static volatile int32_t g_index_signed = 0;
+static uint32_t g_index_seen = 0;
+static volatile float g_rpm_for_index = 0.0f;
+
+// PCNT 观察点（Watch Point）相关 —— 等角度采样
+static const int PCNT_WATCH_POINTS[] = {0, 250, 500, 750};  // 每转 4 等分
+static const int PCNT_WATCH_N = 4;
+static volatile uint32_t g_watch_triggered = 0;
+static volatile uint32_t g_watch_last_us = 0;
+static volatile int64_t g_watch_last_counts = 0;
+
+static void IRAM_ATTR onIndexIsr(void*) {
+  g_index_irq++;
+  if (g_rpm_for_index >= 0.0f) g_index_signed++;
+  else g_index_signed--;
+}
+
+static bool IRAM_ATTR onPcntWatch(pcnt_unit_handle_t unit,
+                                   const pcnt_watch_event_data_t* edata,
+                                   void* user_ctx) {
+  (void)unit;
+  (void)user_ctx;
+  g_watch_triggered++;
+  g_watch_last_us = micros();
+  g_watch_last_counts = edata->watch_point_value;
+  return true;
+}
+
+static void revsClear() {
+  int raw = 0;
+  if (g_pcnt) pcnt_unit_get_count(g_pcnt, &raw);
+  int64_t counts = cb_counts_base + (int64_t)raw;
+  g_counts_zero = counts;
+  g_revs_abs_acc = 0.0;
+  g_abs_counts_last = counts;
+  g_abs_inited = true;
+  noInterrupts();
+  g_index_irq = 0;
+  g_index_signed = 0;
+  interrupts();
+  g_index_seen = 0;
+  g_index_evt_seen = 0;
+  g_last_i_ms = 0;
+}
+
+static uint32_t sessionRel(uint32_t t_ms) {
+  if (g_session_board_t0 == 0) return 0;
+  return t_ms - g_session_board_t0;
+}
+
+static uint64_t sampleUnixMs(uint32_t t_ms) {
+  if (!g_time_synced || g_session_unix_t0 == 0) return 0;
+  return g_session_unix_t0 + (uint64_t)sessionRel(t_ms);
+}
+
+static void sessionBegin(const char* why) {
+  g_session_board_t0 = millis();
+  if (!g_time_synced) g_session_unix_t0 = 0;
+  hostPrintf("# SESSION %s board_t0=%lu unix_t0=%llu synced=%d\n", why,
+             (unsigned long)g_session_board_t0, (unsigned long long)g_session_unix_t0,
+             g_time_synced ? 1 : 0);
+}
+
+static uint64_t wallUnixMsNow() { return sampleUnixMs(millis()); }
+
+static bool formatWallStamp(char* out, size_t n, uint64_t unix_ms) {
+  if (!out || n < 16) return false;
+  if (unix_ms == 0) {
+    snprintf(out, n, "b%lu", (unsigned long)millis());
+    return false;
+  }
+  time_t sec = (time_t)(unix_ms / 1000ULL);
+  setenv("TZ", "CST-8", 1);
+  tzset();
+  struct tm t;
+  if (!localtime_r(&sec, &t)) {
+    snprintf(out, n, "u%llu", (unsigned long long)(unix_ms / 1000ULL));
+    return false;
+  }
+  snprintf(out, n, "%04d%02d%02d_%02d%02d%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+           t.tm_hour, t.tm_min, t.tm_sec);
+  return true;
+}
+
+static void applyHostTime(uint64_t unix_ms) {
+  if (g_session_board_t0 == 0) g_session_board_t0 = millis();
+  uint32_t rel = millis() - g_session_board_t0;
+  g_session_unix_t0 = (unix_ms > rel) ? (unix_ms - (uint64_t)rel) : unix_ms;
+  g_time_synced = true;
+  char stamp[24];
+  formatWallStamp(stamp, sizeof(stamp), wallUnixMsNow());
+  hostPrintf("# TIME ok stamp=%s unix_now=%llu board_t0=%lu (SD filenames use this clock)\n",
+             stamp, (unsigned long long)wallUnixMsNow(), (unsigned long)g_session_board_t0);
+}
+
+static bool poolAlloc() {
+  if (g_pool) return true;
+  size_t bytes = POOL_CAP * sizeof(LogSample);
+  void* p = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!p) p = malloc(bytes);
+  g_pool = (LogSample*)p;
+  return g_pool != nullptr;
+}
+
+static bool ilogAlloc() {
+  if (g_ilog && g_ipool) return true;
+  size_t ib = ILOG_CAP * sizeof(IndexEvent);
+  void* p = heap_caps_malloc(ib, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!p) p = malloc(ib);
+  g_ilog = (IndexEvent*)p;
+  g_ilog_cap = g_ilog ? ILOG_CAP : 0;
+  g_ilog_w = 0;
+  g_ilog_n = 0;
+  g_ilog_drop = 0;
+
+  size_t pb = IPOOL_CAP * sizeof(IndexEvent);
+  void* q = heap_caps_malloc(pb, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!q) q = malloc(pb);
+  g_ipool = (IndexEvent*)q;
+  g_ipool_n = 0;
+  return g_ilog != nullptr && g_ipool != nullptr;
+}
+
+static void ipoolClear() { g_ipool_n = 0; }
+
+static void ilogClear() {
+  portENTER_CRITICAL(&g_ilog_mux);
+  g_ilog_w = 0;
+  g_ilog_n = 0;
+  g_ilog_drop = 0;
+  portEXIT_CRITICAL(&g_ilog_mux);
+  ipoolClear();
+  g_last_i_ms = 0;
+  g_index_evt_seen = g_index_irq;
+}
+
+static void ilogPushEvt(const IndexEvent& e) {
+  if (!g_ilog || g_ilog_cap == 0) return;
+  portENTER_CRITICAL(&g_ilog_mux);
+  g_ilog[g_ilog_w] = e;
+  g_ilog_w = (g_ilog_w + 1) % g_ilog_cap;
+  if (g_ilog_n < g_ilog_cap) g_ilog_n++;
+  else g_ilog_drop++;
+  portEXIT_CRITICAL(&g_ilog_mux);
+}
+
+static void ipoolPushEvt(const IndexEvent& e) {
+  if (!g_ipool || g_ipool_n >= IPOOL_CAP) return;
+  g_ipool[g_ipool_n++] = e;
+}
+
+static void ipoolCommitToIlog() {
+  for (size_t i = 0; i < g_ipool_n; ++i) ilogPushEvt(g_ipool[i]);
+  ipoolClear();
+}
+
+static int16_t rpmToX10(float rpm) {
+  float r = rpm;
+  if (r > 3276.0f) r = 3276.0f;
+  if (r < -3276.0f) r = -3276.0f;
+  return (int16_t)lroundf(r * 10.0f);
+}
+
+static void captureIndexEdges(uint32_t now_ms, float rpm, uint32_t index_n) {
+  if (index_n <= g_index_evt_seen) {
+    g_index_evt_seen = index_n;
+    return;
+  }
+  if (g_phase != PH_STAGING && g_phase != PH_RECORD) {
+    g_index_evt_seen = index_n;
+    g_last_i_ms = now_ms;
+    return;
+  }
+
+  uint32_t n_edges = index_n - g_index_evt_seen;
+  if (n_edges > 8) n_edges = 8;
+  for (uint32_t k = 0; k < n_edges; ++k) {
+    uint32_t this_n = g_index_evt_seen + 1 + k;
+    uint32_t dt = 0;
+    if (g_last_i_ms != 0 && now_ms >= g_last_i_ms) dt = now_ms - g_last_i_ms;
+    g_last_i_ms = now_ms;
+
+    float rpm_i = 0.0f;
+    if (dt > 0) {
+      rpm_i = 60000.0f / (float)dt;
+      if (rpm < 0.0f) rpm_i = -rpm_i;
+    }
+
+    IndexEvent e;
+    e.t_ms = now_ms;
+    e.dt_ms = dt;
+    e.index_n = this_n;
+    e.rpm_x10 = rpmToX10(rpm);
+    e.rpm_i_x10 = rpmToX10(rpm_i);
+    e.seg = g_seg_cur;
+
+    if (g_phase == PH_STAGING) ipoolPushEvt(e);
+    else ilogPushEvt(e);
+  }
+  g_index_evt_seen = index_n;
+}
+
+static bool logAlloc() {
+  if (g_log) return true;
+  Serial.printf("# logAlloc INTERNAL-only (spiram_free=%u internal_free=%u)\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  size_t cap = LOG_CAP_INTERNAL;
+  void* p = heap_caps_malloc(cap * sizeof(LogSample), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  g_log_in_psram = false;
+  if (!p) {
+    cap = 4000;
+    p = malloc(cap * sizeof(LogSample));
+  }
+  if (!p) return false;
+  g_log = (LogSample*)p;
+  g_log_cap = cap;
+  g_log_w = 0;
+  g_log_n = 0;
+  g_log_drop = 0;
+  return true;
+}
+
+static void logClear() {
+  portENTER_CRITICAL(&g_log_mux);
+  g_log_w = 0;
+  g_log_n = 0;
+  g_log_drop = 0;
+  portEXIT_CRITICAL(&g_log_mux);
+  g_seg_count = 0;
+  g_seg_cur = 0;
+  ilogClear();
+  revsClear();
+}
+
+static void logPushMain(uint32_t t_ms, float rpm, uint16_t seg, uint32_t index_n) {
+  if (!g_log || g_log_cap == 0) return;
+  LogSample s;
+  s.t_ms = t_ms;
+  s.seg = seg;
+  s.rpm_x10 = rpmToX10(rpm);
+  s.index_n = index_n;
+  portENTER_CRITICAL(&g_log_mux);
+  g_log[g_log_w] = s;
+  g_log_w = (g_log_w + 1) % g_log_cap;
+  if (g_log_n < g_log_cap) g_log_n++;
+  else g_log_drop++;
+  portEXIT_CRITICAL(&g_log_mux);
+}
+
+static void poolClear() { g_pool_n = 0; }
+
+static void poolPush(uint32_t t_ms, float rpm, uint16_t seg, uint32_t index_n) {
+  if (!g_pool) return;
+  if (g_pool_n >= POOL_CAP) {
+    g_evt_seg = g_seg_cur;
+    poolCommitToMain();
+    g_evt_n = (uint32_t)g_log_n;
+    g_phase = PH_IDLE;
+    g_seg_cur = 0;
+    g_armed = false;
+    bleMuteHost(false);
+    g_noise_why = 5;
+    g_evt_code = 5;
+    g_evt_pending = true;
+    return;
+  }
+  g_pool[g_pool_n].t_ms = t_ms;
+  g_pool[g_pool_n].rpm_x10 = rpmToX10(rpm);
+  g_pool[g_pool_n].seg = seg;
+  g_pool[g_pool_n].index_n = index_n;
+  g_pool_n++;
+}
+
+static void poolCommitToMain() {
+  if (!g_pool) {
+    poolClear();
+    return;
+  }
+  size_t start = 0;
+  size_t n = g_pool_n;
+  if (n > BACKTRACK_N) {
+    start = n - BACKTRACK_N;
+    n = BACKTRACK_N;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    LogSample s = g_pool[start + i];
+    portENTER_CRITICAL(&g_log_mux);
+    g_log[g_log_w] = s;
+    g_log_w = (g_log_w + 1) % g_log_cap;
+    if (g_log_n < g_log_cap) g_log_n++;
+    else g_log_drop++;
+    portEXIT_CRITICAL(&g_log_mux);
+  }
+  g_evt_n = (uint32_t)n;
+  poolClear();
+  ipoolCommitToIlog();
+}
+
+static void discardStaging(uint8_t why) {
+  poolClear();
+  ipoolClear();
+  g_phase = PH_IDLE;
+  g_seg_cur = 0;
+  g_below_ms = 0;
+  g_flip_cnt = 0;
+  g_evt_code = 2;
+  g_noise_why = why;
+  g_evt_pending = true;
+  bleMuteHost(false);
+}
+
+static void salvageStagingOrDiscard(uint8_t why, uint32_t now_ms, int64_t net) {
+  const bool keep = (g_pool_n >= 8) || (net >= 8) || (net >= (CONFIRM_COUNTS / 8));
+  if (!keep) {
+    g_evt_seg = g_seg_cur;
+    g_evt_n = (uint32_t)((net > 0) ? net : (int64_t)g_pool_n);
+    discardStaging(why);
+    return;
+  }
+  g_evt_revs = (float)net / (float)ABI_STEPS_PER_REV;
+  g_evt_seg = g_seg_cur;
+  poolCommitToMain();
+  g_evt_n = (uint32_t)g_log_n;
+  g_phase = PH_RECORD;
+  g_rec_start_ms = now_ms;
+  g_below_ms = 0;
+  g_flip_cnt = 0;
+  g_noise_why = why;
+  g_evt_code = 1;
+  g_evt_pending = true;
+}
+
+static void beginStaging(uint32_t now_ms, int64_t counts, float rpm, uint32_t index_n) {
+  bleMuteHost(true);
+  g_seg_count = (uint16_t)(g_seg_count + 1);
+  g_seg_cur = g_seg_count;
+  g_phase = PH_STAGING;
+  g_stage_start_ms = now_ms;
+  g_stage_counts0 = counts;
+  g_stage_sign = (rpm >= 0.0f) ? 1 : -1;
+  g_below_ms = 0;
+  g_flip_cnt = 0;
+  poolClear();
+  ipoolClear();
+  g_last_i_ms = 0;
+  poolPush(now_ms, rpm, g_seg_cur, index_n);
+}
+
+static bool pcntBegin() {
+  // 单 PCNT 单元：A 相上升沿计数 + B 相方向电平
+  // 原版为 A/B 正交四倍频（4000 步/转）
+  // 新版为 A 相单边沿 + B 相方向（1000 步/转），毛刺更少
+  pcnt_unit_config_t ucfg = {};
+  ucfg.high_limit = 30000;
+  ucfg.low_limit = -30000;
+  ucfg.flags.accum_count = true;
+  if (pcnt_new_unit(&ucfg, &g_pcnt) != ESP_OK) return false;
+
+  pcnt_glitch_filter_config_t filter = {};
+  filter.max_glitch_ns = 1000;
+  pcnt_unit_set_glitch_filter(g_pcnt, &filter);
+
+  // A 相 → edge_gpio_num（脉冲输入）
+  // B 相 → level_gpio_num（方向控制电平）
+  pcnt_chan_config_t ch_a = {};
+  ch_a.edge_gpio_num = PIN_A;
+  ch_a.level_gpio_num = PIN_B;
+  if (pcnt_new_channel(g_pcnt, &ch_a, &g_chan_a) != ESP_OK) return false;
+
+  // 上升沿：增加计数
+  // 下降沿：不动作（仅单边沿，避免毛刺）
+  pcnt_channel_set_edge_action(g_chan_a,
+      PCNT_CHANNEL_EDGE_ACTION_HOLD,      // 下降沿：无动作
+      PCNT_CHANNEL_EDGE_ACTION_INCREASE); // 上升沿：+1
+
+  // B 相电平控制方向：
+  //   B 低电平 → 正向计数
+  //   B 高电平 → 反向计数
+  // （根据实际编码器接线可能需要交换）
+  pcnt_channel_set_level_action(g_chan_a,
+      PCNT_CHANNEL_LEVEL_ACTION_KEEP,     // B 低：保持方向
+      PCNT_CHANNEL_LEVEL_ACTION_INVERSE); // B 高：反向
+
+  // 注册 PCNT 事件回调（观察点 Watch Point）
+  pcnt_event_callbacks_t cbs = {};
+  cbs.on_reach = onPcntWatch;
+  pcnt_unit_register_event_callbacks(g_pcnt, &cbs, nullptr);
+
+  // 设置观察点：每转 4 等分（0°, 90°, 180°, 270°）
+  for (int i = 0; i < PCNT_WATCH_N; i++) {
+    pcnt_unit_add_watch_point(g_pcnt, PCNT_WATCH_POINTS[i]);
+  }
+
+  pcnt_unit_enable(g_pcnt);
+  pcnt_unit_clear_count(g_pcnt);
+  pcnt_unit_start(g_pcnt);
+
+  // I 相（Z 信号）：GPIO 上升沿中断，每转一个脉冲
+  pinMode(PIN_I, INPUT_PULLUP);
+  attachInterruptArg(PIN_I, onIndexIsr, nullptr, RISING);
+
+  return true;
+}
+
+static void sampleCb(void* arg) {
+  (void)arg;
+  if (g_sample_freeze || g_dumping) return;
+  uint32_t t0 = micros();
+  int raw = 0;
+  if (g_pcnt) pcnt_unit_get_count(g_pcnt, &raw);
+  if (raw > 20000 || raw < -20000) {
+    cb_counts_base += raw;
+    pcnt_unit_clear_count(g_pcnt);
+    raw = 0;
+  }
+  int64_t counts = cb_counts_base + (int64_t)raw;
+  uint32_t now_us = t0;
+  uint32_t now_ms = millis();
+
+  if (snapIsRecording()) {
+    uint32_t index_n = g_index_irq;
+    snapOnSampleCounts(counts, index_n, now_us);
+    cb_hist_c[cb_hist_i] = counts;
+    cb_hist_us[cb_hist_i] = now_us;
+    cb_hist_i = (cb_hist_i + 1) % VEL_WINDOW;
+    if (cb_hist_n < VEL_WINDOW) cb_hist_n++;
+    float rpm_loc = 0.0f;
+    if (cb_hist_n >= VEL_WINDOW) {
+      int i_old = cb_hist_i;
+      int64_t dc = counts - cb_hist_c[i_old];
+      uint32_t dt = now_us - cb_hist_us[i_old];
+      if (dt > 0) {
+        rpm_loc = ((float)dc / (float)ABI_STEPS_PER_REV) * (1e6f / (float)dt) * 60.0f;
+      }
+    }
+    cb_rpm_filt = 0.85f * cb_rpm_filt + 0.15f * rpm_loc;
+    g_rpm_for_index = cb_rpm_filt;
+    portENTER_CRITICAL(&g_snap_mux);
+    g_snap.counts = counts;
+    g_snap.t_ms = now_ms;
+    g_snap.index_n = index_n;
+    g_snap.seq++;
+    portEXIT_CRITICAL(&g_snap_mux);
+    return;
+  }
+
+  if (!g_abs_inited) {
+    g_abs_counts_last = counts;
+    g_counts_zero = counts;
+    g_abs_inited = true;
+  } else {
+    int64_t dc = counts - g_abs_counts_last;
+    if (dc < 0) dc = -dc;
+    g_revs_abs_acc += (double)dc / (double)ABI_STEPS_PER_REV;
+    g_abs_counts_last = counts;
+  }
+  float revs_total = (float)((double)(counts - g_counts_zero) / (double)ABI_STEPS_PER_REV);
+  float revs_abs = (float)g_revs_abs_acc;
+
+  cb_hist_c[cb_hist_i] = counts;
+  cb_hist_us[cb_hist_i] = now_us;
+  cb_hist_i = (cb_hist_i + 1) % VEL_WINDOW;
+  if (cb_hist_n < VEL_WINDOW) cb_hist_n++;
+
+  float rpm = 0.0f;
+  if (cb_hist_n >= VEL_WINDOW) {
+    int i_old = cb_hist_i;
+    int64_t dc = counts - cb_hist_c[i_old];
+    uint32_t dt = now_us - cb_hist_us[i_old];
+    if (dt > 0) {
+      rpm = ((float)dc / (float)ABI_STEPS_PER_REV) * (1e6f / (float)dt) * 60.0f;
+    }
+  }
+  cb_rpm_filt = 0.85f * cb_rpm_filt + 0.15f * rpm;
+  if (fabsf(cb_rpm_filt) < 0.3f) cb_rpm_filt = 0.0f;
+  g_rpm_for_index = cb_rpm_filt;
+
+  uint32_t index_n = g_index_irq;
+  int32_t index_signed = g_index_signed;
+  g_index_seen = index_n;
+
+  int8_t dir = 0;
+  if (cb_rpm_filt > 0.5f) dir = 1;
+  else if (cb_rpm_filt < -0.5f) dir = -1;
+
+  const float arpm = fabsf(cb_rpm_filt);
+
+  if (snapIsRecording()) {
+    snapOnSampleCounts(counts, index_n, now_us);
+    goto snap_out;
+  }
+  if (g_armed && snapIsArmed()) {
+    snapOnSampleCounts(counts, index_n, now_us);
+    if (g_phase == PH_IDLE) {
+      if (arpm > RPM_GATE) {
+        bleMuteHost(true);
+        g_phase = PH_STAGING;
+        g_stage_start_ms = now_ms;
+        g_stage_index0 = index_n;
+        g_stage_counts0 = counts;
+        g_seg_count = (uint16_t)(g_seg_count + 1);
+        g_seg_cur = g_seg_count;
+        g_evt_code = 6;
+        g_evt_pending = true;
+      }
+    } else if (g_phase == PH_STAGING) {
+      const bool rpm_drop = (arpm < (RPM_GATE * 0.5f));
+      const bool short_hold = (now_ms - g_stage_start_ms) >= 200u;
+      const bool i_plus = ((int32_t)(index_n - g_stage_index0) >= 1);
+      const bool ring_ok = (snapRingCount() >= 120);
+      const bool drop_salvage = rpm_drop && (snapRingCount() >= 40);
+      if (i_plus || short_hold || ring_ok || drop_salvage) {
+        if (snapTriggerFromRing(BACKTRACK_N, g_rec_duration_ms)) {
+          g_phase = PH_RECORD;
+          g_rec_start_ms = now_ms;
+          g_evt_revs = 1.0f;
+          g_evt_seg = g_seg_cur;
+          g_evt_n = (uint32_t)snapCount();
+          g_evt_code = 1;
+          g_evt_pending = true;
+        }
+      }
+    }
+    goto snap_out;
+  }
+
+  if (g_phase == PH_RECORD && !snapIsRecording()) {
+    logPushMain(now_ms, cb_rpm_filt, g_seg_cur, index_n);
+    if ((now_ms - g_rec_start_ms) >= g_rec_duration_ms) {
+      g_evt_seg = g_seg_cur;
+      g_evt_n = (uint32_t)g_log_n;
+      g_evt_code = 3;
+      g_evt_pending = true;
+      g_phase = PH_IDLE;
+      g_seg_cur = 0;
+      g_armed = false;
+      bleMuteHost(false);
+    }
+  } else if (g_armed && !snapIsArmed()) {
+    if (g_phase == PH_IDLE) {
+      if (arpm > RPM_GATE) {
+        beginStaging(now_ms, counts, cb_rpm_filt, index_n);
+      }
+    } else if (g_phase == PH_STAGING) {
+      poolPush(now_ms, cb_rpm_filt, g_seg_cur, index_n);
+      if (g_phase != PH_STAGING) {
+        g_noise_why = 5;
+        goto snap_out;
+      }
+
+      int64_t dcounts = counts - g_stage_counts0;
+      int64_t net = (g_stage_sign >= 0) ? dcounts : -dcounts;
+      if (net < 0) net = -net;
+      if (net >= CONFIRM_COUNTS) {
+        g_evt_revs = (float)net / (float)ABI_STEPS_PER_REV;
+        g_evt_seg = g_seg_cur;
+        poolCommitToMain();
+        g_phase = PH_RECORD;
+        g_rec_start_ms = now_ms;
+        g_evt_code = 1;
+        g_evt_pending = true;
+        goto snap_out;
+      }
+
+      int sgn = (cb_rpm_filt >= 0.0f) ? 1 : -1;
+      if (arpm > RPM_GATE && sgn != g_stage_sign) {
+        g_flip_cnt++;
+        if (g_flip_cnt >= 24) {
+          salvageStagingOrDiscard(2, now_ms, net);
+          goto snap_out;
+        }
+      } else if (arpm > RPM_GATE) {
+        g_flip_cnt = 0;
+      }
+
+      if (arpm <= RPM_GATE) {
+        g_below_ms += SAMPLE_PERIOD_US / 1000UL;
+        if (g_below_ms >= NOISE_BELOW_MS) {
+          salvageStagingOrDiscard(3, now_ms, net);
+          goto snap_out;
+        }
+      } else {
+        g_below_ms = 0;
+      }
+
+      if ((now_ms - g_stage_start_ms) >= STAGING_TIMEOUT_MS) {
+        salvageStagingOrDiscard(4, now_ms, net);
+        goto snap_out;
+      }
+    }
+  }
+
+snap_out:
+  if (capIsRunning()) {
+    capPushIsr(now_ms, rpm, counts, index_n);
+  }
+  captureIndexEdges(now_ms, cb_rpm_filt, index_n);
+  portENTER_CRITICAL(&g_snap_mux);
+  g_snap.counts = counts;
+  g_snap.rpm = cb_rpm_filt;
+  g_snap.dir = dir;
+  g_snap.t_ms = now_ms;
+  g_snap.seq++;
+  g_snap.revs_total = revs_total;
+  g_snap.revs_abs = revs_abs;
+  g_snap.index_n = index_n;
+  g_snap.index_signed = index_signed;
+  portEXIT_CRITICAL(&g_snap_mux);
+
+  cb_n++;
+  if (now_ms - cb_last_diag_ms >= 500) {
+    if (cb_n > 0) meas_hz = (uint32_t)((cb_n * 1000UL) / (now_ms - cb_last_diag_ms));
+    cb_n = 0;
+    cb_last_diag_ms = now_ms;
+    portENTER_CRITICAL(&g_snap_mux);
+    g_snap.sample_hz_meas = meas_hz;
+    portEXIT_CRITICAL(&g_snap_mux);
+  }
+  (void)t0;
+}
+
+static bool sampleTimerBegin() {
+  esp_timer_create_args_t args = {};
+  args.callback = &sampleCb;
+  args.name = "abi2k";
+  if (esp_timer_create(&args, &g_timer) != ESP_OK) return false;
+  return esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US) == ESP_OK;
+}
+
+static Snap takeSnap() {
+  Snap s;
+  portENTER_CRITICAL(&g_snap_mux);
+  s = g_snap;
+  portEXIT_CRITICAL(&g_snap_mux);
+  return s;
+}
+
+static const char* phaseName(RecPhase p) {
+  switch (p) {
+    case PH_STAGING: return "STAGING";
+    case PH_RECORD:  return "RECORD";
+    default:         return "IDLE";
+  }
+}
+
+static void emitTelem(const Snap& s) {
+  if (g_dumping || g_sample_freeze) return;
+  size_t n = 0, drop = 0;
+  portENTER_CRITICAL(&g_log_mux);
+  n = g_log_n;
+  drop = g_log_drop;
+  portEXIT_CRITICAL(&g_log_mux);
+
+  uint32_t remain = 0;
+  if (g_phase == PH_RECORD) {
+    uint32_t e = millis() - g_rec_start_ms;
+    remain = (e < g_rec_duration_ms) ? (g_rec_duration_ms - e) : 0;
+  }
+
+  int rx = rpmToX10(s.rpm);
+  int neg = 0;
+  if (rx < 0) { neg = 1; rx = -rx; }
+  int whole = rx / 10;
+  int frac = rx % 10;
+  int rxi = rpmToX10(s.revs_total);
+  int negi = 0;
+  if (rxi < 0) { negi = 1; rxi = -rxi; }
+  int wholer = rxi / 10;
+  int fracr = rxi % 10;
+  int rxia = rpmToX10(s.revs_abs);
+  if (rxia < 0) rxia = -rxia;
+  int wholea = rxia / 10;
+  int fraca = rxia % 10;
+  int revs_x10 = 0;
+  if (g_phase == PH_STAGING) {
+    int64_t d = s.counts - g_stage_counts0;
+    if (d < 0) d = -d;
+    revs_x10 = (int)((d * 10) / ABI_STEPS_PER_REV);
+  }
+
+  char line[220];
+  uint32_t t_rel = sessionRel(s.t_ms);
+  uint64_t unix_ms = sampleUnixMs(s.t_ms);
+  snprintf(line, sizeof(line),
+           "L,%lu,%s%d.%d,%d,%d,%u,%lu,%lu,%lld,%u,%u,%u,%d.%d,%lu,%u,%s%d.%d,%d.%d,%lu,%ld,%lu,%llu\n",
+           (unsigned long)s.t_ms, neg ? "-" : "", whole, frac, (int)s.dir, g_armed ? 1 : 0,
+           (unsigned)n, (unsigned long)drop, (unsigned long)s.sample_hz_meas, (long long)s.counts,
+           (unsigned)g_seg_cur, (unsigned)g_phase, (unsigned)g_pool_n, revs_x10 / 10,
+           revs_x10 % 10, (unsigned long)remain, (unsigned)g_seg_count, negi ? "-" : "", wholer,
+           fracr, wholea, fraca, (unsigned long)s.index_n, (long)s.index_signed,
+           (unsigned long)t_rel, (unsigned long long)unix_ms);
+  Serial.print(line);
+
+  if (bleConnected() && !bleHostMuted() && !g_armed && g_phase == PH_IDLE &&
+      !snapIsRecording()) {
+    uint16_t snap_n = snapCount();
+    char short_l[96];
+    snprintf(short_l, sizeof(short_l), "L,%s%d.%d,%d,%d,%u,%lu,%u\n", neg ? "-" : "", whole, frac,
+             (int)s.dir, g_armed ? 1 : 0, (unsigned)g_phase, (unsigned long)remain,
+             (unsigned)snap_n);
+    bleSendLine(short_l);
+  }
+}
+
+static uint16_t g_ble_pkt_ms = 180;
+static uint16_t g_ble_ack_wait_ms = 600;
+static uint16_t g_ble_dump_max = 120;
+static uint16_t g_ble_min_gap_ms = 50;
+static volatile bool g_dump_ack = false;
+static volatile bool g_dump_abort = false;
+static uint32_t g_ble_pkt_seq = 0;
+static uint16_t g_ble_pull_seg = 0;
+
+static void bleDumpTakeAck() { g_dump_ack = true; }
+
+static void bleDumpPollRx() {
+  char line[96];
+  while (bleTakeRxLine(line, sizeof(line))) {
+    if (!strncasecmp(line, "DUMP ACK", 8) || !strcasecmp(line, "ACK") ||
+        !strncasecmp(line, "ACK,", 4) || !strcasecmp(line, "DUMP NEXT")) {
+      g_dump_ack = true;
+    } else if (!strncasecmp(line, "TIME", 4) || !strncasecmp(line, "ABI?", 4) ||
+               !strncasecmp(line, "BLE RATE", 8) || !strncasecmp(line, "PING", 4) ||
+               !strcasecmp(line, "DIAG") || !strcasecmp(line, "SNAP?")) {
+    } else if (!strncasecmp(line, "MONITOR", 7) || !strncasecmp(line, "LOG", 3) ||
+               !strcasecmp(line, "DUMP ABORT") || !strcasecmp(line, "ABORT")) {
+      g_dump_abort = true;
+    }
+  }
+}
+
+static bool bleDumpPace() {
+  if (!bleConnected() || g_dump_abort) return false;
+  g_dump_ack = false;
+  uint32_t t0 = millis();
+  while (bleConnected() && !g_dump_abort) {
+    bleDumpPollRx();
+    if (g_dump_ack) {
+      uint32_t e = millis() - t0;
+      if (e < g_ble_min_gap_ms) delay(g_ble_min_gap_ms - e);
+      return bleConnected() && !g_dump_abort;
+    }
+    uint32_t elapsed = millis() - t0;
+    if (elapsed >= g_ble_ack_wait_ms) break;
+    delay(5);
+  }
+  if (g_dump_abort) return false;
+  delay(g_ble_pkt_ms);
+  return bleConnected() && !g_dump_abort;
+}
+
+static bool bleDumpSendLine(const char* line) {
+  if (!line || !bleConnected()) return false;
+  bleSendLine(line);
+  g_ble_pkt_seq++;
+  return bleDumpPace();
+}
+
+static void dumpMark(bool use_ble, const char* fmt, ...) {
+  char buf[192];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (use_ble) {
+    if (!bleConnected()) return;
+    bleDumpSendLine(buf);
+  } else {
+    Serial.print(buf);
+  }
+}
+
+static void dumpLog(size_t max_n, uint16_t only_seg, bool via_ble) {
+  g_dump_started = true;
+  g_dumping = true;
+  g_dump_abort = false;
+  if (g_timer) esp_timer_stop(g_timer);
+  g_sample_freeze = true;
+  const bool use_ble = via_ble && bleConnected();
+  if (via_ble && !use_ble) {
+    if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+    g_dumping = false;
+    g_sample_freeze = false;
+    return;
+  }
+  g_ble_pkt_seq = 0;
+  if (!g_log || g_log_cap == 0) {
+    dumpMark(use_ble, "# LOG empty (no buffer)\n");
+    dumpMark(use_ble, "D END 0\n");
+    dumpMark(use_ble, "I END 0\n");
+    if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+    g_dumping = false;
+    g_sample_freeze = false;
+    return;
+  }
+  size_t n, w;
+  portENTER_CRITICAL(&g_log_mux);
+  n = g_log_n;
+  w = g_log_w;
+  portEXIT_CRITICAL(&g_log_mux);
+  if (n == 0) {
+    dumpMark(use_ble, "# LOG empty\n");
+    dumpMark(use_ble,
+             "# HINT: live RPM != record. Send MONITOR START while spinning, "
+             "wait CONFIRM + RECORD done, then DUMP.\n");
+    hostPrintf("# MONITOR armed=%d phase=%s log_n=0 (dump empty)\n", g_armed ? 1 : 0,
+               phaseName(g_phase));
+    dumpMark(use_ble, "D END 0\n");
+    dumpMark(use_ble, "I END 0\n");
+    if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+    g_dumping = false;
+    g_sample_freeze = false;
+    return;
+  } else {
+    if (max_n == 0 || max_n > n) max_n = n;
+    size_t start = (w + g_log_cap - n) % g_log_cap;
+
+    uint32_t expect = 0;
+    for (size_t i = 0; i < max_n; ++i) {
+      LogSample s = g_log[(start + i) % g_log_cap];
+      if (only_seg != 0 && s.seg != only_seg) continue;
+      expect++;
+    }
+    uint32_t stride = 1;
+    if (use_ble && expect > g_ble_dump_max && g_ble_dump_max > 0) {
+      stride = (expect + g_ble_dump_max - 1) / g_ble_dump_max;
+    }
+
+    uint32_t out_total = (stride > 1) ? ((expect + stride - 1) / stride) : expect;
+    if (use_ble) {
+      dumpMark(true,
+               "# BLE dump mode=paced ack_wait=%ums pkt_ms=%ums max=%u stride=%lu "
+               "expect≈%lu out~%lu\n",
+               (unsigned)g_ble_ack_wait_ms, (unsigned)g_ble_pkt_ms, (unsigned)g_ble_dump_max,
+               (unsigned long)stride, (unsigned long)expect, (unsigned long)out_total);
+      dumpMark(true, "# DATA_START|%lu\n", (unsigned long)out_total);
+      dumpMark(true, "# DUMP PROG n=0 total=%lu pct=0\n", (unsigned long)out_total);
+    }
+
+    if (only_seg) {
+      dumpMark(use_ble, "# LOG DUMP seg=%u %s\n", (unsigned)only_seg,
+               use_ble ? "ble=1 paced" : "ble=0 (USB full speed)");
+    } else {
+      dumpMark(use_ble, "# LOG DUMP by-seg n=%u segs≈%u %s\n", (unsigned)max_n,
+               (unsigned)g_seg_count, use_ble ? "ble=1 paced" : "ble=0 (USB full speed)");
+    }
+
+    uint16_t cur_seg = 0xFFFF;
+    uint32_t seg_count_pts = 0;
+    uint32_t total = 0;
+    uint32_t seg_out = 0;
+    uint32_t keep_i = 0;
+    bool ble_aborted = false;
+    uint32_t last_ka_ms = millis();
+
+    for (size_t i = 0; i < max_n; ++i) {
+      size_t idx = (start + i) % g_log_cap;
+      LogSample s = g_log[idx];
+      if (only_seg != 0 && s.seg != only_seg) continue;
+
+      if (use_ble && stride > 1) {
+        if ((keep_i++ % stride) != 0) continue;
+      }
+
+      if (s.seg != cur_seg) {
+        if (cur_seg != 0xFFFF) {
+          dumpMark(use_ble, "S END %u n=%lu\n", (unsigned)cur_seg, (unsigned long)seg_count_pts);
+          seg_out++;
+        }
+        cur_seg = s.seg;
+        seg_count_pts = 0;
+        dumpMark(use_ble, "S BEGIN %u board_t0=%lu unix_t0=%llu\n", (unsigned)cur_seg,
+                 (unsigned long)g_session_board_t0, (unsigned long long)g_session_unix_t0);
+      }
+      int rx = (int)s.rpm_x10;
+      int neg = 0;
+      if (rx < 0) { neg = 1; rx = -rx; }
+      int whole = rx / 10;
+      int frac = rx % 10;
+      int dir = (s.rpm_x10 > 0) ? 1 : (s.rpm_x10 < 0 ? -1 : 0);
+      uint32_t t_rel = sessionRel(s.t_ms);
+      uint64_t unix_ms = sampleUnixMs(s.t_ms);
+      if (use_ble) {
+        if (!bleConnected()) {
+          ble_aborted = true;
+          Serial.println("# DUMP BLE aborted: link lost");
+          break;
+        }
+        char ble[80];
+        snprintf(ble, sizeof(ble), "D,%lu,%s%d.%d,%d,%u,%lu\n", (unsigned long)s.t_ms,
+                 neg ? "-" : "", whole, frac, dir, (unsigned)s.seg, (unsigned long)s.index_n);
+        if (!bleDumpSendLine(ble)) {
+          ble_aborted = true;
+          Serial.println("# DUMP BLE aborted: link lost");
+          break;
+        }
+      } else {
+        char line[72];
+        snprintf(line, sizeof(line), "D,%lu,%s%d.%d,%d,%u,%lu\n", (unsigned long)s.t_ms,
+                 neg ? "-" : "", whole, frac, dir, (unsigned)s.seg, (unsigned long)s.index_n);
+        Serial.print(line);
+        if ((total & 0x07) == 0x07) {
+          Serial.flush();
+          yield();
+          delay(2);
+        }
+      }
+      seg_count_pts++;
+      total++;
+      if (use_ble && (total % 20) == 0) {
+        uint32_t pct = out_total ? (total * 100UL / out_total) : 0;
+        if (pct > 100) pct = 100;
+        Serial.printf("# DUMP BLE progress %lu/%lu pct=%lu\n", (unsigned long)total,
+                      (unsigned long)out_total, (unsigned long)pct);
+        char prog[80];
+        snprintf(prog, sizeof(prog), "# DUMP PROG n=%lu total=%lu pct=%lu\n",
+                 (unsigned long)total, (unsigned long)out_total, (unsigned long)pct);
+        if (!bleDumpSendLine(prog)) {
+          ble_aborted = true;
+          break;
+        }
+      }
+    }
+    if (cur_seg != 0xFFFF) {
+      dumpMark(use_ble, "S END %u n=%lu\n", (unsigned)cur_seg, (unsigned long)seg_count_pts);
+      seg_out++;
+    }
+    if (ble_aborted) {
+      dumpMark(true, "# DUMP BLE truncated n=%lu\n", (unsigned long)total);
+    }
+    dumpMark(use_ble, "D END %lu segs=%lu\n", (unsigned long)total, (unsigned long)seg_out);
+    if (use_ble) dumpMark(true, "# DATA_END|%lu\n", (unsigned long)total);
+  }
+
+  if (!use_ble) {
+    dumpMark(false, "# INDEX EVENTS skipped (USB short)\n");
+    dumpMark(false, "I END 0\n");
+    if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+    g_dumping = false;
+    g_sample_freeze = false;
+    return;
+  }
+
+  size_t in = 0, iw = 0;
+  portENTER_CRITICAL(&g_ilog_mux);
+  in = g_ilog_n;
+  iw = g_ilog_w;
+  portEXIT_CRITICAL(&g_ilog_mux);
+  dumpMark(use_ble, "# INDEX EVENTS n=%u drop=%lu filter_seg=%u\n", (unsigned)in,
+           (unsigned long)g_ilog_drop, (unsigned)only_seg);
+  if (in == 0 || !g_ilog) {
+    dumpMark(use_ble, "I END 0\n");
+    if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+    g_dumping = false;
+    g_sample_freeze = false;
+    return;
+  }
+  size_t istart = (iw + g_ilog_cap - in) % g_ilog_cap;
+  uint32_t itotal = 0;
+  for (size_t i = 0; i < in; ++i) {
+    if (use_ble && !bleConnected()) break;
+    size_t idx = (istart + i) % g_ilog_cap;
+    IndexEvent e = g_ilog[idx];
+    if (only_seg != 0 && e.seg != only_seg) continue;
+    int rx = (int)e.rpm_x10;
+    int neg = 0;
+    if (rx < 0) { neg = 1; rx = -rx; }
+    int whole = rx / 10, frac = rx % 10;
+    int rxi = (int)e.rpm_i_x10;
+    int negi = 0;
+    if (rxi < 0) { negi = 1; rxi = -rxi; }
+    int wholei = rxi / 10, fraci = rxi % 10;
+    uint32_t t_rel = sessionRel(e.t_ms);
+    uint64_t unix_ms = sampleUnixMs(e.t_ms);
+    char line[160];
+    snprintf(line, sizeof(line), "I,%u,%lu,%lu,%s%d.%d,%s%d.%d,%lu,%u,%lu,%llu\n",
+             (unsigned)itotal, (unsigned long)e.t_ms, (unsigned long)e.index_n, neg ? "-" : "",
+             whole, frac, negi ? "-" : "", wholei, fraci, (unsigned long)e.dt_ms, (unsigned)e.seg,
+             (unsigned long)t_rel, (unsigned long long)unix_ms);
+    if (use_ble) {
+      if (!bleDumpSendLine(line)) break;
+    } else {
+      Serial.print(line);
+      if ((itotal & 0x1F) == 0x1F) { yield(); delay(1); }
+    }
+    itotal++;
+  }
+  dumpMark(use_ble, "I END %lu\n", (unsigned long)itotal);
+  if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  g_dumping = false;
+  g_sample_freeze = false;
+}
+
+static void requestAutoDump(uint16_t seg) {
+  g_auto_dump_seg = seg;
+  g_auto_dump_expect = g_evt_n;
+  g_need_auto_dump = true;
+}
+
+static bool ensureMonBuffers() {
+  if (!g_log && !logAlloc()) {
+    Serial.println("# WARN logAlloc failed");
+    return false;
+  }
+  if (!g_pool && !poolAlloc()) {
+    Serial.println("# WARN poolAlloc failed");
+    return false;
+  }
+  if (!g_ilog && !ilogAlloc()) {
+    Serial.println("# WARN ilogAlloc failed");
+    return false;
+  }
+  return true;
+}
+
+static void monitorStart() {
+  if (sdMscIsOn()) {
+    hostPrintln("# MONITOR: USB DISK was ON → OFF");
+    sdMscOff();
+  }
+  if (g_sample_freeze || g_dumping) {
+    hostPrintf("# MONITOR: clear stuck freeze=%d dumping=%d\n", g_sample_freeze ? 1 : 0,
+               g_dumping ? 1 : 0);
+  }
+  g_sample_freeze = false;
+  g_dumping = false;
+  g_dump_abort = false;
+  if (snapIsRecording()) {
+    hostPrintln("# MONITOR busy (snap recording)");
+    return;
+  }
+  if (!snapArmBegin()) {
+    hostPrintln("# MONITOR fail: snap arm/ring alloc");
+    char d[120];
+    snapDiagLine(d, sizeof(d));
+    hostPrintln(d);
+    return;
+  }
+  g_armed = true;
+  g_phase = PH_IDLE;
+  g_seg_cur = 0;
+  g_dump_started = false;
+  g_ready_ms = 0;
+  static uint32_t s_monitor_start_count = 0;
+  s_monitor_start_count++;
+  char stamp[24];
+  bool synced = formatWallStamp(stamp, sizeof(stamp), wallUnixMsNow());
+  hostPrintf("# MONITOR armed: PCNT A+I rising-edge |rpm|>%.0f → I+1/1.2s/ring → REC %lums\n",
+             RPM_GATE, (unsigned long)g_rec_duration_ms);
+  hostPrintf("# MONITOR time stamp=%s synced=%d\n", stamp, synced ? 1 : 0);
+  hostPrintf("# MONITOR START count=%lu (clears previous RAM snap)\n",
+             (unsigned long)s_monitor_start_count);
+  {
+    char d[120];
+    snapDiagLine(d, sizeof(d));
+    hostPrintln(d);
+  }
+  if (bleConnected()) {
+    char s[72];
+    snprintf(s, sizeof(s), "# MONITOR START count=%lu\n", (unsigned long)s_monitor_start_count);
+    bleSendLine(s);
+    bleSendLine("# MONITOR armed — BLE live RPM OFF until STOP/done\n");
+  }
+  bleMuteHost(true);
+  if (g_timer) {
+    esp_timer_stop(g_timer);
+    esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  }
+}
+
+static void recNow() {
+  if (sdMscIsOn()) {
+    hostPrintln("# REC blocked — USB DISK ON (send USB DISK OFF first)");
+    return;
+  }
+  if (snapIsRecording()) {
+    hostPrintln("# REC NOW busy (already recording)");
+    return;
+  }
+  g_armed = false;
+  g_phase = PH_IDLE;
+  g_seg_cur = 0;
+  g_sample_freeze = false;
+  g_dumping = false;
+  g_dump_started = false;
+  g_ready_ms = 0;
+  bleMuteHost(false);
+  if (!snapRecStart(g_rec_duration_ms, SAMPLE_HZ)) {
+    hostPrintln("# REC NOW fail (snap buffer)");
+    return;
+  }
+  if (g_timer) {
+    esp_timer_stop(g_timer);
+    esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  }
+  hostPrintf("# REC NOW %lums @%luHz → INTERNAL RAM then SD SAVE\n",
+             (unsigned long)g_rec_duration_ms, (unsigned long)SAMPLE_HZ);
+}
+
+static void snapArchiveToSd() {
+  if (sdMscIsOn()) {
+    hostPrintln("# SD SAVE blocked — USB DISK ON (PC owns card; USB DISK OFF first)");
+    return;
+  }
+  if (snapIsRecording()) {
+    hostPrintln("# SD SAVE busy recording");
+    return;
+  }
+  size_t len = snapDataLen();
+  const uint8_t* p = snapDataBytes();
+  if (!p || len == 0 || snapCount() == 0) {
+    hostPrintln("# SD SAVE fail: no snap data");
+    return;
+  }
+  if (!sdReady() && !sdBegin()) {
+    hostPrintln("# SD SAVE fail: no card — data still in RAM");
+    if (bleConnected()) {
+      delay(400);
+      hostPrintln("# BLE PULL READY src=RAM — send DUMP BIN BLE (no SD archive)");
+    } else {
+      hostPrintln("# → try DUMP BIN (USB) or insert SD + SD SAVE");
+    }
+    return;
+  }
+  uint64_t unix_now = wallUnixMsNow();
+  char stamp[24];
+  bool synced = formatWallStamp(stamp, sizeof(stamp), unix_now);
+  char path[64];
+  snprintf(path, sizeof(path), "/snap_%s_%u.bin", stamp, (unsigned)snapCount());
+  g_dumping = true;
+  g_sample_freeze = true;
+  if (g_timer) esp_timer_stop(g_timer);
+  bool ok = sdWriteBinary(path, p, len);
+  if (ok) {
+    uint32_t crc = snapCrc32(p, len);
+    char meta_path[64];
+    snprintf(meta_path, sizeof(meta_path), "/snap_%s_%u.txt", stamp, (unsigned)snapCount());
+    char meta[320];
+    snprintf(meta, sizeof(meta),
+             "stamp=%s\niso_local=%s\nunix_ms=%llu\nsynced=%d\nn=%u\nbytes=%u\ncrc=0x%08lX\n"
+             "hz=2000\nboard_ms=%lu\nsteps_per_rev=%d\nmode=A+I_PCNT\nfile=%s\n",
+             stamp, stamp, (unsigned long long)unix_now, synced ? 1 : 0, (unsigned)snapCount(),
+             (unsigned)len, (unsigned long)crc, (unsigned long)millis(), ABI_STEPS_PER_REV, path);
+    sdWriteText(meta_path, meta);
+    hostPrintf("# SD SAVE OK %s n=%u bytes=%u crc=0x%08lX time=%s synced=%d mode=A+I_PCNT\n",
+               path, (unsigned)snapCount(), (unsigned)len, (unsigned long)crc, stamp,
+               synced ? 1 : 0);
+    if (!synced) {
+      hostPrintln("# WARN no PC TIME yet — filename uses board millis");
+    }
+    if (bleConnected()) {
+      delay(400);
+      hostPrintln("# BLE PULL READY src=RAM — send DUMP BIN BLE (safer than SD SPI TX)");
+    } else {
+      hostPrintln("# → auto USB DISK ON (Native USB = U-disk; CH343 = serial)");
+      sdMscOn();
+    }
+  } else {
+    hostPrintln("# SD SAVE fail: write error — data still in RAM");
+    if (bleConnected()) {
+      delay(400);
+      hostPrintln("# BLE PULL READY src=RAM — send DUMP BIN BLE");
+    }
+  }
+  if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  g_sample_freeze = false;
+  g_dumping = false;
+}
+
+static void dumpBin() {
+  if (snapIsRecording()) {
+    hostPrintln("# DUMP BIN busy (still recording)");
+    return;
+  }
+  if (!snapDumpReady()) {
+    hostPrintln("# DUMP BIN wait — need # SNAP DUMP READY (ALIVE ~2s)");
+    return;
+  }
+  g_dumping = true;
+  g_sample_freeze = true;
+  if (g_timer) esp_timer_stop(g_timer);
+  snapDumpBinary();
+  if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  g_sample_freeze = false;
+  g_dumping = false;
+}
+
+static bool bleSendBinHexChunks(const uint8_t* data, size_t len, uint32_t* seq) {
+  static const char* HEXDIG = "0123456789ABCDEF";
+  const size_t CHUNK = 72;
+  size_t off = 0;
+  char line[200];
+  while (off < len) {
+    if (!bleConnected() || g_dump_abort) return false;
+    size_t m = len - off;
+    if (m > CHUNK) m = CHUNK;
+    int pos = snprintf(line, sizeof(line), "B,%lu,", (unsigned long)(*seq));
+    for (size_t i = 0; i < m && pos + 2 < (int)sizeof(line) - 2; ++i) {
+      uint8_t b = data[off + i];
+      line[pos++] = HEXDIG[b >> 4];
+      line[pos++] = HEXDIG[b & 0x0F];
+    }
+    line[pos++] = '\n';
+    line[pos] = '\0';
+    if (!bleDumpSendLine(line)) return false;
+    (*seq)++;
+    off += m;
+  }
+  return true;
+}
+
+static void dumpBinBlePayload(const uint8_t* payload, size_t plen, uint16_t n, uint16_t hz,
+                              const char* src) {
+  if (!bleConnected()) {
+    hostPrintln("# DUMP BIN BLE fail: BLE not connected");
+    return;
+  }
+  if (!payload || n == 0 || plen == 0) {
+    hostPrintln("# DUMP BIN BLE fail: empty payload");
+    return;
+  }
+  if (plen != (size_t)n * snapPointSize()) {
+    n = (uint16_t)(plen / snapPointSize());
+    plen = (size_t)n * snapPointSize();
+    if (n == 0) {
+      hostPrintln("# DUMP BIN BLE fail: payload not snap points");
+      return;
+    }
+  }
+  if (hz == 0) hz = 2000;
+
+  uint32_t file_magic = snapFileMagic();
+  uint32_t crc = snapCrc32(payload, plen);
+  uint8_t head[8];
+  memcpy(head, &file_magic, 4);
+  memcpy(head + 4, &n, 2);
+  memcpy(head + 6, &hz, 2);
+  uint8_t crc_le[4];
+  memcpy(crc_le, &crc, 4);
+
+  g_dumping = true;
+  g_sample_freeze = true;
+  g_dump_abort = false;
+  bleMuteHost(true);
+  if (g_timer) esp_timer_stop(g_timer);
+
+  uint16_t saved_gap = g_ble_min_gap_ms;
+  uint16_t saved_ack = g_ble_ack_wait_ms;
+  g_ble_min_gap_ms = 35;
+  g_ble_ack_wait_ms = 900;
+
+  const char* src_tag = (src && src[0]) ? src : "RAM";
+  char mark[200];
+  snprintf(mark, sizeof(mark),
+           "# BIN BLE BEGIN src=%s n=%u hz=%u steps=%ld pt=%u bytes=%u crc=0x%08lX\n",
+           src_tag, (unsigned)n, (unsigned)hz, (long)snapStepsPerRev(), (unsigned)snapPointSize(),
+           (unsigned)(8 + plen + 4), (unsigned long)crc);
+  Serial.print(mark);
+  bool ok = bleDumpSendLine(mark);
+
+  uint32_t seq = 0;
+  if (ok) ok = bleSendBinHexChunks(head, sizeof(head), &seq);
+  if (ok) ok = bleSendBinHexChunks(payload, plen, &seq);
+  if (ok) ok = bleSendBinHexChunks(crc_le, sizeof(crc_le), &seq);
+
+  snprintf(mark, sizeof(mark),
+           "# BIN BLE END src=%s n=%u chunks=%lu ok=%d crc=0x%08lX\n",
+           src_tag, (unsigned)n, (unsigned long)seq, ok ? 1 : 0, (unsigned long)crc);
+  Serial.print(mark);
+  if (bleConnected() && !g_dump_abort) bleDumpSendLine(mark);
+
+  g_ble_min_gap_ms = saved_gap;
+  g_ble_ack_wait_ms = saved_ack;
+  if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  bleMuteHost(false);
+  g_sample_freeze = false;
+  g_dumping = false;
+  g_dump_abort = false;
+}
+
+static void dumpBinBleFromSd() {
+  if (!bleConnected()) {
+    hostPrintln("# DUMP BIN BLE SD fail: BLE not connected");
+    return;
+  }
+  if (snapIsRecording()) {
+    hostPrintln("# DUMP BIN BLE SD busy recording");
+    return;
+  }
+  if (sdMscIsOn()) {
+    hostPrintln("# DUMP BIN BLE SD blocked — USB DISK ON");
+    return;
+  }
+  char path[64];
+  uint32_t fsz = 0;
+  if (!sdFindLatestSnap(path, sizeof(path), &fsz)) {
+    hostPrintln("# DUMP BIN BLE SD fail: no snap_*.bin on card");
+    return;
+  }
+  g_dumping = true;
+  g_sample_freeze = true;
+  if (g_timer) esp_timer_stop(g_timer);
+  uint8_t* buf = nullptr;
+  size_t len = 0;
+  bool rd = sdReadEntire(path, &buf, &len);
+  if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  g_sample_freeze = false;
+  g_dumping = false;
+  if (!rd || !buf || len == 0) {
+    if (buf) free(buf);
+    hostPrintf("# DUMP BIN BLE SD fail: read %s\n", path);
+    return;
+  }
+  hostPrintf("# DUMP BIN BLE SD file=%s bytes=%u → BLE\n", path, (unsigned)len);
+  uint16_t n = (uint16_t)(len / snapPointSize());
+  dumpBinBlePayload(buf, (size_t)n * snapPointSize(), n, 2000, "SD");
+  free(buf);
+}
+
+static void dumpBinBle() {
+  if (!bleConnected()) {
+    hostPrintln("# DUMP BIN BLE fail: BLE not connected");
+    return;
+  }
+  if (snapIsRecording()) {
+    hostPrintln("# DUMP BIN BLE busy recording");
+    return;
+  }
+  const uint8_t* payload = snapDataBytes();
+  size_t plen = snapDataLen();
+  uint16_t n = snapCount();
+  uint16_t hz = (uint16_t)snapHz();
+  if (payload && n > 0 && plen > 0) {
+    dumpBinBlePayload(payload, plen, n, hz, "RAM");
+    return;
+  }
+  char d[140];
+  snapDiagLine(d, sizeof(d));
+  hostPrintln(d);
+  hostPrintln("# DUMP BIN BLE: empty RAM — try SD fallback");
+  dumpBinBleFromSd();
+}
+
+static void dumpHex() {
+  if (snapIsRecording()) {
+    hostPrintln("# HEX DUMP busy (still recording)");
+    return;
+  }
+  if (!snapDumpReady()) {
+    hostPrintln("# HEX DUMP wait — need # SNAP DUMP READY");
+    return;
+  }
+  g_dumping = true;
+  g_sample_freeze = true;
+  if (g_timer) esp_timer_stop(g_timer);
+  snapDumpHex();
+  if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+  g_sample_freeze = false;
+  g_dumping = false;
+}
+
+static void monitorStop() {
+  g_armed = false;
+  snapArmEnd();
+  if (g_phase == PH_STAGING) {
+    g_evt_seg = g_seg_cur;
+    discardStaging(2);
+    hostPrintln("# MONITOR disarm: staging discarded");
+  } else if (g_phase == PH_RECORD) {
+    uint16_t seg = g_seg_cur;
+    g_evt_seg = seg;
+    g_phase = PH_IDLE;
+    g_seg_cur = 0;
+    hostPrintln("# MONITOR disarm: record stopped → auto dump");
+    requestAutoDump(seg);
+  } else {
+    hostPrintln("# MONITOR disarm");
+  }
+}
+
+static void handleCmd(char* line) {
+  while (*line == ' ' || *line == '\t') ++line;
+  char* p = line + strlen(line);
+  while (p > line && (p[-1] == ' ' || p[-1] == '\t')) *--p = '\0';
+  if (*line == '\0') return;
+
+  if (!strcasecmp(line, "REC") || !strncasecmp(line, "REC NOW", 7) || !strcasecmp(line, "SNAP") ||
+      !strcasecmp(line, "REC SNAP")) {
+    if (snapIsRecording() || g_armed || snapCount() > 0) {
+      hostPrintf("# REC NOW ignored (rec=%d armed=%d snap=%u) — use MONITOR path\n",
+                 snapIsRecording() ? 1 : 0, g_armed ? 1 : 0, (unsigned)snapCount());
+      return;
+    }
+    recNow();
+    return;
+  }
+  if (!strcasecmp(line, "DUMP BIN BLE SD") || !strcasecmp(line, "BIN DUMP BLE SD") ||
+      !strcasecmp(line, "BLE BIN SD") || !strcasecmp(line, "DUMP SD BLE")) {
+    dumpBinBleFromSd();
+    return;
+  }
+  if (!strcasecmp(line, "DUMP BIN BLE") || !strcasecmp(line, "BIN DUMP BLE") ||
+      !strcasecmp(line, "BLE BIN")) {
+    dumpBinBle();
+    return;
+  }
+  if (!strcasecmp(line, "DUMP BIN") || !strcasecmp(line, "BIN DUMP")) {
+    dumpBin();
+    return;
+  }
+  if (!strcasecmp(line, "HEX DUMP") || !strcasecmp(line, "DUMP HEX")) {
+    dumpHex();
+    return;
+  }
+  if (!strcasecmp(line, "SNAP?")) {
+    uint16_t n = snapCount();
+    size_t bytes = snapDataLen();
+    int valid = (n > 0 && bytes > 0) ? 1 : 0;
+    char s[120];
+    snprintf(s, sizeof(s), "# SNAP src=RAM valid=%d n=%u bytes=%u ring=%u ready=%d\n",
+             valid, (unsigned)n, (unsigned)bytes, (unsigned)snapRingCount(),
+             snapDumpReady() ? 1 : 0);
+    hostPrintln(s);
+    if (bleConnected()) bleSendLine(s);
+    return;
+  }
+  if (!strcasecmp(line, "LOG?") || !strcasecmp(line, "SNAP STATUS") ||
+      !strcasecmp(line, "DIAG") || !strcasecmp(line, "STATUS")) {
+    snapPrintStatus();
+    char d[160];
+    snapDiagLine(d, sizeof(d));
+    hostPrintln(d);
+    hostPrintf("# DIAG2 armed=%d phase=%s freeze=%d dumping=%d rpm=%.1f idx=%lu rec_ms=%lu"
+               " pcnt_watch=%lu\n",
+               g_armed ? 1 : 0, phaseName(g_phase), g_sample_freeze ? 1 : 0,
+               g_dumping ? 1 : 0, (double)takeSnap().rpm,
+               (unsigned long)takeSnap().index_n, (unsigned long)g_rec_duration_ms,
+               (unsigned long)g_watch_triggered);
+    return;
+  }
+  if (!strcasecmp(line, "SD?") || !strcasecmp(line, "SD STATUS")) {
+    sdPrintStatus();
+    return;
+  }
+  if (!strcasecmp(line, "SD INIT") || !strcasecmp(line, "SD BEGIN")) {
+    if (sdMscIsOn()) {
+      hostPrintln("# SD INIT blocked — USB DISK ON (USB DISK OFF first)");
+      return;
+    }
+    g_dumping = true;
+    g_sample_freeze = true;
+    if (g_timer) esp_timer_stop(g_timer);
+    sdBegin();
+    if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+    g_sample_freeze = false;
+    g_dumping = false;
+    return;
+  }
+  if (!strcasecmp(line, "SD TEST")) {
+    if (sdMscIsOn()) {
+      hostPrintln("# SD TEST blocked — USB DISK ON");
+      return;
+    }
+    g_dumping = true;
+    g_sample_freeze = true;
+    if (g_timer) esp_timer_stop(g_timer);
+    sdSelfTest();
+    if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+    g_sample_freeze = false;
+    g_dumping = false;
+    return;
+  }
+  if (!strcasecmp(line, "SD LIST") || !strcasecmp(line, "SD LS")) {
+    if (sdMscIsOn()) {
+      hostPrintln("# SD LIST blocked — USB DISK ON (read files on PC)");
+      return;
+    }
+    g_dumping = true;
+    g_sample_freeze = true;
+    if (g_timer) esp_timer_stop(g_timer);
+    sdListRoot(30);
+    if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+    g_sample_freeze = false;
+    g_dumping = false;
+    return;
+  }
+  if (!strcasecmp(line, "SD SAVE") || !strcasecmp(line, "SNAP SD")) {
+    snapArchiveToSd();
+    return;
+  }
+  if (!strcasecmp(line, "USB DISK") || !strcasecmp(line, "USB DISK?") ||
+      !strcasecmp(line, "MSC?") || !strcasecmp(line, "MSC")) {
+    sdMscPrintStatus();
+    return;
+  }
+  if (!strcasecmp(line, "USB DISK ON") || !strcasecmp(line, "MSC ON") ||
+      !strcasecmp(line, "USB MSC ON")) {
+    if (snapIsRecording()) {
+      hostPrintln("# USB DISK blocked — still recording");
+      return;
+    }
+    g_dumping = true;
+    g_sample_freeze = true;
+    if (g_timer) esp_timer_stop(g_timer);
+    sdMscOn();
+    if (!sdMscIsOn()) {
+      if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+      g_sample_freeze = false;
+      g_dumping = false;
+    }
+    return;
+  }
+  if (!strcasecmp(line, "USB DISK OFF") || !strcasecmp(line, "MSC OFF") ||
+      !strcasecmp(line, "USB MSC OFF")) {
+    sdMscOff();
+    if (g_timer) esp_timer_start_periodic(g_timer, SAMPLE_PERIOD_US);
+    g_sample_freeze = false;
+    g_dumping = false;
+    return;
+  }
+  if (!strncasecmp(line, "REC MS", 6) || !strncasecmp(line, "REC TIME", 8)) {
+    const char* a = line;
+    if (!strncasecmp(a, "REC MS", 6)) a += 6;
+    else a += 8;
+    while (*a == ' ') ++a;
+    if (*a) {
+      int v = atoi(a);
+      if (v < 500) v = 500;
+      if (v > 3000) v = 3000;
+      v = (v / 100) * 100;
+      if (v < 500) v = 500;
+      g_rec_duration_ms = (uint32_t)v;
+    }
+    hostPrintf("# REC MS=%lu (next shot only; snap=%u rec=%d)\n",
+               (unsigned long)g_rec_duration_ms, (unsigned)snapCount(),
+               snapIsRecording() ? 1 : 0);
+    return;
+  }
+  if (!strncasecmp(line, "DUMP ACK", 8) || !strcasecmp(line, "ACK") ||
+      !strcasecmp(line, "DUMP NEXT")) {
+    bleDumpTakeAck();
+    return;
+  }
+  if (!strncasecmp(line, "BLE DUMP", 8)) {
+    const char* a = line + 8;
+    while (*a == ' ') ++a;
+    if (!strncasecmp(a, "MS", 2)) {
+      int v = atoi(a + 2);
+      if (v < 20) v = 20;
+      if (v > 500) v = 500;
+      g_ble_pkt_ms = (uint16_t)v;
+      g_ble_ack_wait_ms = (uint16_t)(v * 2 + 40);
+      if (g_ble_ack_wait_ms > 800) g_ble_ack_wait_ms = 800;
+      hostPrintf("# OK ble_ms=%u ack_wait=%u\n", (unsigned)g_ble_pkt_ms,
+                 (unsigned)g_ble_ack_wait_ms);
+    } else if (!strncasecmp(a, "MAX", 3)) {
+      int v = atoi(a + 3);
+      if (v < 100) v = 100;
+      if (v > 4000) v = 4000;
+      g_ble_dump_max = (uint16_t)v;
+      hostPrintf("# OK ble_max=%u\n", (unsigned)g_ble_dump_max);
+    } else {
+      hostPrintf("# OK ble_ms=%u ack_wait=%u max=%u\n",
+                 (unsigned)g_ble_pkt_ms, (unsigned)g_ble_ack_wait_ms,
+                 (unsigned)g_ble_dump_max);
+    }
+    return;
+  }
+  if (!strcasecmp(line, "BLE ON") || !strcasecmp(line, "BLE START")) {
+    bleBegin();
+    hostPrintf("# BLE ON heap_internal=%u\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    return;
+  }
+  if (!strcasecmp(line, "PING")) {
+    hostSerialPrintln("# PONG");
+    return;
+  }
+  if (!strcasecmp(line, "FW?") || !strcasecmp(line, "VERSION")) {
+    hostPrintln("# FW=pcnt-ai-v1 A+I rising-edge PCNT steps=1000 snap=counts→host");
+    return;
+  }
+  if (!strncasecmp(line, "TIME", 4)) {
+    const char* a = line + 4;
+    while (*a == ' ') ++a;
+    uint64_t u = strtoull(a, nullptr, 10);
+    if (u > 0) applyHostTime(u);
+    else hostSerialPrintln("# TIME need unix_ms");
+    return;
+  }
+  if (!strcasecmp(line, "HELP") || !strcasecmp(line, "?")) {
+    hostPrintln("# CMD: MONITOR START|STOP | REC NOW | SD SAVE | DUMP BIN BLE | USB DISK …");
+    hostPrintln("# PCNT A+I rising-edge (B=dir), gpio_intr=I (Z)");
+    hostPrintln("# DUMP BIN BLE=读RAM | USB DISK ON=Native USB 读卡");
+    hostPrintln("# SPI SD: CS=10 SCK=12 MOSI=11 MISO=13 @3.3V");
+    return;
+  }
+  if (!strncasecmp(line, "CAPTURE", 7) || !strncasecmp(line, "CAP ", 4)) {
+    const char* a = line;
+    if (!strncasecmp(a, "CAPTURE", 7)) a += 7;
+    else a += 3;
+    while (*a == ' ') ++a;
+    if (!strcasecmp(a, "STOP")) {
+      capStop();
+      hostPrintf("# CAPTURE stop n=%u dur_ms=%lu\n", (unsigned)capCount(),
+                 (unsigned long)capDurationMs());
+    } else if (!strncasecmp(a, "START", 5)) {
+      a += 5;
+      while (*a == ' ') ++a;
+      uint32_t sec = 30;
+      if (*a) {
+        float v = atof(a);
+        if (v >= 30.0f && v <= 100.0f) sec = (uint32_t)(v + 0.5f);
+        else if (v > 100.0f && v <= 100000.0f) sec = (uint32_t)((v / 1000.0f) + 0.5f);
+      }
+      if (sec < 30) sec = 30;
+      if (sec > 100) sec = 100;
+      if (!capStart(sec * 1000UL)) {
+        size_t free_b = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        hostPrintf("# CAPTURE fail: no buffer (spiram_free=%u).\n", (unsigned)free_b);
+      } else {
+        hostPrintf("# CAPTURE START %lus RAW@2kHz (no gate/filter) buf≈%us\n",
+                   (unsigned long)((capRemainMs() + 999) / 1000UL),
+                   (unsigned)(capCapacity() / SAMPLE_HZ));
+      }
+    } else if (!strncasecmp(a, "DUMP", 4)) {
+      if (capIsRunning()) {
+        hostPrintln("# CAPTURE still running — STOP first");
+      } else {
+        const char* p = a + 4;
+        while (*p == ' ') ++p;
+        uint16_t stride = 10;
+        if (!strncasecmp(p, "FULL", 4) || !strcasecmp(p, "1") || !strcasecmp(p, "ALL")) {
+          stride = 1;
+        } else if (*p) {
+          int v = atoi(p);
+          if (v >= 1 && v <= 50) stride = (uint16_t)v;
+        }
+        capDumpUsb(stride);
+      }
+    } else if (!strncasecmp(a, "NEXT", 4)) {
+      capDumpNext();
+    } else {
+      hostPrintf("# CAPTURE run=%d n=%u/%u dur_ms=%lu remain_ms=%lu isr=%lu drop=%lu\n",
+                 capIsRunning() ? 1 : 0, (unsigned)capCount(), (unsigned)capCapacity(),
+                 (unsigned long)capDurationMs(), (unsigned long)capRemainMs(),
+                 (unsigned long)capIsrHits(), (unsigned long)capRingDrop());
+    }
+    return;
+  }
+  if (!strcasecmp(line, "REVS CLEAR") || !strcasecmp(line, "INDEX CLEAR")) {
+    revsClear();
+    hostPrintln("# REVS/INDEX cleared");
+    return;
+  }
+  if (!strcasecmp(line, "READ") || !strcasecmp(line, "LOG READ")) {
+    uint16_t only_seg = g_ble_pull_seg;
+    dumpLog(0, only_seg, true);
+    if (only_seg != 0) g_ble_pull_seg = 0;
+    return;
+  }
+  if (!strncasecmp(line, "MONITOR", 7)) {
+    const char* a = line + 7;
+    while (*a == ' ') ++a;
+    if (!strcasecmp(a, "START") || !strcasecmp(a, "ON") || !strcasecmp(a, "1")) {
+      monitorStart();
+    } else if (!strcasecmp(a, "STOP") || !strcasecmp(a, "OFF") || !strcasecmp(a, "0")) {
+      monitorStop();
+    } else {
+      hostPrintf("# MONITOR armed=%d phase=%s seg=%u pool=%u log_n=%u segs=%u\n",
+                 g_armed ? 1 : 0, phaseName(g_phase), (unsigned)g_seg_cur,
+                 (unsigned)g_pool_n, (unsigned)g_log_n, (unsigned)g_seg_count);
+    }
+    return;
+  }
+  if (!strncasecmp(line, "LOG", 3)) {
+    const char* a = line + 3;
+    while (*a == ' ') ++a;
+    if (!strcasecmp(a, "CLEAR")) {
+      logClear();
+      poolClear();
+      hostPrintln("# LOG cleared (main+pool)");
+    } else if (!strncasecmp(a, "DUMP", 4)) {
+      bool do_usb = true;
+      bool do_ble = true;
+      const char* b = a + 4;
+      while (*b == ' ') ++b;
+      if (!strncasecmp(b, "USB", 3)) {
+        do_ble = false;
+        b += 3;
+        while (*b == ' ') ++b;
+      } else if (!strncasecmp(b, "BLE", 3)) {
+        do_usb = false;
+        b += 3;
+        while (*b == ' ') ++b;
+      }
+      uint16_t only_seg = 0;
+      if (!strncasecmp(b, "SEG", 3)) {
+        b += 3;
+        while (*b == ' ') ++b;
+        only_seg = (uint16_t)strtoul(b, nullptr, 10);
+        while (*b && *b != ' ') ++b;
+        while (*b == ' ') ++b;
+      } else if (g_ble_pull_seg != 0) {
+        only_seg = g_ble_pull_seg;
+      }
+      size_t max_n = 0;
+      if (*b) max_n = (size_t)strtoul(b, nullptr, 10);
+      if (do_usb) {
+        Serial.printf("# AUTO DUMP BEGIN seg=%u expect_D=%lu (PC pull)\n",
+                      (unsigned)only_seg, (unsigned long)g_auto_dump_expect);
+        dumpLog(max_n, only_seg, false);
+        Serial.printf("# AUTO DUMP END seg=%u\n", (unsigned)only_seg);
+        if (only_seg != 0 && only_seg == g_ble_pull_seg) g_ble_pull_seg = 0;
+      }
+      if (do_ble) {
+        dumpLog(max_n, only_seg, true);
+        if (only_seg != 0 && only_seg == g_ble_pull_seg) g_ble_pull_seg = 0;
+      }
+    } else {
+      hostPrintf("# LOG n=%u cap=%u drop=%lu pool=%u segs=%u phase=%s | I_n=%u I_drop=%lu\n",
+                 (unsigned)g_log_n, (unsigned)g_log_cap, (unsigned long)g_log_drop,
+                 (unsigned)g_pool_n, (unsigned)g_seg_count, phaseName(g_phase),
+                 (unsigned)g_ilog_n, (unsigned long)g_ilog_drop);
+    }
+    return;
+  }
+  if (!strcasecmp(line, "ABI?")) {
+    Snap s = takeSnap();
+    hostPrintf(
+        "# ABI hz=%lu meas=%lu rpm=%.2f armed=%d phase=%s"
+        " | revs=%.3f revs_abs=%.3f I_n=%lu I_signed=%ld"
+        " | PCNT A+I rising-edge B=dir steps=%d watch=%lu\n",
+        (unsigned long)SAMPLE_HZ, (unsigned long)s.sample_hz_meas, s.rpm,
+        g_armed ? 1 : 0, phaseName(g_phase), s.revs_total, s.revs_abs,
+        (unsigned long)s.index_n, (long)s.index_signed,
+        ABI_STEPS_PER_REV, (unsigned long)g_watch_triggered);
+    return;
+  }
+  if (!strncasecmp(line, "BLE RATE", 8)) {
+    bleSetRate((uint16_t)atoi(line + 8));
+    hostPrintf("# BLE RATE %u\n", (unsigned)bleTelemHz());
+    return;
+  }
+  hostPrintf("# ERR unknown: %s\n", line);
+}
+
+void setup() {
+  Serial.setTxBufferSize(4096);
+  Serial.begin(921600);
+  delay(300);
+  Serial.println();
+  Serial.println("# ESP32-S3 AS5047P ABI Monitor FW=pcnt-ai-v1");
+  Serial.println("# Mode: PCNT A+I rising-edge, B=dir level, I=gpio_intr(Z)");
+  Serial.println("# Steps/rev=1000 (A rising edges only) — was 4000 (quadrature)");
+  Serial.println("# Glitch filter=1000ns — no sampling of A/I signals");
+  Serial.println("# PCNT watch points: 0,250,500,750 (= 0/90/180/270 deg)");
+  Serial.println("# Policy: idle=BLE live RPM; MONITOR armed=BLE telem OFF");
+  Serial.println("# Android tip: dump = Notify + DUMP ACK");
+
+  snapSetStepsPerRev(ABI_STEPS_PER_REV);
+  if (!snapAlloc()) Serial.println("# WARN snap alloc failed");
+  else Serial.println("# SNAP RAM buffer 5000x16 INTERNAL (~80KB) OK");
+
+  if (!sdBegin()) Serial.println("# WARN SD not ready — SD INIT / SD TEST");
+  else sdSelfTest();
+
+  if (!pcntBegin()) Serial.println("# FATAL PCNT failed");
+  else if (!sampleTimerBegin()) Serial.println("# FATAL timer failed");
+  else Serial.println("# PCNT A+I + 2kHz timer OK");
+  revsClear();
+
+  bleBegin();
+  Serial.printf("# BLE name=%s (auto on boot)\n", BLE_DEVICE_NAME);
+  Serial.printf("# heap after setup internal=%u spiram=%u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  Serial.println("# ready. MONITOR START → ring → trigger → SD; BLE→DUMP BIN BLE");
+}
+
+void loop() {
+  static bool s_snap_was_rec = false;
+  bool snap_rec = snapIsRecording();
+  if (s_snap_was_rec && !snap_rec) {
+    g_armed = false;
+    g_phase = PH_IDLE;
+    g_seg_cur = 0;
+    bleMuteHost(false);
+    g_evt_n = (uint32_t)snapCount();
+    g_evt_code = 3;
+    g_evt_pending = true;
+  }
+  s_snap_was_rec = snap_rec;
+
+  snapPollDone();
+  if (snapTakeArchiveEdge()) {
+    snapArchiveToSd();
+  }
+  capPoll();
+  capDumpPoll();
+
+  if (bleTakeConnectEdge()) {
+    g_dump_abort = true;
+    g_dumping = false;
+    sessionBegin("ble_connect");
+  }
+
+  if (capTakeDoneEdge()) {
+    hostPrintf("# CAPTURE DONE n=%u dur_ms=%lu — send CAPTURE DUMP\n",
+               (unsigned)capCount(), (unsigned long)capDurationMs());
+  }
+
+  if (capIsRunning()) {
+    static uint32_t last_cap_prog_ms = 0;
+    uint32_t nowp = millis();
+    if (nowp - last_cap_prog_ms >= 500) {
+      last_cap_prog_ms = nowp;
+      uint32_t rem = capRemainMs();
+      uint32_t rem_s = (rem + 999) / 1000UL;
+      Serial.printf("# CAPTURE PROG remain_s=%lu remain_ms=%lu n=%u\n",
+                    (unsigned long)rem_s, (unsigned long)rem, (unsigned)capCount());
+    }
+  }
+
+  if (g_evt_pending) {
+    g_evt_pending = false;
+    uint8_t c = g_evt_code;
+    if (c == 1) {
+      hostPrintf("# CONFIRM |rpm|>%.0f & I+1rev seg=%u snap_n=%lu → +REC %lums (backtrack≤%u)\n",
+                 RPM_GATE, (unsigned)g_evt_seg, (unsigned long)g_evt_n,
+                 (unsigned long)g_rec_duration_ms, (unsigned)BACKTRACK_N);
+      if (bleConnected()) {
+        char s[72];
+        snprintf(s, sizeof(s), "# CONFIRM seg=%u n=%lu\n", (unsigned)g_evt_seg,
+                 (unsigned long)g_evt_n);
+        bleSendLine(s);
+      }
+      g_noise_why = 0;
+    } else if (c == 2) {
+      const char* why = "unknown";
+      if (g_noise_why == 2) why = "flip";
+      else if (g_noise_why == 3) why = "below_gate";
+      else if (g_noise_why == 4) why = "timeout";
+      else if (g_noise_why == 5) why = "pool_ovf";
+      hostPrintf("# NOISE discard seg=%u why=%s counts=%lu\n",
+                 (unsigned)g_evt_seg, why, (unsigned long)g_evt_n);
+      if (bleConnected()) bleSendLine("# NOISE discard\n");
+    } else if (c == 3) {
+      hostPrintf("# RECORD done n=%lu → ALIVE then SD SAVE (disarmed)\n",
+                 (unsigned long)g_evt_n);
+      if (bleConnected()) {
+        char s[96];
+        snprintf(s, sizeof(s), "# RECORD done n=%lu → SD SAVE\n", (unsigned long)g_evt_n);
+        bleSendLine(s);
+        snprintf(s, sizeof(s), "# CD15 n=%lu\n", (unsigned long)g_evt_n);
+        bleSendLine(s);
+      }
+      if (snapCount() == 0 && g_log_n > 0 && g_evt_n == (uint32_t)g_log_n) {
+        requestAutoDump(g_evt_seg);
+      }
+    } else if (c == 6) {
+      hostPrintf("# STAGING |rpm|>%.0f waiting I+1rev ring=%u\n",
+                 RPM_GATE, (unsigned)snapRingCount());
+      if (bleConnected()) bleSendLine("# QUIET\n");
+    } else if (c == 5) {
+      const char* why = "stop";
+      if (g_noise_why == 2) why = "flip";
+      else if (g_noise_why == 3) why = "rpm_stop";
+      else if (g_noise_why == 4) why = "timeout";
+      hostPrintf("# SALVAGE keep seg=%u log_n=%lu why=%s (data NOT deleted)\n",
+                 (unsigned)g_evt_seg, (unsigned long)g_evt_n, why);
+      requestAutoDump(g_evt_seg);
+    } else if (c == 4) {
+      hostPrintln("# NOISE discard: pool overflow");
+    }
+  }
+
+  if (g_need_auto_dump) {
+    g_need_auto_dump = false;
+    uint16_t seg = g_auto_dump_seg;
+    uint32_t expect = 0;
+    {
+      size_t n, w;
+      portENTER_CRITICAL(&g_log_mux);
+      n = g_log_n;
+      w = g_log_w;
+      portEXIT_CRITICAL(&g_log_mux);
+      if (g_log && n > 0 && seg != 0) {
+        size_t start = (w + g_log_cap - n) % g_log_cap;
+        for (size_t i = 0; i < n; ++i) {
+          if (g_log[(start + i) % g_log_cap].seg == seg) expect++;
+        }
+      } else {
+        expect = g_auto_dump_expect;
+      }
+    }
+    g_auto_dump_expect = expect;
+    g_ble_pull_seg = seg;
+    g_dump_started = false;
+    g_dumping = false;
+    g_sample_freeze = false;
+
+    Serial.printf("# RECORD_DONE|%lu\n", (unsigned long)expect);
+    Serial.printf(
+        "# AUTO DUMP READY seg=%u expect_D=%lu — send LOG DUMP USB SEG %u\n",
+        (unsigned)seg, (unsigned long)expect, (unsigned)seg);
+    if (bleConnected()) {
+      char ble_msg[140];
+      snprintf(ble_msg, sizeof(ble_msg), "# RECORD_DONE|%lu\n", (unsigned long)expect);
+      bleSendLine(ble_msg);
+      snprintf(ble_msg, sizeof(ble_msg),
+               "# AUTO DUMP READY seg=%u expect_D=%lu (send READ or LOG DUMP BLE SEG %u)\n",
+               (unsigned)seg, (unsigned long)expect, (unsigned)seg);
+      bleSendLine(ble_msg);
+    }
+    g_ready_ms = millis();
+    if (expect == 0) {
+      Serial.println("# WARN READY but expect_D=0");
+      g_ready_ms = 0;
+    }
+  }
+
+  if (g_ready_ms != 0 && !g_dump_started && g_auto_dump_seg != 0 && g_auto_dump_expect > 0) {
+    if ((millis() - g_ready_ms) >= 1200) {
+      uint16_t seg = g_auto_dump_seg;
+      g_ready_ms = 0;
+      Serial.printf("# AUTO DUMP FALLBACK seg=%u expect_D=%lu (PC silent)\n",
+                    (unsigned)seg, (unsigned long)g_auto_dump_expect);
+      dumpLog(0, seg, false);
+      g_ble_pull_seg = 0;
+    }
+  } else if (g_dump_started) {
+    g_ready_ms = 0;
+  }
+
+  static char usb_line[128];
+  static size_t usb_len = 0;
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (usb_len > 0) {
+        usb_line[usb_len] = '\0';
+        handleCmd(usb_line);
+        usb_len = 0;
+      }
+    } else if (usb_len + 1 < sizeof(usb_line)) {
+      usb_line[usb_len++] = c;
+    } else {
+      usb_len = 0;
+    }
+  }
+
+  char ble_line[128];
+  if (bleTakeRxLine(ble_line, sizeof(ble_line))) handleCmd(ble_line);
+
+  static uint32_t last_mon_diag_ms = 0;
+  uint32_t now_diag = millis();
+  if (g_armed && !g_dumping && g_phase == PH_IDLE && !snapIsRecording() &&
+      (now_diag - last_mon_diag_ms) >= 1000) {
+    last_mon_diag_ms = now_diag;
+    Snap sdiag = takeSnap();
+    Serial.printf("# MON phase=%s rpm=%.0f snap=%u ring=%u rec=%d idx=%lu\n",
+                  phaseName(g_phase), (double)fabsf(sdiag.rpm),
+                  (unsigned)snapCount(), (unsigned)snapRingCount(),
+                  snapIsRecording() ? 1 : 0, (unsigned long)sdiag.index_n);
+  }
+
+  static uint32_t last_telem_ms = 0;
+  uint32_t now = millis();
+  uint16_t want_hz = bleTelemHz();
+  if (capIsDumping()) {
+  } else if (snapIsRecording() || g_phase == PH_STAGING || g_phase == PH_RECORD) {
+    uint32_t period = 1000;
+    if (now - last_telem_ms >= period) {
+      last_telem_ms = now;
+      emitTelem(takeSnap());
+    }
+  } else {
+    if (capIsRunning()) want_hz = 1;
+    uint32_t period = 1000UL / (uint32_t)want_hz;
+    if (period < 20) period = 20;
+    if (now - last_telem_ms >= period) {
+      last_telem_ms = now;
+      emitTelem(takeSnap());
+    }
+  }
+}
