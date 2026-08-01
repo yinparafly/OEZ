@@ -20,7 +20,7 @@
 - 每次构建：`CPU1_RAM` 配置（RAM 调试）；最终 `CPU1_FLASH` 烧录回归。
 - 每个固件任务验证 = 构建通过 + 烧录后串口断言（`SNAP?`/`ABI?`/`SNAP STATUS`/`HEX DUMP`/`FW?`）；PC 任务验证 = `python test_abi_tjx.py` 全绿。
 - FatFS R0.15（elm-chan，`https://elm-chan.org/fsw/ff/arc/ff15.zip`），FF_USE_LFN=1、FF_LFN_UNICODE=0、FF_USE_STRFUNC=0；无网络时改用 FF_USE_LFN=0（文件名缩为 8.3 短名）。
-- 波特率：921600。若编译后实测 SCIA 误差 >±2%（SYSCLK=200MHz 时 921600 理论误差约 -3.1%），全局改用 460800（同比例误差 ±1.7%）并在 PC 工具默认值同步修改。
+- 波特率：921600。若编译后实测 SCIA 误差 >±2%（SYSCLK=200MHz 时 921600 理论误差约 -3.1%），全局改用 460800（同比例误差 ±1.7%）并在 PC 工具默认值同步修改。**实测方法（评审 G/dp）：PC 发 1KB 定长包，板端环回，测收发时间差计算实际波特率偏差（Task 12 Step 11）。**
 
 ---
 
@@ -133,6 +133,7 @@
   - **兜底**：若 SysConfig/TRM 确认无 L1/L2 可用 → 按 Global Constraints：SNAP_CAP=2800、RING_CAP=800，并后续任务同步改常量（Task 4 Step 1）。
 - [ ] **Step 7: 构建 CPU1_RAM 验证**
   - 预期：SysConfig 重新生成 board.c/h；编译 0 错误；.map 中 `SNAP_RAM` 段存在且 L1/L2 区域被占用。
+  - **硬性规则（评审 G）**：若 .map 显示 SNAP_RAM 不足 → 立即启用兜底（2800/800，见 Global Constraints），不得带病进入联调。
 - [ ] **Step 8: Commit**
   ```bash
   git add TMS320/AbiMonitor_TJX/c2000.syscfg TMS320/AbiMonitor_TJX/28p55x_generic_ram_lnk.cmd TMS320/AbiMonitor_TJX/28p55x_generic_flash_lnk.cmd TMS320/docs/superpowers/specs/2026-08-01-abimonitor-eventspeed-design.md
@@ -690,7 +691,10 @@ void snap_print_status(void) {
     }
     ```
   - 手转轴（低速），串口打印 `abi_counts()/abi_index_n()/abi_last_rpm()` 断言：正反转 counts 增减、I 每圈 +1。
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: ISR 开销实测（强制检查点——评审 G：Task 6 完成后立即做，不拖到联调）**
+  - 方法：CPUTIMER0 读 `CPUTimer_getTimerCount` 差值（或 GPIO 翻转示波器法）测 `INT_Module_EQEP_ISR` 周期数；结果记入 spec §12.7 与联调文档。
+  - 判定：>0.6µs（≈120 周期 @200MHz / 90 周期 @150MHz）→ **立即启用 2X 降级**（GEAR_2X：捕获 A 双沿、canonical ×2，eqep_abi/speed_est 约 6 行），不等到联调。
+- [ ] **Step 5: Commit**
   ```bash
   git add TMS320/AbiMonitor_TJX/app/eqep_abi.h TMS320/AbiMonitor_TJX/app/eqep_abi.c
   git commit -m "feat: eqep capture ISR, canonical counts, index, gear switch"
@@ -1011,6 +1015,7 @@ void snap_print_status(void) {
 - [ ] **Step 3: 自动流程（响应 `# SNAP DONE` → ALIVE → `# SNAP DUMP READY` → 发 `DUMP BIN` → 收到帧 → 校验 → 存盘 → 提示出图）**
   - 存盘名：`snap_<YYYYmmdd_HHMMSS>_<n>.bin`（PC 本地时间）；同时写 `<name>.csv`（t_ms,rpm,dir,index_n,counts）。
   - `steps` 取 BIN END 行的 `steps=`（默认 4000）；`mode=event` 时 hz=0 显示"事件模式"。
+  - **超时机制（dp 建议）**：等待 SNAP DONE/ALIVE/DUMP READY 各超时 5s → 主动发 `SNAP STATUS` 查询 → 仍无响应报错退出，避免假死。
 - [ ] **Step 4: tkinter GUI（精简）**
   - 布局：端口下拉 + 连接/断开；按钮：`TIME+START`（发 TIME 再 MONITOR START）、`STOP`、`手动拉取 BIN`、`打开曲线`；状态行（armed/RECORD/READY）；遥测日志框（只显示 `L,` 解析出的 rpm/dir/armed + 标记行）。
   - 出图：matplotlib 子图 1：rpm vs t_ms（非均匀 t_us 时间轴，散点+线）；子图 2：counts vs t_ms；窗口标题含 steps/mode/点数。
@@ -1025,7 +1030,7 @@ void snap_print_status(void) {
 
 ---
 
-### Task 12: 硬件联调 + 回归（spec §12 测试计划 1-9）
+### Task 12: 硬件联调 + 回归（spec §12 测试计划 1-12）
 
 **Files:**
 - Modify: 按发现修正 `AbiMonitor_TJX\app\*` 与 `TMS320\pc\*`
@@ -1039,12 +1044,15 @@ void snap_print_status(void) {
 - [ ] **Step 2: 实时遥测**：10Hz `L,` 行 rpm 与实际相符、方向正确。
 - [ ] **Step 3: 事件记录**：MONITOR START → 弹射 → SNAP DONE → ALIVE → DUMP READY → PC 自动拉帧 → 出图（非均匀时间轴、无 2kHz 台阶）。
 - [ ] **Step 4: 分档切换**：高速源（或手摇极限）验证 >6500 切 1X、<5500 回 4X；canonical counts 无阶跃；I 对齐生效。
-- [ ] **Step 5: ISR 开销实测**：CPUTIMER 测 `INT_Module_EQEP_ISR` 周期数；4X 满速 CPU 占用 <30% 预算；超则启用 2X 降级（GEAR_2X=3，捕获 A/B 各上升沿，canonical 换算 ×2）——**实现时若需要**给 eqep_abi/speed_est 加 GEAR_2X 分支（约 6 行）。
+- [ ] **Step 5: ISR 开销实测（满载复核）**：Task 6 门已测周期数；此处 4X 满速实际运行确认 CPU 占用 <30% 预算；超则按 Task 6 结论启用 2X 降级（GEAR_2X=3，捕获 A 双沿，canonical ×2）。
 - [ ] **Step 6: SD 存档**：插入卡 → 记录完自动存 → `SD DUMP` 拉回 → PC 校验 CRC。
 - [ ] **Step 7: 外推**：低速缓转 → 无事件时段输出线性外推；停止 100ms 归 0。
 - [ ] **Step 8: 极限场景**（G 建议）：长时间空闲后突然弹射（环缓冲无污染）；记录中途档位切换（counts 连续）；写卡失败重试路径（拔卡模拟）。
-- [ ] **Step 9: CPU1_FLASH 回归**：烧 FLASH 全量重跑 Step 2-8。
-- [ ] **Step 10: Commit**
+- [ ] **Step 9: 融合过渡交叉验证**（用户要求，spec §12.9）：弹射/扑翼场景各 ≥3 次，PC 双曲线（QCPRD 间隔 vs counts 差分）叠加 + `# GEAR` 切换点标注，无毛刺无跳变 → 结案记录；有毛刺则定位修正重测。
+- [ ] **Step 10: 档位收益评估**（评审 G：提前到联调而非 backlog）：实测确认 G2/G3 实际收益（设备是否真会到档）；无收益则记录结论并收敛档位表。
+- [ ] **Step 11: 波特率误差测量**（评审 G/dp）：PC 发 1KB 定长包，板端环回，测收发时间差计算实际波特率与标称 921600 偏差；>±2% → 固件与 PC 同步改 460800 并重测。
+- [ ] **Step 12: CPU1_FLASH 回归**：烧 FLASH 全量重跑 Step 2-11。
+- [ ] **Step 13: Commit**
   ```bash
   git add TMS320/docs/联调记录/2026-08-01-abimonitor-bringup.md TMS320/AbiMonitor_TJX/app TMS320/pc
   git commit -m "test: bring-up pass — event speed monitor (see bringup log)"
