@@ -27,6 +27,8 @@ AB 脉冲在时间轴上**非均匀分布**：低速时稀疏、高速时密集�
 **阶段2（将来，只留接口）：**
 - 400~600Hz 固定频率速度输出，供外部做速度闭环控制
 - 蓝牙串口模块
+- **完整 PC 大 GUI**：复刻 abi_monitor.py（档案管理、曲线工作室等），
+  在阶段1 精简工具 + 板子联调完成后实施（见 §14）
 
 ## 2. 核心架构：事件驱动测速
 
@@ -56,31 +58,33 @@ AB 边沿 ──► EQEP1 硬件计数(4X/1X 可切) + 捕获锁存
 
 ## 3. 测速与分档
 
-| 转速范围 | 模式 | 一圈步数 | 最大事件率 | 记录 steps= |
-|---|---|---|---|---|
-| < 5500 RPM | ABI **4X** | 4000 | ~367 kHz | 4000 |
-| ≥ 6500 RPM | 只 A + I（**1X**） | 1000 | ~108 kHz | 1000 |
-| 5500~6500 | 保持当前档（迟滞防抖） | — | — | — |
+| 转速范围 | 模式 | 捕获边沿 | 一圈步数（记录 canonical=4000 恒定） |
+|---|---|---|---|
+| < 5500 RPM | ABI **4X** | A/B 全部 4 边沿 | 4000 |
+| ≥ 6500 RPM | 只 A + I（**1X**） | 仅 A 上升沿 | 4000（canonical；板载 QCPRD 测速用 1000） |
+| 5500~6500 | 保持当前档（迟滞防抖） | — | — |
 
 - 自动切换带迟滞：>6500 切 1X，<5500 切回 4X，中间区间保持，防频繁切换。
-- steps 随档位变化 → `BIN END` 行上报 `steps=`，PC 解析覆盖（见 §5）。
-- EQEP 1X 模式：位置计数器在 A 的边沿计数；I 用于每圈复位/校准与圈数累计。
-- 切换时机在 1kHz 主循环（非 ISR）执行，切换瞬间计数基准按档位换算保持连续。
+- **canonical 基准（简化，PC 端自建后可行）**：BIN 内 counts 一律换算为
+  4X 基准（4000 步/圈），steps=4000 **恒定**，PC 端无分档处理、无换算舍入、
+  无位置漂移；档位只影响（a）EQEP 解码器分辨率（b）捕获边沿集合
+  （1X 档只捕获 A 上升沿）与（c）板载 QCPRD 测速换算（4000 或 1000）。
+- EQEP 1X 模式：位置计数器在 A 的边沿计数；I 用于每圈校准与圈数累计。
+- 切换时机在 1kHz 主循环（非 ISR）执行；切换后下一个 I 脉冲把 canonical
+  counts 对齐到 `index_n*4000`（绝对重校准，消除累积误差）。
 
 **分档切换伪代码（1kHz 主循环，非 ISR）：**
 ```
 if rpm_est > 6500 and gear == GEAR_4X:
-    gear = GEAR_1X                    # 停 4X 计数，锁存当前 QPOSCNT
-    counts_ref = qep_counts_4x / 4    # 按比例换算基准（向零取整）
+    gear = GEAR_1X                    # 解码器改 1X + 捕获只留 A 上升沿
     idx_cal_pending = 1               # 等下一个 I 脉冲做绝对重校准
 elif rpm_est < 5500 and gear == GEAR_1X:
-    gear = GEAR_4X
-    counts_ref = qep_counts_1x * 4
+    gear = GEAR_4X                    # 解码器改 4X + 捕获恢复全部 4 边沿
     idx_cal_pending = 1
 ```
-- **I 重校准**（dp 建议，消除切换换算舍入误差/位置漂移）：`idx_cal_pending`
-  置位后，下一个 I 上升沿把位置基准强制置为已知值（QPOSCNT 清零或补偿偏移），
-  之后所有 counts 点以该基准重新对齐；主缓冲内单次记录保持同一档位连续换算。
+- **canonical counts 连续**：counts 恒为 4X 基准累计（1X 档每事件 +4），
+  切换无需换算、无舍入；`idx_cal_pending` 置位后下一个 I 上升沿把 canonical
+  counts 对齐到 `index_n*4000`（绝对重校准，dp 建议，消除任何累积误差）。
 
 ## 4. 记录流程（武装 → 触发 → 回溯+续记）
 
@@ -108,11 +112,14 @@ elif rpm_est < 5500 and gear == GEAR_1X:
   可配置上限（默认 3400）。
 - **t_us 全局零基准**（dp 建议）：所有点时间戳以"触发确认时刻"为 0 起算、
   单调递增、跨文件可比；环缓冲内点存相对时刻，回溯拷入主缓冲时整体平移对齐。
-- 记录时如果发生档位切换，主缓冲内 counts 以同一档位连续换算，保证差分正确。
+- 记录时如果发生档位切换：canonical counts 天然连续（恒 4000 步/圈基准），
+  无需换算；切换后 I 脉冲对齐一次。
 
-## 5. 串口协议（PC 兼容 + steps 修复）
+## 5. 串口协议（PC 端自建，ESP32 工程不动）
 
-波特率 **921600**（abi_monitor.py 默认）。
+波特率 **921600**。协议与 ESP32 v40 对齐（指令集、`L,` 遥测、BIN 帧），
+保证将来完整 GUI 或旧工具可复用；但 **ESP32 固件、abi_monitor.py、
+curve_studio.py 一律不改**，PC 端全新自建（见下）。
 
 指令（与 ESP32 v40 一致）：`MONITOR START/STOP`、`REC MS <ms>`、`SNAP?`、
 `DUMP BIN`、`FW?`、`TIME <unix_ms>`、`PING`、`HELP`、`ABI?`。
@@ -120,8 +127,8 @@ elif rpm_est < 5500 and gear == GEAR_1X:
 遥测（非记录时，10Hz）：`L,<t_ms>,<rpm_x10>,<dir>,...` 行（与 ESP32 格式一致）。
 
 标记行：`# MONITOR armed`、`# SNAP DONE n=`、`# ALIVE n=`、`# SNAP DUMP READY n=`、
-`# BIN END n= hz= steps= mode= bytes= crc=`（`mode=event` 标明事件模式，PC 据此
-处理 hz=0 显示与时间轴）。
+`# BIN END n= hz= steps= mode= bytes= crc=`（`steps=4000` 恒定 canonical；
+`mode=event` 标明事件模式，PC 据此处理 hz=0 显示与时间轴）。
 
 DUMP BIN 帧（照抄 ESP32 v2）：
 ```
@@ -135,11 +142,18 @@ CRC32                (4B LE, zlib CRC32 of payload)
 ```
 `BIN END` 行带 `steps=<4000|1000>`。
 
-**PC 端修改（约 15 行，abi_monitor.py）**：
-- 解析 `BIN END` 行 `steps=` 和 `mode=`：steps 覆盖 `ABI_STEPS_PER_REV`
-  （RPM 计算用）；mode=event 时 hz 仅作展示（显示"事件模式"，不参与绘图，
-  时间轴一律用 t_us 差分）。
-- 此修改同时修掉 ESP32 版 4X 计数 + PC steps=1000 的 4 倍转速 bug 隐患。
+**PC 端（阶段1：精简专用工具，新写）**：
+- `D:\oezcon\TMS320\pc\abi_tjx.py`（纯 Python：pyserial + tkinter/命令行）：
+  921600 连接 → TIME 对时 → MONITOR START → 10Hz 遥测显示 → 自动识别
+  `# SNAP DONE`/`# ALIVE`/`# SNAP DUMP READY` → 自动 `DUMP BIN` 拉帧 →
+  CRC 校验 + `steps=`/`mode=` 解析（覆盖 RPM 计算）→ 存 `.bin`/`.csv` →
+  弹射出图（t_us 非均匀时间轴，matplotlib）。
+- 二进制 BIN 帧与 ESP32 完全一致（`<IqI` 点阵、CRC32 位相同），
+  将来可直接被完整 GUI/curve_studio 打开。
+- 测试：`pc\test_abi_tjx.py`（纯脚本 assert 风格，仿 ESP32
+  `test_snap_parse_offline.py`：CRC、v2 解析、steps 覆盖、BIN END 正则）。
+- **阶段2：完整大 GUI**（复刻 abi_monitor.py 的档案管理/曲线工作室功能），
+  在精简工具与板子联调完成后实施——记录于 §14 backlog。
 
 ## 6. 内存布局（启用 L1/L2 SARAM）
 
@@ -202,6 +216,7 @@ typedef struct {          // 16B packed（#pragma pack / __attribute__((packed))
 - CCS **20.1.1** + C2000WARE **5.04.00.00** + XDS110 驱动，全部装到 `D:\ti\`（安装包在 `D:\oezcon\TMS320\05-【TMS320F28P550】开发工具\`）。
 - 工程：复制 N20 例程工程模板（EQEP1+SCIA+RGB 已配好）→ 新工程 `AbiMonitor_TJX`，
   位置 `D:\oezcon\TMS320\AbiMonitor_TJX\`。
+- PC 工具：`D:\oezcon\TMS320\pc\abi_tjx.py` + `test_abi_tjx.py`。
 - 开发方式：SysConfig（c2000.syscfg）+ driverlib C 代码。
 - 下载：CCS Debug（RAM 调试）/ 烧写 FLASH 后串口验证。
 
@@ -216,6 +231,8 @@ typedef struct {          // 16B packed（#pragma pack / __attribute__((packed))
 | `cli.c/h` | 串口指令解析与应答（协议同 ESP32）+ 接收超时/帧错误处理 |
 | `sd_fatfs.c/h` | FatFS + SPIB diskio + 存档文件名/元数据 |
 | `lckfb_tjx_init.*` | 复用官方（delay/lc_printf） |
+| `pc/abi_tjx.py` | 精简专用 PC 工具：串口、自动拉取、解析、存盘、出图 |
+| `pc/test_abi_tjx.py` | PC 工具自测（CRC/解析/steps 覆盖，纯脚本 assert） |
 
 ## 12. 测试计划
 
@@ -239,11 +256,20 @@ typedef struct {          // 16B packed（#pragma pack / __attribute__((packed))
 | 风险 | 对策 |
 |---|---|
 | 4X 高速事件率 400kHz ISR 压力 | ISR 极致精简（无浮点/printf）；实测执行时间（§12.7）；2X 降级开关兜底 |
-| 分档切换造成 counts 基准跳变 | 切换伪代码 + I 上升沿绝对重校准（§3）；BIN 内统一档位 |
+| 分档切换造成 counts 基准跳变 | canonical 4X 基准无换算无舍入；切换后 I 脉冲绝对重校准（§3）；BIN 内 steps=4000 恒定 |
 | 环缓冲回溯余量不足（G 建议） | RING_CAP=1200（4X 满速约 4.8ms）；`SNAP CAP` 可配置 |
 | 大缓冲内存布局（G 建议） | 链接器显式段 + `.map` 核对；packed 验证 sizeof==16 |
-| PC steps 硬编码 / hz=0 兼容（dp 建议） | PC 解析 BIN END steps=+mode=（约 15 行）；hz=0 仅显示事件模式 |
+| PC steps 硬编码 / hz=0 兼容 | PC 端全部自建（abi_tjx.py 解析 BIN END steps=+mode=）；binary 格式与 ESP32 一致便于将来复用 |
 | FatFS 移植工作量 | 用现成 chaN FatFS R0.15 纯 C，仅 diskio 适配层自写 |
 | SD 与记录争用 / 写卡失败 | 主循环停采样写卡 + 重试≤3 + `# SD ERR` 上报 |
 | 高速 AB 信号完整性（dp 建议） | 信号线靠近源处预留 100pF 焊盘（硬件滤波）；接线用短跳线 |
 | L1/L2 配成 RAM 后 Flash 执行变慢 | 代码留 RAM；必要时只把大缓冲放 L1/L2 |
+
+## 14. 阶段2 backlog（联调完成后实施）
+
+1. **完整 PC 大 GUI**：复刻 abi_monitor.py 全功能（档案管理、多曲线、滤波编辑、
+   CSV 导出、自动存档）——前提：阶段1 精简工具 + 板子联调完成。
+2. **400~600Hz 固定频率闭环速度输出**：1kHz 速度估计流已就绪（§8），
+   新增固定频率输出接口供外部闭环。
+3. **蓝牙串口模块**（BLE NUS，协议同 ESP32 v40）。
+4. **MCI/外部位置传感器扩展**（F28P55x 特色，可选）。
