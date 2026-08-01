@@ -1056,7 +1056,7 @@ void snap_print_status(void) {
 
 **Files:**
 - Modify: `TMS320\docs\superpowers\specs\2026-08-01-abimonitor-eventspeed-design.md`（把实测值回填：L1/L2 地址、SPIB 引脚、SYSCLK、ISR 周期数、实际事件率）
-- Create: `TMS320\README.md`（工程结构 + 构建/烧录/PC 工具使用说明）
+- Create: `TMS320\项目文档.md` 已存在（2026-08-01 建档，审查与接手入口）——本任务只做**回填与修订**（实测值、联调结果、变更记录）
 
 **Interfaces:**
 - Consumes: 全部任务结果。
