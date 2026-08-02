@@ -9,6 +9,7 @@
 
 #include "app/cli.h"
 #include "app/eqep_abi.h"
+#include "app/speed_est.h"
 
 
 // extern volatile uint32_t Encoder_Count;         // 编码器计数，用于用户使用。
@@ -95,6 +96,7 @@ void main(void)
     Motor_Init();
     cli_init();
     abi_init();
+    spd_init();
     g_seq_start = g_tick_1khz;
 
     while(1)
@@ -205,6 +207,7 @@ __interrupt void INT_myCPUTIMER0_ISR(void)
 {
     g_tick_1khz++;
     abi_clock_tick();
+    spd_tick_1khz();
     Encoder_Periodic_Update();
     Interrupt_clearACKGroup(INT_myCPUTIMER0_INTERRUPT_ACK_GROUP);
 }

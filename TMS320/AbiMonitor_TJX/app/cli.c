@@ -1,6 +1,7 @@
 #include "cli.h"
 #include "sd_fatfs.h"
 #include "eqep_abi.h"
+#include "speed_est.h"
 #include "fatfs/diskio.h"
 #include "board.h"
 #include "driverlib.h"
@@ -154,6 +155,10 @@ static void cli_handle(char *line)
     {
         uint16_t f = HWREGH(Module_EQEP_BASE + EQEP_O_QFLG);
         cli_printf("# QFLG=0x%04X\n", (unsigned)f);
+    }
+    else if (strcmp(line, "SPD?") == 0)
+    {
+        cli_printf("# RPM=%lu gear=%d ms=%lu\n", (unsigned long)spd_rpm(), spd_gear(), (unsigned long)spd_abs_ms());
     }
     else if (strcmp(line, "ABI?") == 0)
     {
