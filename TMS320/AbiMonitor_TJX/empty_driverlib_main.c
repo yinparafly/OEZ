@@ -12,6 +12,8 @@
 #include "app/speed_est.h"
 #include "app/snap_bin.h"
 
+extern unsigned int g_snap_n;
+
 
 // extern volatile uint32_t Encoder_Count;         // 编码器计数，用于用户使用。
 // extern volatile uint32_t Encoder_Last_Count;    // 存储上一次中断时的编码器位置值
@@ -176,6 +178,22 @@ void main(void)
 
         cli_task();
         snap_poll(spd_rpm());
+
+        /* 10Hz L-line telemetry while armed */
+        {
+            static uint32_t last_l = 0;
+            uint32_t now = spd_abs_ms();
+            if (snap_armed() && now - last_l >= 100) {
+                last_l = now;
+            cli_printf("L,%lu,%d,%lu,%lu,%u,%d,%d,%d,%d\n",
+                       (unsigned long)spd_rpm(), spd_gear(),
+                       (unsigned long)now,
+                       (unsigned long)snap_data_bytes()/16,
+                       (unsigned)g_snap_n,
+                       (int)g_recording, (int)g_alive,
+                       snap_armed(), snap_full());
+            }
+        }
 
         // RGB的B灯亮起，G灯熄灭
         GPIO_writePin(RGB_B, 0);

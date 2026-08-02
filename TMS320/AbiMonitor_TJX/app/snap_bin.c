@@ -118,6 +118,7 @@ void snap_poll(uint32_t rpm)
 
 bool snap_done(void)      { return !g_recording && !g_alive && g_snap_n > 0; }
 bool snap_dump_ready(void) { return snap_done(); }
+bool snap_full(void)       { return g_snap_n >= SNAP_CAP; }
 
 uint32_t snap_data_bytes(void) { return (uint32_t)(g_snap_n * 16U); }
 

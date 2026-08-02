@@ -28,6 +28,7 @@ void snap_on_event(uint32_t t_us, int64_t counts, uint32_t index_n);
 void snap_poll(uint32_t rpm);
 bool snap_done(void);
 bool snap_dump_ready(void);
+bool snap_full(void);
 
 /* Data dump */
 uint32_t snap_data_bytes(void);

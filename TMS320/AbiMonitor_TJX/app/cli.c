@@ -157,6 +157,37 @@ static void cli_handle(char *line)
         uint16_t f = HWREGH(Module_EQEP_BASE + EQEP_O_QFLG);
         cli_printf("# QFLG=0x%04X\n", (unsigned)f);
     }
+    else if (strcmp(line, "TIME") == 0)
+    {
+        /* TIME <unix_ms> — set base time for SD filenames */
+        cli_put_raw("# TIME stub (SD not active)\n");
+    }
+    else if (strcmp(line, "TIME") == 0)
+    {
+        cli_put_raw("# TIME stub\n");
+    }
+    else if (strncmp(line, "TIME ", 5) == 0)
+    {
+        cli_printf("# TIME=%s (stub)\n", line + 5);
+    }
+    else if (strcmp(line, "MONITOR START") == 0)
+    {
+        snap_alloc();
+        cli_put_raw("# ARMED\n");
+    }
+    else if (strcmp(line, "MONITOR STOP") == 0)
+    {
+        snap_force_done();
+        cli_put_raw("# STOPPED\n");
+    }
+    else if (strncmp(line, "REC MS ", 7) == 0)
+    {
+        unsigned long ms = 0;
+        const char *p = line + 7;
+        while (*p >= '0' && *p <= '9') { ms = ms * 10 + (*p - '0'); p++; }
+        if (ms > 0) snap_set_ms(ms);
+        cli_printf("# REC MS=%lu\n", ms);
+    }
     else if (strcmp(line, "SNAP?") == 0)
     {
         cli_printf("# SNAP n=%u bytes=%lu armed=%d rec=%d alive=%d done=%d\n",
