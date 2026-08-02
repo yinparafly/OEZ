@@ -168,47 +168,40 @@ void main(void)
         lc_printf("SeqState      = [%u]\r\n", g_seq_state);
         lc_printf("TgtRPM=[%u] Speed=[%u]\r\n", pi_target_rpm, g_speed);
 
-        // 诊断：GPIO0 复用、EPWM 时基/动作/比较
-        uint16_t gpamux = (uint16_t)(HWREG(0x00007C00u + 0x6u) & 0x3u);
-        uint16_t tbCtr  = EPWM_getTimeBaseCounterValue(EPWM1_BASE);
-        uint16_t aqCtl  = HWREGH(EPWM1_BASE + 0x40u);
-        uint16_t cmpA   = HWREGH(EPWM1_BASE + 0x6Au);
-        lc_printf("GPIO0_MUX=[%u] TBCTR=[%u] AQCTLA=[0x%02X] CMPA=[%u]\r\n",
-                  gpamux, tbCtr, aqCtl, cmpA);
+        /* Minimal 1Hz status line (non-verbose, fast) */
+        static uint32_t dbg_tick = 0;
+        if (g_tick_1khz - dbg_tick >= 1000) {
+            dbg_tick = g_tick_1khz;
+            uint32_t rpm = spd_rpm();
+            lc_printf("RPM=[%lu] SNAP=[%u/%u]\r\n",
+                      (unsigned long)rpm, (unsigned)g_snap_n, (unsigned)SNAP_CAP);
+        }
 
         cli_task();
         snap_poll(spd_rpm());
 
-        /* 10Hz L-line telemetry while armed */
+        /* LED indicators based on snap state */
         {
-            static uint32_t last_l = 0;
-            uint32_t now = spd_abs_ms();
-            if (snap_armed() && now - last_l >= 100) {
-                last_l = now;
-            cli_printf("L,%lu,%d,%lu,%lu,%u,%d,%d,%d,%d\n",
-                       (unsigned long)spd_rpm(), spd_gear(),
-                       (unsigned long)now,
-                       (unsigned long)snap_data_bytes()/16,
-                       (unsigned)g_snap_n,
-                       (int)g_recording, (int)g_alive,
-                       snap_armed(), snap_full());
+            int armed = snap_armed();
+            if (snap_done()) {
+                GPIO_writePin(RGB_B, 0);  /* B on */
+                GPIO_writePin(RGB_G, 0);  /* G on → purple */
+            } else if (g_alive) {
+                GPIO_writePin(RGB_B, 1);
+                GPIO_writePin(RGB_G, 0);  /* G on → green */
+            } else if (g_recording) {
+                static int blip = 0;
+                blip++;
+                GPIO_writePin(RGB_G, blip & 4 ? 0 : 1); /* G flash → recording */
+                GPIO_writePin(RGB_B, 1);
+            } else if (armed) {
+                GPIO_writePin(RGB_B, 0);  /* B on → blue */
+                GPIO_writePin(RGB_G, 1);
+            } else {
+                GPIO_writePin(RGB_B, 1);
+                GPIO_writePin(RGB_G, 1);  /* both off */
             }
         }
-
-        // RGB的B灯亮起，G灯熄灭
-        GPIO_writePin(RGB_B, 0);
-        GPIO_writePin(RGB_G, 1);
-        delay_ms(50);
-
-        // RGB的G灯亮起，B灯熄灭
-        GPIO_writePin(RGB_B, 1);
-        GPIO_writePin(RGB_G, 0);
-        delay_ms(50);
-
-        // RGB的B和G都熄灭
-        GPIO_writePin(RGB_B, 1);
-        GPIO_writePin(RGB_G, 1);
-        delay_ms(50);
     }
 }
 
