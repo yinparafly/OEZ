@@ -39,28 +39,20 @@ static int32_t  g_pi_int    = 0;
 static uint16_t pi_target_rpm = 0;
 static uint8_t  g_seq_done  = 0;   // 全部科目跑完 → 停止电机，不再循环
 
-// PID 闭环：调整脉宽档位使实际转速逼近目标 RPM
+// PID 闭环：调整脉宽档位使实际转速逼近目标 RPM (feedback from UTO speed_est)
 static void Motor_CloseLoop(uint32_t tick)
 {
-    uint32_t ppr = Encoder_PulsePerRev;
     if (tick - g_ramp_tick >= SEQ_RAMP_MS) {
         g_ramp_tick = tick;
-        // 柔和斜坡：升到启动脉宽；若 PPR 未校准（电机未转）则继续缓慢爬升
-        if (g_speed < 1000u || (ppr == 0 && g_speed < 1200u)) {
+        if (g_speed < 1000u) {
             g_speed = (uint16_t)(g_speed + SEQ_RAMP_STEP);
             return;
         }
     }
     if (tick - g_ctrl_tick >= SEQ_CTRL_MS) {
-        uint32_t dt_ms = tick - g_ctrl_tick;   // 实际采样窗口（主循环耗时导致 >500ms）
         g_ctrl_tick = tick;
-        if (ppr > 0 && dt_ms > 0) {
-            // 实际窗口内的计数增量 → RPM
-            static uint32_t pi_last_cnt = 0;
-            uint32_t cnt = Encoder_Count;
-            uint32_t dv = cnt - pi_last_cnt;
-            pi_last_cnt = cnt;
-            uint32_t rpm_now = (uint32_t)((uint64_t)dv * 60000u / ppr / dt_ms);
+        uint32_t rpm_now = spd_rpm();
+        if (rpm_now > 0) {
             int32_t err = (int32_t)pi_target_rpm - (int32_t)rpm_now;
             g_pi_int += err;
             if (g_pi_int > 2500)  g_pi_int = 2500;
@@ -139,36 +131,7 @@ void main(void)
             }
         }
 
-        DINT;
-        uint32_t value = Get_Encoder_Value();
-        int32_t dir = Get_Encoder_Dir();
-        uint32_t ppr = Encoder_PulsePerRev;
-        uint32_t idx = Encoder_Index_Count;
-        uint32_t tick_now = g_tick_1khz;
-        EINT;
-
-        // 推算转速：两次打印间计数增量 / 每转脉冲数 / 秒数 → RPM
-        static uint32_t last_value = 0;
-        static uint32_t last_tick = 0;
-        uint32_t dv = value - last_value;
-        uint32_t dt = tick_now - last_tick;
-        last_value = value;
-        last_tick = tick_now;
-        uint32_t rpm = 0;
-        if (ppr > 0 && dt > 0) {
-            rpm = (uint32_t)((uint64_t)dv * 60000u / ppr / dt);
-        }
-        
-        lc_printf("\r\n");
-        lc_printf("Encoder_Count = [%lu]\r\n", value);
-        lc_printf("Motor_dir     = [%d]\r\n", dir);
-        lc_printf("Tick_1kHz     = [%lu]\r\n", tick_now);
-        lc_printf("PulsePerRev   = [%lu]  Index=[%lu]\r\n", ppr, idx);
-        lc_printf("RPM           = [%lu]\r\n", rpm);
-        lc_printf("SeqState      = [%u]\r\n", g_seq_state);
-        lc_printf("TgtRPM=[%u] Speed=[%u]\r\n", pi_target_rpm, g_speed);
-
-        /* Minimal 1Hz status line (non-verbose, fast) */
+        /* Minimal 1Hz status line */
         static uint32_t dbg_tick = 0;
         if (g_tick_1khz - dbg_tick >= 1000) {
             dbg_tick = g_tick_1khz;
