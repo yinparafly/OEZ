@@ -9,60 +9,52 @@
 /**
  * Import the modules used in this configuration.
  */
-const epwm  = scripting.addModule("/driverlib/epwm.js", {}, false);
-const epwm1 = epwm.addInstance();
-const epwm2 = epwm.addInstance();
-const eqep  = scripting.addModule("/driverlib/eqep.js", {}, false);
-const eqep1 = eqep.addInstance();
-const gpio  = scripting.addModule("/driverlib/gpio.js", {}, false);
-const gpio1 = gpio.addInstance();
-const gpio2 = gpio.addInstance();
-const sci   = scripting.addModule("/driverlib/sci.js", {}, false);
-const sci1  = sci.addInstance();
+const cputimer = scripting.addModule("/driverlib/cputimer.js", {}, false);
+const cputimer1 = cputimer.addInstance();
+const eqep     = scripting.addModule("/driverlib/eqep.js", {}, false);
+const eqep1    = eqep.addInstance();
+const gpio     = scripting.addModule("/driverlib/gpio.js", {}, false);
+const gpio1    = gpio.addInstance();
+const gpio2    = gpio.addInstance();
+const gpio3    = gpio.addInstance();
+const sci      = scripting.addModule("/driverlib/sci.js", {}, false);
+const sci1     = sci.addInstance();
+const spi      = scripting.addModule("/driverlib/spi.js", {}, false);
+const spi1     = spi.addInstance();
 
 /**
  * Write custom configuration values to the imported modules.
  */
-epwm1.epwmTimebase_hsClockDiv                                    = "EPWM_HSCLOCK_DIVIDER_1";
-epwm1.epwmTimebase_period                                        = 10000;
-epwm1.epwmTimebase_counterMode                                   = "EPWM_COUNTER_MODE_UP_DOWN";
-epwm1.epwmActionQualifier_EPWM_AQ_OUTPUT_A_ON_TIMEBASE_UP_CMPA   = "EPWM_AQ_OUTPUT_LOW";
-epwm1.epwmActionQualifier_EPWM_AQ_OUTPUT_A_ON_TIMEBASE_DOWN_CMPA = "EPWM_AQ_OUTPUT_HIGH";
-epwm1.useCase                                                    = "CUSTOM";
-epwm1.useInterfacePins                                           = ["EPWM#_A"];
-epwm1.$name                                                      = "Module_PWM_M";
-epwm1.epwm.$assign                                               = "EPWM4";
-epwm1.epwm.epwm_aPin.$assign                                     = "GPIO6";
-
-epwm2.epwmTimebase_hsClockDiv                                    = "EPWM_HSCLOCK_DIVIDER_1";
-epwm2.epwmTimebase_period                                        = 10000;
-epwm2.epwmTimebase_counterMode                                   = "EPWM_COUNTER_MODE_UP_DOWN";
-epwm2.epwmActionQualifier_EPWM_AQ_OUTPUT_A_ON_TIMEBASE_UP_CMPA   = "EPWM_AQ_OUTPUT_LOW";
-epwm2.epwmActionQualifier_EPWM_AQ_OUTPUT_A_ON_TIMEBASE_DOWN_CMPA = "EPWM_AQ_OUTPUT_HIGH";
-epwm2.useCase                                                    = "CUSTOM";
-epwm2.useInterfacePins                                           = ["EPWM#_A"];
-epwm2.$name                                                      = "Module_PWM_P";
-epwm2.epwm.$assign                                               = "EPWM8";
-epwm2.epwm.epwm_aPin.$assign                                     = "GPIO14";
+cputimer1.$name                    = "myCPUTIMER0";
+cputimer1.startTimer               = true;
+cputimer1.enableInterrupt          = true;
+cputimer1.registerInterrupts       = true;
+cputimer1.timerPeriod              = 149999;
+cputimer1.timerInt.enableInterrupt = true;
 
 eqep1.eqepResolution          = "EQEP_CONFIG_1X_RESOLUTION";
-eqep1.latchPositionCounter    = "EQEP_LATCH_UNIT_TIME_OUT";
 eqep1.swPositionInit          = true;
 eqep1.enableModule            = true;
-eqep1.enableUnitTimer         = true;
+eqep1.enableUnitTimer         = false;
 eqep1.enableInterrupt         = true;
 eqep1.registerInterrupts      = true;
-eqep1.interruptSources        = ["EQEP_INT_UNIT_TIME_OUT"];
+eqep1.interruptSources        = ["EQEP_INT_POS_COMP_MATCH","EQEP_INT_DIR_CHANGE","EQEP_INT_INDEX_EVNT_LATCH"];
 eqep1.emulationMode           = "EQEP_EMULATIONMODE_RUNFREE";
-eqep1.useInterfacePins        = ["EQEP#_A","EQEP#_B"];
+eqep1.useInterfacePins        = ["EQEP#_A","EQEP#_B","EQEP#_INDEX"];
 eqep1.$name                   = "Module_EQEP";
 eqep1.useCase                 = "CUSTOM";
 eqep1.positionCounterMax      = 4294967295;
-eqep1.unitTimerPeriod         = 7500000;
+eqep1.compareConfig           = true;
+eqep1.compareSyncPulsePin     = "EQEP_COMPARE_NO_SYNC_OUT";
+eqep1.compareShadowRegisterUse = "EQEP_COMPARE_LOAD_ON_MATCH";
+eqep1.compareValue            = 0;
+eqep1.compareCycles           = 0;
+eqep1.enableCompare           = true;
 eqep1.eqepInt.enableInterrupt = true;
 eqep1.eqep.$assign            = "EQEP1";
 eqep1.eqep.eqep_aPin.$assign  = "GPIO50";
 eqep1.eqep.eqep_bPin.$assign  = "GPIO51";
+eqep1.eqep.eqep_indexPin.$assign = "GPIO53";
 
 gpio1.$name             = "RGB_B";
 gpio1.direction         = "GPIO_DIR_MODE_OUT";
@@ -76,13 +68,43 @@ gpio2.writeInitialValue = true;
 gpio2.initialValue      = 1;
 gpio2.gpioPin.$assign   = "A18, B18, C18, GPIO21";
 
+gpio3.$name             = "SD_CS";
+gpio3.direction         = "GPIO_DIR_MODE_OUT";
+gpio3.writeInitialValue = true;
+gpio3.initialValue      = 1;
+gpio3.gpioPin.$assign   = "GPIO6";
+
 sci1.$name                      = "Debug_Serial";
 sci1.selectRegisteredInterrupts = ["registerRxInt"];
 sci1.enabledInterrupts          = ["SCI_INT_RXRDY_BRKDT"];
 sci1.useFifo                    = false;
+sci1.baudRates                  = 921600;
 sci1.sci.$assign                = "SCIA";
 sci1.sci.sci_rxPin.$assign      = "A16, B16, C16, GPIO28";
 sci1.sci.sci_txPin.$assign      = "GPIO29";
 sci1.rxQual.$name               = "myGPIOQUAL0";
 sci1.txQual.$name               = "myGPIOQUAL1";
 sci1.sciRXInt.enableInterrupt   = true;
+
+spi1.mode                    = "SPI_MODE_CONTROLLER";
+spi1.ptePolarity             = "SPI_PTE_ACTIVE_HIGH";
+spi1.dataWidth               = "8";
+spi1.useInterrupts           = false;
+spi1.useFifo                 = false;
+spi1.useCase                 = "CUSTOM";
+spi1.useInterfacePins        = ["SPI@_CLK","SPI@_PICO","SPI@_POCI"];
+spi1.$name                   = "SD_SPI";
+spi1.bitRate                 = 1000000;
+spi1.picoQual.$name          = "myGPIOQUAL2";
+spi1.pociQual.$name          = "myGPIOQUAL3";
+spi1.spi.spi_picoPin.$assign = "GPIO30";
+spi1.spi.spi_pociPin.$assign = "GPIO31";
+spi1.spi.spi_clkPin.$assign  = "GPIO14";
+spi1.clkQual.$name           = "myGPIOQUAL4";
+
+/**
+ * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
+ * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
+ * re-solve from scratch.
+ */
+spi1.spi.$suggestSolution = "SPIB";

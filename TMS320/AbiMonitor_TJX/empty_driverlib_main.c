@@ -7,10 +7,69 @@
 
 #include "bsp_motor_hallencoder.h"
 
+#include "app/cli.h"
+
 
 // extern volatile uint32_t Encoder_Count;         // 编码器计数，用于用户使用。
 // extern volatile uint32_t Encoder_Last_Count;    // 存储上一次中断时的编码器位置值
 // extern volatile int32_t  Motor_dir;             // 电机旋转方向（正转/反转）
+
+volatile uint32_t g_tick_1khz = 0;   // 1kHz CPU Timer 节拍计数
+
+// 电机闭环测试序列（循环）：停5s -> 斜坡启动+闭环锁定1500RPM(20s) -> 停5s -> 斜坡+闭环2000RPM(20s) -> 停5s -> 循环
+#define SEQ_TARGET_CNT 2u
+static const uint16_t g_seq_targets[SEQ_TARGET_CNT] = { 1500u, 2000u };  // 目标 RPM
+#define SEQ_CTRL_MS    500u          // 闭环控制周期 500ms
+#define SEQ_RAMP_MS    40u           // 斜坡步进周期 40ms
+#define SEQ_RAMP_STEP  40u           // 斜坡每步 +40 speed（0→1000 约 1s）
+#define SEQ_ADJ_MAX    100u          // 闭环单次最大调整
+#define SEQ_SPD_MIN    800u
+#define SEQ_SPD_MAX    9000u
+static uint8_t  g_seq_state = 0;
+static uint32_t g_seq_start = 0;
+static uint32_t g_ctrl_tick = 0;
+static uint32_t g_ramp_tick = 0;
+static uint16_t g_speed     = 0;
+static int32_t  g_pi_int    = 0;
+static uint16_t pi_target_rpm = 0;
+static uint8_t  g_seq_done  = 0;   // 全部科目跑完 → 停止电机，不再循环
+
+// PID 闭环：调整脉宽档位使实际转速逼近目标 RPM
+static void Motor_CloseLoop(uint32_t tick)
+{
+    uint32_t ppr = Encoder_PulsePerRev;
+    if (tick - g_ramp_tick >= SEQ_RAMP_MS) {
+        g_ramp_tick = tick;
+        // 柔和斜坡：升到启动脉宽；若 PPR 未校准（电机未转）则继续缓慢爬升
+        if (g_speed < 1000u || (ppr == 0 && g_speed < 1200u)) {
+            g_speed = (uint16_t)(g_speed + SEQ_RAMP_STEP);
+            return;
+        }
+    }
+    if (tick - g_ctrl_tick >= SEQ_CTRL_MS) {
+        uint32_t dt_ms = tick - g_ctrl_tick;   // 实际采样窗口（主循环耗时导致 >500ms）
+        g_ctrl_tick = tick;
+        if (ppr > 0 && dt_ms > 0) {
+            // 实际窗口内的计数增量 → RPM
+            static uint32_t pi_last_cnt = 0;
+            uint32_t cnt = Encoder_Count;
+            uint32_t dv = cnt - pi_last_cnt;
+            pi_last_cnt = cnt;
+            uint32_t rpm_now = (uint32_t)((uint64_t)dv * 60000u / ppr / dt_ms);
+            int32_t err = (int32_t)pi_target_rpm - (int32_t)rpm_now;
+            g_pi_int += err;
+            if (g_pi_int > 2500)  g_pi_int = 2500;
+            if (g_pi_int < -2500) g_pi_int = -2500;
+            int32_t adj = err / 2 + g_pi_int / 8;
+            if (adj > SEQ_ADJ_MAX)  adj = SEQ_ADJ_MAX;
+            if (adj < -(int32_t)SEQ_ADJ_MAX) adj = -(int32_t)SEQ_ADJ_MAX;
+            int32_t spd = (int32_t)g_speed + adj;
+            if (spd < SEQ_SPD_MIN) spd = SEQ_SPD_MIN;
+            if (spd > SEQ_SPD_MAX) spd = SEQ_SPD_MAX;
+            g_speed = (uint16_t)spd;
+        }
+    }
+}
 
 void main(void)
 {
@@ -32,20 +91,84 @@ void main(void)
     lc_printf("\r\n= = = = = = = = = = = = = = = = = = = = = = = = =\r\n");
 
     Encoder_Init();
-    
+    Motor_Init();
+    cli_init();
+    g_seq_start = g_tick_1khz;
+
     while(1)
     {
-        // 电流太小，驱不动，尽量使用驱动板
-        // Motor_Set_PWM(1, 5000);
+        // 闭环测试序列状态机（由 1kHz 节拍驱动，跑完即停，不循环）
+        // 状态 0/2/4 = 停 5s，状态 1/3 = 斜坡启动+闭环锁定目标 RPM 20s
+        {
+            uint32_t t = g_tick_1khz;
+            if (!g_seq_done && g_seq_state % 2 == 0) {
+                Motor_Set_PWM(1, 0);
+                if (t - g_seq_start >= 5000) {
+                    g_seq_state++; g_seq_start = t;
+                    g_speed = 0; g_pi_int = 0;
+                    g_ctrl_tick = t; g_ramp_tick = t;
+                }
+            } else if (!g_seq_done) {
+                uint8_t idx = (uint8_t)((g_seq_state - 1) / 2);
+                if (idx < SEQ_TARGET_CNT) {
+                    pi_target_rpm = g_seq_targets[idx];
+                    Motor_CloseLoop(t);
+                    Motor_Set_PWM(1, g_speed);
+                    if (t - g_seq_start >= 20000) {
+                        Motor_Set_PWM(1, 0);
+                        if (idx + 1 >= SEQ_TARGET_CNT) {
+                            g_seq_done = 1;   // 全部科目完成：停机保持
+                        } else {
+                            g_seq_state++;
+                        }
+                        g_seq_start = t;
+                    }
+                } else {
+                    g_seq_state = 0; g_seq_start = t;
+                }
+            } else {
+                Motor_Set_PWM(1, 0);   // 测试完成：电机保持停止
+            }
+        }
 
         DINT;
         uint32_t value = Get_Encoder_Value();
         int32_t dir = Get_Encoder_Dir();
+        uint32_t ppr = Encoder_PulsePerRev;
+        uint32_t idx = Encoder_Index_Count;
+        uint32_t tick_now = g_tick_1khz;
         EINT;
+
+        // 推算转速：两次打印间计数增量 / 每转脉冲数 / 秒数 → RPM
+        static uint32_t last_value = 0;
+        static uint32_t last_tick = 0;
+        uint32_t dv = value - last_value;
+        uint32_t dt = tick_now - last_tick;
+        last_value = value;
+        last_tick = tick_now;
+        uint32_t rpm = 0;
+        if (ppr > 0 && dt > 0) {
+            rpm = (uint32_t)((uint64_t)dv * 60000u / ppr / dt);
+        }
         
         lc_printf("\r\n");
         lc_printf("Encoder_Count = [%lu]\r\n", value);
         lc_printf("Motor_dir     = [%d]\r\n", dir);
+        lc_printf("Tick_1kHz     = [%lu]\r\n", tick_now);
+        lc_printf("PulsePerRev   = [%lu]  Index=[%lu]\r\n", ppr, idx);
+        lc_printf("RPM           = [%lu]\r\n", rpm);
+        lc_printf("SeqState      = [%u]\r\n", g_seq_state);
+        lc_printf("TgtRPM=[%u] Speed=[%u]\r\n", pi_target_rpm, g_speed);
+
+        // 诊断：GPIO0 复用、EPWM 时基/动作/比较
+        uint16_t gpamux = (uint16_t)(HWREG(0x00007C00u + 0x6u) & 0x3u);
+        uint16_t tbCtr  = EPWM_getTimeBaseCounterValue(EPWM1_BASE);
+        uint16_t aqCtl  = HWREGH(EPWM1_BASE + 0x40u);
+        uint16_t cmpA   = HWREGH(EPWM1_BASE + 0x6Au);
+        lc_printf("GPIO0_MUX=[%u] TBCTR=[%u] AQCTLA=[0x%02X] CMPA=[%u]\r\n",
+                  gpamux, tbCtr, aqCtl, cmpA);
+
+        cli_task();
 
         // RGB的B灯亮起，G灯熄灭
         GPIO_writePin(RGB_B, 0);
@@ -66,9 +189,20 @@ void main(void)
 
 __interrupt void INT_Debug_Serial_RX_ISR(void)
 {
-    //清除接收中断标志位
+    // 读取接收到的字符，推入 CLI 环形缓冲区（读 SCIRXBUF 会自动清除 RXRDY 标志）
+    uint16_t rx = SCI_readCharNonBlocking(SCIA_BASE);
+    cli_push_rx((char)(rx & 0xFFU));
+    // 清除 FIFO 中断标志（FIFO 禁用时为无操作）
     SCI_clearInterruptStatus(SCIA_BASE, SCI_INT_RXFF);
-    //清除中断标志位
+    // 清除 PIE 中断应答
     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP9);
+}
+
+// 1kHz CPU Timer 节拍中断
+__interrupt void INT_myCPUTIMER0_ISR(void)
+{
+    g_tick_1khz++;
+    Encoder_Periodic_Update();
+    Interrupt_clearACKGroup(INT_myCPUTIMER0_INTERRUPT_ACK_GROUP);
 }
 

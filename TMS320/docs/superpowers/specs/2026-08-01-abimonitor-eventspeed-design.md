@@ -236,8 +236,8 @@ typedef struct {          // 16B packed（#pragma pack / __attribute__((packed))
 | AS5047P I | GPIO53 (EQEP1_INDEX) | 3.3V 直连 |
 | SCIA TX/RX | GPIO29/28 | 板载 USB-UART → PC @ 921600 |
 | RGB LED | GPIO20/21 | 状态指示（武装=蓝，记录=绿，写SD=绿闪，就绪=紫） |
-| SD CS | GPIO33（候选，Task 3 以 SysConfig 冲突检查为准） | 未占用 |
-| SD SCK/MOSI/MISO | SPIB×3 = GPIO30/31/32（候选，Task 3 以 SysConfig 冲突检查为准） | 避开 GPIO0-3/50/51/53/28/29 |
+| SD CS | GPIO6（普通 GPIO 输出） | 删除 EPWM4 后空闲，与 SPI 同片区 |
+| SD SCK/MOSI/MISO | SPIB = CLK GPIO14（mode9）/ PICO GPIO30（mode3）/ POCI GPIO31（mode3），F28P55x.json 已核实；四脚集中在 U21/U22 排针同一片区；GPIO32 未引出排针不可用 | 避开 GPIO0-3/50/51/53/28/29 |
 
 ## 10. 环境与工程
 
@@ -264,9 +264,9 @@ typedef struct {          // 16B packed（#pragma pack / __attribute__((packed))
 
 ## 12. 测试计划
 
-1. **低速自检（校准 steps）**：手转 N 圈，串口 `ABI?` 查 counts → 验证 1000×N（1X）
+1. **低速自检（校准 steps）**：电驱动多圈（或手转 N 圈），串口 `ABI?` 查 counts → 验证 1000×N（1X）
    或 4000×N（4X）；steps 常量按实测修正（AS5047P 手册 1000 PPR 十进制）。
-2. **实时遥测**：手转/电机，PC 看 10Hz `L,` 行 RPM 与实际相符。
+2. **实时遥测**：电驱动多速/手转，PC 看 10Hz `L,` 行 RPM 与实际相符。
 3. **事件记录**：MONITOR START → 弹射 → SNAP DONE → ALIVE → PC 自动 DUMP BIN →
    曲线工作室出图（非均匀时间轴，验证高速细节保留）。
 4. **分档切换**：用高转速源验证 >6500 切 1X、<5500 切回 4X，steps= 随之变化，

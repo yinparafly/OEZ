@@ -4,7 +4,7 @@
 
 **Goal:** 在天机星 TMS320F28P550 开发板上实现事件触发（非均匀采样）测速记录器：EQEP 硬件捕获每个 ABI 边沿，回溯 400 点 + 续记 2400 点，串口/事件点存档到 SD，配套自建精简 PC 工具；ESP32 工程一律不动。
 
-**Architecture:** 事件驱动测速。EQEP1 捕获单元硬件锁存每个边沿（QCPRD/QCTMR），捕获中断 ISR 把 16B 事件点 (t_us, counts, index_n) 写入环缓冲/主缓冲；1kHz CPU 定时器做速度估计（实测+外推）、分档判定（4X/1X+迟滞）、10Hz 遥测；记录完成后 ALIVE 2s 再写 SD。PC 端全新自建 `abi_tjx.py`（精简 tkinter + 解析库 + 测试），协议与 ESP32 v40 对齐。
+**Architecture:** 事件驱动测速。EQEP1 位置比较（PCM）逐计数中断 ISR（⚡ 捕获单元无中断，方案 A 见决策记录）把 16B 事件点 (t_us, counts, index_n) 写入环缓冲/主缓冲；1kHz CPU 定时器做速度估计（实测+外推）、分档判定（PCM 步长 1/4 + 迟滞）、10Hz 遥测；记录完成后 ALIVE 2s 再写 SD。PC 端全新自建 `abi_tjx.py`（精简 tkinter + 解析库 + 测试），协议与 ESP32 v40 对齐。
 
 **Tech Stack:** CCS 20.1.1（Theia）+ C2000Ware 5.04.00.00 + TI C2000 编译器 22.6.1.LTS（`--abi=eabi`）+ SysConfig 1.23 + driverlib（C28x 150/200MHz）+ FatFS R0.15 + Python3（pyserial/matplotlib，Windows 10/11）。设计文档：`TMS320/docs/superpowers/specs/2026-08-01-abimonitor-eventspeed-design.md`。
 
@@ -20,7 +20,33 @@
 - 每次构建：`CPU1_RAM` 配置（RAM 调试）；最终 `CPU1_FLASH` 烧录回归。
 - 每个固件任务验证 = 构建通过 + 烧录后串口断言（`SNAP?`/`ABI?`/`SNAP STATUS`/`HEX DUMP`/`FW?`）；PC 任务验证 = `python test_abi_tjx.py` 全绿。
 - FatFS R0.15（elm-chan，`https://elm-chan.org/fsw/ff/arc/ff15.zip`），FF_USE_LFN=1、FF_LFN_UNICODE=0、FF_USE_STRFUNC=0；无网络时改用 FF_USE_LFN=0（文件名缩为 8.3 短名）。
-- 波特率：921600。若编译后实测 SCIA 误差 >±2%（SYSCLK=200MHz 时 921600 理论误差约 -3.1%），全局改用 460800（同比例误差 ±1.7%）并在 PC 工具默认值同步修改。**实测方法（评审 G/dp）：PC 发 1KB 定长包，板端环回，测收发时间差计算实际波特率偏差（Task 12 Step 11）。**
+- 波特率：921600。**主频已确定为 150MHz**（device.h L299 公式 20MHz×30/(2×1×2)，用户确认 F28P55x 为 150MHz）；LSPCLK=37.5MHz 时 BRR=4 → 实际 937500，误差 **+1.72% < ±2%**，921600 可直接用，无需降 460800（2026-08-02 修正，原按 200MHz 估算 -3.1% 作废）。**实测方法（评审 G/dp）：PC 发 1KB 定长包，板端环回，测收发时间差计算实际波特率偏差（Task 12 Step 11）。**
+
+---
+
+### 决策记录（2026-08-02）：eQEP 捕获单元无中断 → 方案 A（PCM 逐计数中断）
+
+**问题**（详见 `TMS320/docs/2026-08-02_eQEP捕获中断缺失_问题与发现.md`）：
+F28P55x eQEP 捕获单元**没有中断**：QCAPCTL 仅 UPPS/CCPS/CEN 三字段（hw_eqep.h L123-130）、QFLG 仅 13 个标志无捕获位（L164-179）、TI 官方 eqep_ex4 用 UNIT_TIME_OUT 中断（标题 "via unit timeout interrupt"）。原计划枚举 `EQEP_INT_CAPTURE_PERIOD`/`EQEP_INT_INDEX_EVENT`/`EQEP_CAPTURE_*` 均不存在；Index 正确名 **`EQEP_INT_INDEX_EVNT_LATCH`**（eqep.h L144）。QCPRD/QCTMR 是 **16 位**（SYSCLK=150MHz 时 65535 tick ≈ 436.9µs，约 34.3rpm 以下失效）；QCTMR 每捕获事件清零，**不能作绝对时钟**（原 qctmr64 方案作废）。EPG 只有 SIGGEN0_DONE/FILL 中断，无边沿测量中断。**正交模式下计数天然 4X**（1X/2X 分辨率枚举是 QDECCTL.XCR，仅 CLOCK_DIR 模式生效），无法硬件切分辨率降 ISR 速率。
+
+**方案 A（已选用）——位置比较逐计数中断**：
+- 初始化：`EQEP_enableCompare()`（QPOSCTL.PCE=1）；QPOSCTL 裸写 **PCSHDW=1、PCLOAD=1**（影子使能、匹配装载）；`EQEP_setCompareConfig(base, EQEP_COMPARE_NO_SYNC_OUT, QPOSCNT±1, 0)` 武装；`EQEP_enableInterrupt(base, EQEP_INT_POS_COMP_MATCH | EQEP_INT_DIR_CHANGE | EQEP_INT_INDEX_EVNT_LATCH)`。
+- ISR（`INT_Module_EQEP_ISR`，同一条 INT_EQEP1 分发）：PCM → 读 QPOSCNT 差分（±2³¹ 回绕修正）累计 canonical counts、读 µs 时钟得 t_us、µs 差分得周期、`snap_on_event`、按 `EQEP_getDirection()`（返回 int16_t ±1）重新武装 QPOSCMP=QPOSCNT±1；QDC → 按新方向重新武装（防反向背离失配）；IEL → index_n++ 与绝对校准。
+- 时间戳：**CPUTIMER0 自由运行 @SYSCLK + 1kHz ISR 维护 64 位回绕计数**（不用 QCTMR）。
+- 周期测速：ISR 内 µs 差分，**不启用 QCAP**（16 位溢出且无中断，无收益）。
+- 降速分档（GEAR）：正交模式无硬件 1X/4X 可切 → **PCM 步长 N**（GEAR_4X→N=1 逐计数、GEAR_1X→N=4），ISR 速率 /N；QPOSCNT 差值恒精确，canonical 不丢。
+- ISR 追不上时：delta>1 追赶，计数精确、中间边沿时间丢失（优雅降级）。
+
+**方案 B（备选，留作将来对比）**：UNIT_TIME_OUT 周期采样（TI ex4 模式），UTO 中断轮询 QPOSCNT/QCPRD，1kHz 采样实现最简最稳，但每 tick 只记 1 点、逐边沿事件时间全丢。
+**对比时机**：Task 12 联调后，可选把 `app/eqep_abi.c` 换成方案 B 实现，对比事件时间分辨率与 CPU 开销。
+
+**三朋友答复确认（2026-08-02，G/k/dp 三份答复已存档 `TMS320/docs/superpowers/specs/`）**：
+- 三人一致确认：QCAP 无中断（11 个中断源 PCE/PHE/QDC/WTO/PCU/PCO/PCR/PCM/SEL/IEL/UTO，无捕获位）、正交模式恒 4X、XCR 只对 CLOCK_DIR 生效、QCPRD 16 位、QCTMR 清零；方案 A 合理（k 评 ★★★★ 首选，dp 称"极具创造性变通"，TI E2E 有人讨论过类似做法）。
+- **主频修正：F28P55x = 150MHz**（非 200MHz；device.h L299 公式与用户确认一致）。全计划已改为 150MHz 口径：ISR 预算 90 周期/0.6µs、QCPRD 溢出 436.9µs≈34.3rpm、921600 波特率误差 +1.72% 可用。
+- PCLOAD=1 匹配自动装载影子值：dp 确认 ISR 只需更新影子值、匹配时硬件自动装载，无竞争（前提 ISR 足够快）；k 强调**写完 QPOSCMP 再清标志**。
+- 已吸收的加固项（k）→ Task 6 Step 2 代码：① ISR 开头先读 QPOSCNT + 时间戳再分发标志（缩小窗口）；② 加**漏事件计数器**（本次 delta > step 时累加，联调观察优雅降级）；③ 中高速自动加大 N（按最近速度估计）；④ 回绕/QPOSMAX 行为上板实测（Task 6 Step 3 冒烟 + Task 11/12 联调）。
+- G 建议：Task 6 不要直接写整套业务，先做极简 PCM 验证程序（100kHz 模拟脉冲测 CPU 占用）。→ 已落实：Task 6 Step 4 是强制检查点（ISR 开销实测，>0.6µs 立即降档），不再新增任务。
+- 其他路线记录（dp/G）：GPIO XINT 边沿中断（无 4X 解码，噪声敏感 ★★）、CLB+XBAR+DMA（片上小 FPGA，开发成本高 ★ 后期优化）、eCAP（F28P55x 有 eCAP 模块，但 1-2 路无法同时处理 A+B 正交，不适合）——均不改变当前方案 A 选型。
 
 ---
 
@@ -109,18 +135,19 @@
 - [ ] **Step 2: SCIA 波特率 921600**
   - `Debug_Serial` 实例 Baud Rate 改为 **921600**；保留 RX 中断、非 FIFO。
   - 记录项：若任务 6 实测收发异常，按 Global Constraints 降 460800。
-- [ ] **Step 3: EQEP1 配置（捕获 + Index）**
+- [ ] **Step 3: EQEP1 配置（PCM 逐计数中断 + Index，见决策记录）**
   - `Module_EQEP` 实例：A=GPIO50、B=GPIO51，**新增 Index=GPIO53**（EQEP1_INDEX）。
-  - 解码器分辨率先保持模板的 1X（任务 5 运行中按档位调用 `EQEP_setDecoderConfig` 覆盖）。
-  - 位置计数器模式：`EQEP_POSITION_RESET_MAX_POS`、max=0xFFFFFFFF；**关** unit timer 中断（模板的 50ms 锁存路径弃用）。
-  - **开启捕获单元**：`EQEP_setCaptureConfig(..., 捕获全部 4 边沿, CAPCLK 分频=SYSCLK)`、`EQEP_enableCapture(..., EQEP_CAPTURE_PERIOD_READY)`；中断源加入 **CAPTURE_PERIOD**（捕获周期就绪）。
-  - **Index 事件中断**：中断源加入 **INDEX_EVENT**。
-  - 勾选 `registerInterrupts`。
-  - ⚠ 从本工程自带 `device\driverlib\eqep.h`（L951 `EQEP_setCaptureConfig`、L980 `EQEP_enableCapture`、L1031 `EQEP_getCapturePeriod`、L1056 `EQEP_getCaptureTimer`）与 `device\driverlib\inc\hw_eqep.h` 核对**精确枚举名**（`EQEP_INT_CAPTURE_PERIOD`、`EQEP_INT_INDEX_EVENT`、`EQEP_CAPTURE_BOTH_RISING_FALLING` / `EQEP_CAPTURE_POS_RISING` 等），以头文件实际为准，不一致就在实现时改。
+  - 解码器：`EQEP_setDecoderConfig` 用 `EQEP_CONFIG_QUADRATURE | EQEP_CONFIG_NO_SWAP | EQEP_CONFIG_IGATE_DISABLE`（⚠ 本器件无 4X/1X 分辨率枚举，XCR 仅 CLOCK_DIR 模式；正交模式天然 4X=4000 计数/圈）。
+  - 位置计数器模式：`EQEP_POSITION_RESET_MAX_POS`、max=0xFFFFFFFF；**关** unit timer（模板的 50ms 锁存路径弃用）。
+  - **位置比较（PCM）**：`EQEP_enableCompare()`（PCE=1）；QPOSCTL 裸写 **PCSHDW=1、PCLOAD=1**（driverlib 无封装）；`EQEP_setCompareConfig(base, EQEP_COMPARE_NO_SYNC_OUT, QPOSCNT±1, 0)` 武装首值。
+  - **中断源（同一 INT_EQEP1）**：`EQEP_INT_POS_COMP_MATCH`（逐计数）+ `EQEP_INT_DIR_CHANGE`（反向重新武装）+ `EQEP_INT_INDEX_EVNT_LATCH`（Index 事件，⚠ 不是 INDEX_EVENT）。
+  - **不启用 QCAP 捕获单元**（无中断源 + 16 位 QCPRD 低速溢出；周期测速改由 ISR 内 µs 差分，见 Task 6）。
+  - 勾选 `registerInterrupts`（生成 `INT_Module_EQEP_ISR` 骨架，Task 6 实现）。
+  - ⚠ 枚举以本工程 `device\driverlib\eqep.h` / `inc\hw_eqep.h` 实际为准：`EQEP_INT_INDEX_EVNT_LATCH`（L144）、`EQEP_enableInterrupt(base,intFlags)`（L648）、`EQEP_getDirection()` 返回 int16_t ±1（L597）、`EQEP_setCompareConfig(base,config,compareValue,cycles)`（L1875，内部写 QPOSCMP + QPOSCTL）、`EQEP_getCapturePeriod/Timer` 返回 uint16_t（L1030/L1056）；不存在 `EQEP_INT_CAPTURE_PERIOD`/`EQEP_INT_INDEX_EVENT`/`EQEP_CAPTURE_BOTH_RISING_FALLING`/`EQEP_CONFIG_4X_RESOLUTION`。
 - [ ] **Step 4: 新增 CPU Timer（1kHz）**
   - 仿 `05_timer_example\c2000.syscfg`：cputimer.js 实例 `Module_TIMER0`（CPUTIMER0），period=SYSCLK/1000，startTimer、enableInterrupt、registerInterrupts。
 - [ ] **Step 5: 新增 SPIB + CS GPIO（SD 卡）**
-  - spi.js 实例 `SD_SPI`：**SPIB**，controller、8-bit、无 FIFO 无中断；PICO/POCI/CLK 从 SysConfig 引脚图选未占用引脚（避开 0-3/6/14/20/21/28/29/50/51/53），例：CLK=GPIO30、PICO=GPIO31、POCI=GPIO32；CS=GPIO33 作输出 GPIO。
+  - spi.js 实例 `SD_SPI`：**SPIB**，controller、8-bit、无 FIFO 无中断；引脚（已按 F28P55x.json 复用数据核实）：CLK=**GPIO14**（mode9）、PICO=**GPIO30**（mode3）、POCI=**GPIO31**（mode3）、CS=**GPIO6**（普通 GPIO 输出）；四脚在 U21/U22 排针同一片区（28/29 为 SCIA 保留不动）。注意：GPIO32 虽为 SPIB_CLK mode3 但板上排针未引出，不可用；GPIO6/14 原被模板 EPWM4/EPWM8 占用，Task 3 Step 2 删除 EPWM 实例后即空闲。
   - ⚠ 逐一核对 SysConfig 冲突提示；选中后把最终引脚号记录到 spec §9 表格（编辑 `TMS320/docs/superpowers/specs/2026-08-01-abimonitor-eventspeed-design.md` §9 三行）。
 - [ ] **Step 6: L1/L2 SRAM 内存验证与链接脚本**
   - SysConfig → Memory 配置把 L1/L2 SRAM 分配为 CPU 数据 RAM（以 TRM 与 SysConfig 实际选项为准）。
@@ -554,21 +581,20 @@ void snap_print_status(void) {
 
 **Files:**
 - Create: `AbiMonitor_TJX\app\eqep_abi.h`、`AbiMonitor_TJX\app\eqep_abi.c`
-- Modify: 无（ISR 注册在 Task 9 的 main 集成；本任务由 main 临时注册）
+- Modify: 无（ISR 注册由 Task 3 SysConfig `registerInterrupts` 生成的 board.c 完成）
 
 **Interfaces:**
 - Consumes: Task 3 生成的 `Module_EQEP_*` 宏；`snap_on_event`（Task 5）。
 - Produces（Task 7/9 依赖的精确签名）：
-  - `void abi_init(void)`（解码器 4X、捕获全边沿、开 CAPTURE/INDEX 中断；置 gear=4X）
-  - `void abi_capture_isr(void)`（捕获就绪中断体）
-  - `void abi_index_isr(void)`（Index 事件中断体）
-  - `int64_t abi_counts(void)`（canonical 4X 基准累计）
+  - `void abi_init(void)`（解码器正交 4X、PCM/QDC/IEL 中断；置 gear=4X）
+  - `__interrupt void INT_Module_EQEP_ISR(void)`（PCM 逐计数 / QDC 反向 / IEL Index 三源分发）
+  - `int64_t abi_counts(void)`（canonical 4000 步/圈基准累计）
   - `uint32_t abi_index_n(void)`
-  - `uint64_t abi_now_us(void)`（QCTMR 扩展的 64 位 µs）
-  - `int  abi_gear(void)`（1=4X 2=1X）
-  - `void abi_set_gear(int gear)`（改解码器分辨率 + 捕获边沿集合；置 idx_cal_pending）
-  - `float abi_last_rpm(void)`（最近一次 QCPRD 换算，gear 相关 steps）
-  - `uint32_t abi_last_period_us(void)`（最近事件间隔 µs，0=无事件）
+  - `uint64_t abi_now_us(void)`（CPUTIMER0 扩展的 64 位 µs，1kHz ISR 维护）
+  - `int  abi_gear(void)`（1=GEAR_4X 逐计数 2=GEAR_1X 每 4 计数）
+  - `void abi_set_gear(int gear)`（改 PCM 步长 g_step；置 idx_cal_pending）
+  - `uint32_t abi_last_period_us(void)`（最近事件间隔 µs，0=无事件；rpm 由 Task 7 1kHz 换算，ISR 内禁浮点）
+  - `uint32_t abi_missed_events(void)`（漏事件计数，联调观察优雅降级；ISR 内 delta>step 时 ++）
 
 - [ ] **Step 1: 写 `eqep_abi.h`**
   ```c
@@ -578,19 +604,19 @@ void snap_print_status(void) {
   #define GEAR_4X 1
   #define GEAR_1X 2
   void abi_init(void);
-  void abi_capture_isr(void);
-  void abi_index_isr(void);
+  __interrupt void INT_Module_EQEP_ISR(void);   /* SysConfig 注册；PCM/QDC/IEL 分发 */
   int64_t abi_counts(void);
   uint32_t abi_index_n(void);
   uint64_t abi_now_us(void);
   int  abi_gear(void);
   void abi_set_gear(int gear);
-  float abi_last_rpm(void);
   uint32_t abi_last_period_us(void);
+
+  uint32_t abi_missed_events(void);
   #endif
   ```
-- [ ] **Step 2: 写 `eqep_abi.c`**
-  - 核对（实现前必读）：`device\driverlib\eqep.h` 与 `device\driverlib\inc\hw_eqep.h` 中捕获配置/中断标志的**精确枚举名**（如 `EQEP_CAPTURE_BOTH_RISING_FALLING`、`EQEP_INT_CAPTURE_PERIOD`、`EQEP_INT_INDEX_EVENT`、`EQEP_CONFIG_4X_RESOLUTION`），以头文件为准。
+- [ ] **Step 2: 写 `eqep_abi.c`（方案 A：PCM 逐计数 ISR，见决策记录）**
+  - 核对（实现前必读）：`device\driverlib\eqep.h` 与 `device\driverlib\inc\hw_eqep.h` 中**精确枚举名**（`EQEP_INT_POS_COMP_MATCH`、`EQEP_INT_DIR_CHANGE`、`EQEP_INT_INDEX_EVNT_LATCH`、`EQEP_INT_*` 无 CAPTURE）、`EQEP_enableInterrupt`（L648）、`EQEP_getDirection`（L597，返回 int16_t ±1）、`EQEP_setCompareConfig`（L1875，**内部写 QPOSCMP 且只写 active；PCSHDW/PCLOAD 无封装需裸写 QPOSCTL**）。
   ```c
   #include "eqep_abi.h"
   #include "snap_bin.h"
@@ -598,106 +624,111 @@ void snap_print_status(void) {
   #include "board.h"
   #include <limits.h>
 
-  #define SYSCLK_MHZ (DEVICE_SYSCLK_FREQ / 1000000u)   /* 150 或 200 */
+  #define SYSCLK_MHZ (DEVICE_SYSCLK_FREQ / 1000000u)   /* 150（F28P55x 主频） */
 
   static volatile int      g_gear = GEAR_4X;
-  static volatile int64_t  g_counts_canon;   /* 恒 4000 步/圈基准 */
+  static volatile int      g_step = 1;           /* PCM 步长：GEAR_4X→1、GEAR_1X→4 */
+  static volatile int64_t  g_counts_canon;       /* 恒 4000 步/圈基准 */
   static volatile uint32_t g_index_n;
-  static volatile uint32_t g_qctmr_prev;
-  static volatile uint32_t g_qctmr_wraps;    /* QCTMR 32 位回绕计数 */
   static volatile int      g_idx_cal_pending;
-  static volatile float    g_last_rpm;
   static volatile uint32_t g_last_period_us;
+  static volatile uint64_t g_last_evt_us;        /* 上一事件绝对 µs */
+  static volatile uint32_t g_missed_events;      /* 漏事件计数：delta>step 时累加（k 建议） */
+  static int32_t raw_prev;
 
-  void abi_init(void) {
-      g_gear = GEAR_4X; g_counts_canon = 0; g_index_n = 0;
-      g_qctmr_prev = EQEP_getCaptureTimer(Module_EQEP_BASE);
-      g_qctmr_wraps = 0; g_idx_cal_pending = 0;
-      abi_set_gear(GEAR_4X);
-  }
-
-  static uint64_t qctmr64(uint32_t raw) {
-      if (raw < g_qctmr_prev) g_qctmr_wraps++;   /* 回绕检测（仅 ISR 调） */
-      g_qctmr_prev = raw;
-      return ((uint64_t)g_qctmr_wraps << 32) | raw;
-  }
+  /* 64 位 µs 时钟：CPUTIMER0 周期=SYSCLK/1000 向下计数，1kHz ISR（Task 7）维护
+     g_us64（每 tick +1000）与 g_us_tick_cnt（countdown 快照）；
+     亚 µs 精度：t_us = g_us64 + ((g_us_tick_cnt − CPUTimer_getTimerCount + period) % period)/SYSCLK_MHZ
+     （u64 撕裂读用 hi/lo/hi retry） */
+  extern volatile uint64_t g_us64;
+  extern volatile uint32_t g_us_tick_cnt;
+  #define TIMER0_PERIOD (DEVICE_SYSCLK_FREQ / 1000u)
 
   uint64_t abi_now_us(void) {
-      return qctmr64(EQEP_getCaptureTimer(Module_EQEP_BASE)) / SYSCLK_MHZ;
+      uint32_t cnt = CPUTimer_getTimerCount(CPUTIMER0_BASE);
+      uint32_t el  = (g_us_tick_cnt + TIMER0_PERIOD - cnt) % TIMER0_PERIOD;
+      return g_us64 + (uint64_t)(el / SYSCLK_MHZ);
   }
-
-  void abi_capture_isr(void) {
-      uint32_t period = EQEP_getCapturePeriod(Module_EQEP_BASE);  /* QCPRD ticks */
-      int32_t  raw    = (int32_t)EQEP_getPosition(Module_EQEP_BASE);
-      static int32_t raw_prev;
-      int32_t delta = raw - raw_prev;
-      if (delta >  (int32_t)0x3FFFFFFF) delta -= (int32_t)0x80000000u;
-      if (delta < -(int32_t)0x3FFFFFFF) delta += (int32_t)0x80000000u;
-      raw_prev = raw;
-      if (g_gear == GEAR_1X) delta = delta * 4;   /* canonical 4X 基准 */
-      g_counts_canon += delta;
-      uint64_t now = qctmr64(EQEP_getCaptureTimer(Module_EQEP_BASE));
-      uint64_t t_us = now / SYSCLK_MHZ;
-      if (period) {
-          uint32_t p_us = (uint32_t)((uint64_t)period / SYSCLK_MHZ);
-          g_last_period_us = p_us;
-          if (p_us) g_last_rpm = 60.0f * 1000000.0f / ((float)p_us *
-                       (float)((g_gear == GEAR_4X) ? 4000 : 1000));
-      }
-      snap_on_event(t_us, g_counts_canon, g_index_n);
-      EQEP_clearInterruptStatus(Module_EQEP_BASE, EQEP_INT_CAPTURE_PERIOD);
-      Interrupt_clearACKGroup(INT_Module_EQEP_INTERRUPT_ACK_GROUP);
-  }
-
-  void abi_index_isr(void) {
-      g_index_n++;
-      if (g_idx_cal_pending) {
-          g_idx_cal_pending = 0;
-          g_counts_canon = (int64_t)g_index_n * 4000;   /* 绝对重校准 */
-      }
-      EQEP_clearInterruptStatus(Module_EQEP_BASE, EQEP_INT_INDEX_EVENT);
-      Interrupt_clearACKGroup(INT_Module_EQEP_INTERRUPT_ACK_GROUP);
+  void abi_init(void) {
+      g_gear = GEAR_4X; g_step = 1; g_counts_canon = 0; g_index_n = 0;
+      g_idx_cal_pending = 0; g_last_period_us = 0; g_last_evt_us = 0; raw_prev = 0;
+      g_missed_events = 0;
+      EQEP_setDecoderConfig(Module_EQEP_BASE,
+          EQEP_CONFIG_QUADRATURE | EQEP_CONFIG_NO_SWAP | EQEP_CONFIG_IGATE_DISABLE);
+          /* ⚠ 本器件无 4X/1X 分辨率枚举（XCR 仅 CLOCK_DIR 模式）；正交天然 4X */
+      EQEP_setPositionCounterConfig(Module_EQEP_BASE,
+          EQEP_POSITION_RESET_MAX_POS, 0xFFFFFFFFu);
+      abi_set_gear(GEAR_4X);
+      EQEP_enableCompare(Module_EQEP_BASE);                /* QPOSCTL.PCE=1 */
+      HWREGH(Module_EQEP_BASE + EQEP_O_QPOSCTL) |=
+          (EQEP_QPOSCTL_PCSHDW | EQEP_QPOSCTL_PCLOAD);     /* 影子使能+匹配装载 */
+      EQEP_setCompareConfig(Module_EQEP_BASE, EQEP_COMPARE_NO_SYNC_OUT,
+          (uint32_t)((int32_t)EQEP_getPosition(Module_EQEP_BASE)
+                     + EQEP_getDirection(Module_EQEP_BASE) * g_step), 0u);
+      EQEP_enableInterrupt(Module_EQEP_BASE,
+          EQEP_INT_POS_COMP_MATCH | EQEP_INT_DIR_CHANGE | EQEP_INT_INDEX_EVNT_LATCH);
+      EQEP_clearInterruptStatus(Module_EQEP_BASE,
+          EQEP_INT_POS_COMP_MATCH | EQEP_INT_DIR_CHANGE | EQEP_INT_INDEX_EVNT_LATCH);
   }
 
   void abi_set_gear(int gear) {
-      uint32_t reso = (gear == GEAR_4X) ? EQEP_CONFIG_4X_RESOLUTION
-                                        : EQEP_CONFIG_1X_RESOLUTION;
-      EQEP_setDecoderConfig(Module_EQEP_BASE,
-          reso | EQEP_CONFIG_QUADRATURE | EQEP_CONFIG_NO_SWAP | EQEP_CONFIG_IGATE_DISABLE);
-      EQEP_setCaptureConfig(Module_EQEP_BASE,
-          EQEP_CAPTURE_CLK_DIV_1, EQEP_CAPTURE_CLK_DIV_1,
-          (gear == GEAR_4X) ? EQEP_CAPTURE_BOTH_RISING_FALLING
-                            : EQEP_CAPTURE_POS_RISING);
+      g_step = (gear == GEAR_1X) ? 4 : 1;        /* ISR 速率 /step，canonical 仍精确 */
       g_gear = gear;
       g_idx_cal_pending = 1;
+  }
+
+  __interrupt void INT_Module_EQEP_ISR(void) {
+      uint32_t st = EQEP_getInterruptStatus(Module_EQEP_BASE);
+      if (st & EQEP_INT_POS_COMP_MATCH) {
+          int32_t raw = (int32_t)EQEP_getPosition(Module_EQEP_BASE);
+          uint64_t now = abi_now_us();           /* k：先读计数+时间戳，再分发，缩小窗口 */
+          int32_t delta = raw - raw_prev;
+          if (delta >  (int32_t)0x3FFFFFFF) delta -= (int32_t)0x80000000u;
+          if (delta < -(int32_t)0x3FFFFFFF) delta += (int32_t)0x80000000u;
+          raw_prev = raw;
+          if (delta > g_step || delta < -g_step) g_missed_events++;  /* 漏事件计数（k 建议） */
+          g_counts_canon += delta;
+          if (g_last_evt_us) {
+              g_last_period_us = (uint32_t)(now - g_last_evt_us);
+              /* 只做整数 µs 差分（ISR 禁浮点/除法，90 周期预算）；rpm 由 1kHz speed_est 算（Task 7） */
+          }
+          g_last_evt_us = now;
+          snap_on_event(now, g_counts_canon, g_index_n);
+          EQEP_setCompareConfig(Module_EQEP_BASE, EQEP_COMPARE_NO_SYNC_OUT,
+              (uint32_t)(raw + EQEP_getDirection(Module_EQEP_BASE) * g_step), 0u);
+      }
+      if (st & EQEP_INT_DIR_CHANGE) {          /* 反向：按新方向重新武装 */
+          int32_t raw = (int32_t)EQEP_getPosition(Module_EQEP_BASE);
+          raw_prev = raw;
+          EQEP_setCompareConfig(Module_EQEP_BASE, EQEP_COMPARE_NO_SYNC_OUT,
+              (uint32_t)(raw + EQEP_getDirection(Module_EQEP_BASE) * g_step), 0u);
+      }
+      if (st & EQEP_INT_INDEX_EVNT_LATCH) {
+          g_index_n++;
+          if (g_idx_cal_pending) { g_idx_cal_pending = 0; g_counts_canon = (int64_t)g_index_n * 4000; }
+      }
+      EQEP_clearInterruptStatus(Module_EQEP_BASE,
+          EQEP_INT_POS_COMP_MATCH | EQEP_INT_DIR_CHANGE | EQEP_INT_INDEX_EVNT_LATCH);
+      Interrupt_clearACKGroup(INT_Module_EQEP_INTERRUPT_ACK_GROUP);
   }
 
   int64_t abi_counts(void)    { return g_counts_canon; }
   uint32_t abi_index_n(void)  { return g_index_n; }
   int  abi_gear(void)         { return g_gear; }
-  float abi_last_rpm(void)    { return g_last_rpm; }
   uint32_t abi_last_period_us(void) { return g_last_period_us; }
+  uint32_t abi_missed_events(void)  { return g_missed_events; }   /* 联调观察优雅降级 */
   ```
-  - ⚠ 若 `EQEP_CAPTURE_CLK_DIV_1` 等枚举名与实际不符，按 eqep.h 修正；若 hw_eqep.h 无 `EQEP_INT_INDEX_EVENT`（Index 中断位名不同），改用等效名或回退方案（见 Step 3 注）。
+  - ⚠ `HWREGH` 需要 `#include "inc/hw_eqep.h"`（driverlib.h 已带）；PCSHDW/PCLOAD 无 driverlib 封装（eqep.c L65-76 只写 QPOSCMP active 值 + QPOSCTL 的 PCSHDW/PCLOAD 由 config 传入 `EQEP_setCompareConfig` 内 regValue 写入——实现时确认 `EQEP_setCompareConfig` 的 config 参数是否可带 `EQEP_QPOSCTL_PCSHDW|EQEP_QPOSCTL_PCLOAD`，可则免裸写）。
 - [ ] **Step 3: 构建 + 上板冒烟**
-  - main 临时注册两个 ISR：`Interrupt_register(INT_Module_EQEP, &abi_capture_isr); Interrupt_register(INT_Module_EQEP, ...)` 冲突！——实际做法：`abi_capture_isr` 与 `abi_index_isr` 是**同一 PIE 中断**（INT_EQEP1）的两个源，合并为一个 ISR 分发，或按 SysConfig 生成的中断注册方式（board.c 已注册 `INT_Module_EQEP_ISR`）→ **本任务把 ISR 写为 `__interrupt void INT_Module_EQEP_ISR(void)`** 放在 eqep_abi.c，内部先判断 `EQEP_getInterruptStatus` 再分派 capture/index 分支。⚠ 修正：将 `abi_capture_isr`/`abi_index_isr` 合并为：
-    ```c
-    __interrupt void INT_Module_EQEP_ISR(void) {
-        uint32_t st = EQEP_getInterruptStatus(Module_EQEP_BASE);
-        if (st & EQEP_INT_CAPTURE_PERIOD) { /* 捕获就绪处理（上列代码体） */ }
-        if (st & EQEP_INT_INDEX_EVENT)     { /* index 处理 */ }
-        EQEP_clearInterruptStatus(Module_EQEP_BASE, EQEP_INT_CAPTURE_PERIOD | EQEP_INT_INDEX_EVENT);
-        Interrupt_clearACKGroup(INT_Module_EQEP_INTERRUPT_ACK_GROUP);
-    }
-    ```
-  - 手转轴（低速），串口打印 `abi_counts()/abi_index_n()/abi_last_rpm()` 断言：正反转 counts 增减、I 每圈 +1。
+  - ISR 已按方案 A 写为 `__interrupt void INT_Module_EQEP_ISR(void)`（Step 2 代码，PCM/QDC/IEL 三源在同一个 INT_EQEP1 内由 QFLG 分发）；注册由 SysConfig `registerInterrupts` 生成的 `board.c` 完成，main 无需再注册。
+  - 手转或电驱动（多圈多速度更佳），串口打印 `abi_counts()/abi_index_n()/abi_last_period_us()` 断言：正反转 counts 增减、I 每圈 +1、静止时周期保持最后值。
 - [ ] **Step 4: ISR 开销实测（强制检查点——评审 G：Task 6 完成后立即做，不拖到联调）**
   - 方法：CPUTIMER0 读 `CPUTimer_getTimerCount` 差值（或 GPIO 翻转示波器法）测 `INT_Module_EQEP_ISR` 周期数；结果记入 spec §12.7 与联调文档。
-  - 判定：>0.6µs（≈120 周期 @200MHz / 90 周期 @150MHz）→ **立即启用 2X 降级**（GEAR_2X：捕获 A 双沿、canonical ×2，eqep_abi/speed_est 约 6 行），不等到联调。
+  - 判定：>0.6µs（≈90 周期 @150MHz）→ **立即启用降档**（GEAR_1X：PCM 步长 N=4，ISR 速率 /4、canonical 仍精确，eqep_abi/speed_est 约 6 行），不等到联调。
 - [ ] **Step 5: Commit**
   ```bash
   git add TMS320/AbiMonitor_TJX/app/eqep_abi.h TMS320/AbiMonitor_TJX/app/eqep_abi.c
-  git commit -m "feat: eqep capture ISR, canonical counts, index, gear switch"
+  git commit -m "feat: eqep PCM per-count ISR (POS_COMP_MATCH/QDC/IEL), canonical counts, gear step"
   ```
 
 ---
@@ -709,7 +740,7 @@ void snap_print_status(void) {
 - Modify: `snap_bin.c`（Task 9 接 `snap_set_ms`；本任务先由 main 调用）
 
 **Interfaces:**
-- Consumes: `abi_last_rpm/abi_last_period_us/abi_gear/abi_set_gear`（Task 6）、`snap_set_ms`（Task 5）、`abi_now_us`。
+- Consumes: `abi_last_period_us/abi_gear/abi_set_gear`（Task 6）、`snap_set_ms`（Task 5）、`abi_now_us`。
 - Produces（Task 9 依赖）：
   - `void spd_init(void)`
   - `void spd_tick_1khz(void)`（CPUTIMER0 ISR 调：测速/外推/分档切换；内部调 `snap_set_ms(g_ms++)`）
@@ -749,17 +780,29 @@ void snap_print_status(void) {
   static uint64_t last_t1_us, last_t2_us;
   static int      have_1, have_2;
 
-  void spd_init(void) { g_rpm = 0; g_ms = 0; have_1 = have_2 = 0; last_t_us = 0; }
+  /* 64 位 µs 时钟（eqep_abi extern g_us64）：
+     CPUTIMER0 周期=SYSCLK/1000 向下计数；1kHz ISR 维护：
+     g_us64 每 tick +1000；g_us_tick_cnt=ISR 开头读到的 countdown 快照（≈period−ISR 延迟）。
+     abi_now_us() = g_us64 + ((g_us_tick_cnt − CPUTimer_getTimerCount + period) % period)/SYSCLK_MHZ */
+  static volatile uint64_t g_us64;
+  static volatile uint32_t g_us_tick_cnt;
+
+  void spd_init(void) { g_rpm = 0; g_ms = 0; have_1 = have_2 = 0; last_t_us = 0;
+      g_us64 = 0; g_us_tick_cnt = 0; }
 
   uint32_t spd_abs_ms(void) { return g_ms; }
 
   void spd_tick_1khz(void) {
       g_ms++;
       snap_set_ms(g_ms);
+      g_us64 += 1000u;                                   /* 1kHz 基准累加 */
+      g_us_tick_cnt = CPUTimer_getTimerCount(CPUTIMER0_BASE);   /* 亚 ms 插值快照 */
       uint64_t now = abi_now_us();
       uint32_t per = abi_last_period_us();
       if (per > 0) {                       /* 最近 1ms 有（或刚有过）新事件 */
-          float rpm = abi_last_rpm();
+          /* rpm 在此计算（1kHz，非 ISR）：GEAR_1X 时 per 覆盖 step=4 个计数 */
+          float rpm = 60.0f * 1000000.0f /
+              ((float)per * (float)(g_gear == GEAR_4X ? 4000 : 1000));
           /* 事件新近性：用上次事件时刻估算；若 per 为陈旧值则走外推 */
           if (now - last_t_us > 3000u) {   /* 3ms 无事件 → 外推 */
               goto extrap;
@@ -792,7 +835,7 @@ void snap_print_status(void) {
   - ⚠ 外推的"新事件检测"依赖 `abi_last_period_us()` 新近性，语义上简化为"上一次 ISR 距今"；若实测抖动明显，改为在 eqep_abi 暴露 `abi_event_count()`（捕获 ISR 里 ++），`speed_est` 比较计数变化，实现时二选一（优先计数法，改动 3 行）。
 - [ ] **Step 3: 构建 + 上板冒烟**
   - main 临时：CPUTIMER0 ISR 调 `spd_tick_1khz()`；串口 1Hz 打印 `spd_rpm()`。
-  - 断言：低速手转 RPM 数值合理（≈实际）；停转 100ms 后归 0；高速档（>6500）切换时 `spd_gear()` 变 1X（用 4X 模拟高速不可行时暂以手摇方式验证切换阈值，或任务 11 用电机）。
+  - 断言：低速（手转或电驱动）RPM 数值合理（≈实际）；停转 100ms 后归 0；高速档（>6500）切换时 `spd_gear()` 变 1X（优先用电机驱动多速度验证；无电机时暂以手摇方式验证切换阈值，任务 11 再用电机复核）。
 - [ ] **Step 4: Commit**
   ```bash
   git add TMS320/AbiMonitor_TJX/app/speed_est.h TMS320/AbiMonitor_TJX/app/speed_est.c
@@ -987,7 +1030,7 @@ void snap_print_status(void) {
 - [ ] **Step 5: 构建 CPU1_RAM + CPU1_FLASH 双配置**
   - 预期：两配置均 0 错误；FLASH 配置 map 中 SNAP_RAM 在 RAM 运行段。
 - [ ] **Step 6: 上板冒烟（无 SD 卡时也应工作）**
-  - 断言：boot banner → `MONITOR START` → armed 行；手转一圈 → CONFIRM → RECORD → `# SNAP DONE n≈几百` → ALIVE 2 拍 → `# SNAP DUMP READY` → PC `DUMP BIN` 拉帧成功。
+  - 断言：boot banner → `MONITOR START` → armed 行；转动（电驱动多速或手转）→ CONFIRM → RECORD → `# SNAP DONE n≈几百` → ALIVE 2 拍 → `# SNAP DUMP READY` → PC `DUMP BIN` 拉帧成功。
 - [ ] **Step 7: Commit**
   ```bash
   git add TMS320/AbiMonitor_TJX/empty_driverlib_main.c TMS320/AbiMonitor_TJX/app/snap_bin.h TMS320/AbiMonitor_TJX/app/snap_bin.c
@@ -1021,7 +1064,7 @@ void snap_print_status(void) {
   - 出图：matplotlib 子图 1：rpm vs t_ms（非均匀 t_us 时间轴，散点+线）；子图 2：counts vs t_ms；窗口标题含 steps/mode/点数。
   - 依赖缺失：`pip install pyserial matplotlib`（Step 0 前提检查）。
 - [ ] **Step 5: 与固件联调（板在手）**
-  - 启动 GUI → 连接 → TIME+START → 手转轴 → 自动出现 BIN OK → 存盘 → 打开曲线验证非均匀时间轴与高速细节。
+  - 启动 GUI → 连接 → TIME+START → 转动（电驱动多速优先）→ 自动出现 BIN OK → 存盘 → 打开曲线验证非均匀时间轴与高速细节。
 - [ ] **Step 6: Commit**
   ```bash
   git add TMS320/pc/abi_tjx.py TMS320/pc/test_abi_tjx.py
@@ -1040,11 +1083,11 @@ void snap_print_status(void) {
 - Consumes: Task 10/11 产物。
 
 - [ ] **Step 1: 低速自检（校准 steps）**
-  - `ABI?`：手转 N 圈 → canonical counts=4000×N（4X 档）；验证 AS5047P 1000 PPR 假设（不符则调整 steps 常量并记录）。
+  - `ABI?`：电驱动多圈多速度（或手转 N 圈）→ canonical counts=4000×N（4X 档）；验证 AS5047P 1000 PPR 假设（不符则调整 steps 常量并记录）。
 - [ ] **Step 2: 实时遥测**：10Hz `L,` 行 rpm 与实际相符、方向正确。
 - [ ] **Step 3: 事件记录**：MONITOR START → 弹射 → SNAP DONE → ALIVE → DUMP READY → PC 自动拉帧 → 出图（非均匀时间轴、无 2kHz 台阶）。
 - [ ] **Step 4: 分档切换**：高速源（或手摇极限）验证 >6500 切 1X、<5500 回 4X；canonical counts 无阶跃；I 对齐生效。
-- [ ] **Step 5: ISR 开销实测（满载复核）**：Task 6 门已测周期数；此处 4X 满速实际运行确认 CPU 占用 <30% 预算；超则按 Task 6 结论启用 2X 降级（GEAR_2X=3，捕获 A 双沿，canonical ×2）。
+- [ ] **Step 5: ISR 开销实测（满载复核）**：Task 6 门已测周期数；此处 4X 满速实际运行确认 CPU 占用 <30% 预算；超则按 Task 6 结论启用降档（GEAR_1X：PCM 步长 N=4，ISR 速率 /4，canonical 仍精确）。
 - [ ] **Step 6: SD 存档**：插入卡 → 记录完自动存 → `SD DUMP` 拉回 → PC 校验 CRC。
 - [ ] **Step 7: 外推**：低速缓转 → 无事件时段输出线性外推；停止 100ms 归 0。
 - [ ] **Step 8: 极限场景**（G 建议）：长时间空闲后突然弹射（环缓冲无污染）；记录中途档位切换（counts 连续）；写卡失败重试路径（拔卡模拟）。
