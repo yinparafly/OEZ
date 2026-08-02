@@ -52,12 +52,12 @@ SECTIONS
 
    .stack           : > RAMM1
 #if defined(__TI_EABI__)
-   .bss             : > RAMLS5
-   .bss:output      : > RAMLS3
-   .init_array      : > RAMM0
-   .const           : >> RAMGS2 | RAMGS3
-   .data            : > RAMLS5
-   .sysmem          : > RAMLS4
+    .bss             : >> RAMLS5 | RAMLS6 | RAMLS7 | RAMLS8 | RAMLS9 | RAMGS0 | RAMGS1 | RAMGS2
+    .bss:output      : > RAMLS3
+    .init_array      : > RAMM0
+    .const           : >> RAMGS3
+    .data            : > RAMLS4
+    .sysmem          : > RAMLS4
 #else
    .pinit           : > RAMM0
    .ebss            : >> RAMLS5 | RAMLS6

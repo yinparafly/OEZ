@@ -1,4 +1,5 @@
 #include "eqep_abi.h"
+#include "snap_bin.h"
 #include "board.h"
 #include "driverlib.h"
 #include "../module_driver/bsp_motor_hallencoder.h"
@@ -94,6 +95,7 @@ __interrupt void INT_Module_EQEP_ISR(void)
         g_missed += (uint32_t)((d > 0 ? (uint32_t)d : (uint32_t)(-d)) / 4000u);
 
         { uint32_t us_now = (uint32_t)(abi_now_us() & 0xFFFFFFFFuL);
+          snap_on_event(us_now, g_counts, g_index);
           if (g_prev_us > 0 && us_now > g_prev_us)
               g_period = us_now - g_prev_us;
           g_prev_us = us_now; }

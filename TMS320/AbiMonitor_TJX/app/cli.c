@@ -2,6 +2,7 @@
 #include "sd_fatfs.h"
 #include "eqep_abi.h"
 #include "speed_est.h"
+#include "snap_bin.h"
 #include "fatfs/diskio.h"
 #include "board.h"
 #include "driverlib.h"
@@ -155,6 +156,12 @@ static void cli_handle(char *line)
     {
         uint16_t f = HWREGH(Module_EQEP_BASE + EQEP_O_QFLG);
         cli_printf("# QFLG=0x%04X\n", (unsigned)f);
+    }
+    else if (strcmp(line, "SNAP?") == 0)
+    {
+        cli_printf("# SNAP n=%u bytes=%lu armed=%d rec=%d alive=%d done=%d\n",
+                   (unsigned)snap_data_bytes()/16, (unsigned long)snap_data_bytes(),
+                   snap_armed(), (int)g_recording, (int)g_alive, (int)snap_done());
     }
     else if (strcmp(line, "SPD?") == 0)
     {

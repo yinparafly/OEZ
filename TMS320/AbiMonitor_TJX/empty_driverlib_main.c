@@ -10,6 +10,7 @@
 #include "app/cli.h"
 #include "app/eqep_abi.h"
 #include "app/speed_est.h"
+#include "app/snap_bin.h"
 
 
 // extern volatile uint32_t Encoder_Count;         // 编码器计数，用于用户使用。
@@ -97,6 +98,7 @@ void main(void)
     cli_init();
     abi_init();
     spd_init();
+    snap_alloc();
     g_seq_start = g_tick_1khz;
 
     while(1)
@@ -173,6 +175,7 @@ void main(void)
                   gpamux, tbCtr, aqCtl, cmpA);
 
         cli_task();
+        snap_poll(spd_rpm());
 
         // RGB的B灯亮起，G灯熄灭
         GPIO_writePin(RGB_B, 0);
