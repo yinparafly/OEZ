@@ -8,6 +8,7 @@
 #include "bsp_motor_hallencoder.h"
 
 #include "app/cli.h"
+#include "app/eqep_abi.h"
 
 
 // extern volatile uint32_t Encoder_Count;         // 编码器计数，用于用户使用。
@@ -93,6 +94,7 @@ void main(void)
     Encoder_Init();
     Motor_Init();
     cli_init();
+    abi_init();
     g_seq_start = g_tick_1khz;
 
     while(1)
@@ -202,6 +204,7 @@ __interrupt void INT_Debug_Serial_RX_ISR(void)
 __interrupt void INT_myCPUTIMER0_ISR(void)
 {
     g_tick_1khz++;
+    abi_clock_tick();
     Encoder_Periodic_Update();
     Interrupt_clearACKGroup(INT_myCPUTIMER0_INTERRUPT_ACK_GROUP);
 }

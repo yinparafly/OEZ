@@ -1,5 +1,6 @@
 #include "cli.h"
 #include "sd_fatfs.h"
+#include "eqep_abi.h"
 #include "fatfs/diskio.h"
 #include "board.h"
 #include "driverlib.h"
@@ -121,9 +122,56 @@ static void cli_handle(char *line)
         sd_spi_loopback_test();
         cli_printf("# SPI LB %s\n", sd_loopback_ok ? "OK" : "FAIL");
     }
+    else if (strcmp(line, "QPW") == 0)
+    {
+        /* Write 0x0043 to QPOSCTL and read back */
+        volatile uint16_t *p = (volatile uint16_t *)(Module_EQEP_BASE + EQEP_O_QPOSCTL);
+        *p = 0x0043;
+        cli_printf("# QPW -> 0x%04X\n", (unsigned)*p);
+    }
+    else if (strcmp(line, "QSTS") == 0)
+    {
+        uint16_t s = HWREGH(Module_EQEP_BASE + EQEP_O_QEPSTS);
+        cli_printf("# QEPSTS=0x%04X\n", (unsigned)s);
+    }
+    else if (strcmp(line, "QCTL") == 0)
+    {
+        uint16_t c = HWREGH(Module_EQEP_BASE + EQEP_O_QPOSCTL);
+        cli_printf("# QPOSCTL=0x%04X\n", (unsigned)c);
+    }
+    else if (strcmp(line, "QCMP") == 0)
+    {
+        uint32_t c = HWREG(Module_EQEP_BASE + EQEP_O_QPOSCMP);
+        uint32_t p = HWREG(Module_EQEP_BASE + EQEP_O_QPOSCNT);
+        cli_printf("# QCMP=%lu QPOS=%lu\n", (unsigned long)c, (unsigned long)p);
+    }
+    else if (strcmp(line, "QEINT") == 0)
+    {
+        uint16_t e = HWREGH(Module_EQEP_BASE + EQEP_O_QEINT);
+        cli_printf("# QEINT=0x%04X\n", (unsigned)e);
+    }
+    else if (strcmp(line, "QFLG") == 0)
+    {
+        uint16_t f = HWREGH(Module_EQEP_BASE + EQEP_O_QFLG);
+        cli_printf("# QFLG=0x%04X\n", (unsigned)f);
+    }
+    else if (strcmp(line, "ABI?") == 0)
+    {
+        DINT;
+        int64_t cnt = abi_counts();
+        EINT;
+        cli_printf("# ABI cnt=%lld idx=%lu miss=%lu pcm=%lu qdc=%lu iel=%lu g=%d per=%lu\n",
+                   cnt, (unsigned long)abi_index_n(),
+                   (unsigned long)abi_missed_events(),
+                   (unsigned long)abi_pcm_dbg(),
+                   (unsigned long)abi_qdc_dbg(),
+                   (unsigned long)abi_iel_dbg(),
+                   (int)abi_gear(),
+                   (unsigned long)abi_last_period_us());
+    }
     else if (strcmp(line, "HELP") == 0)
     {
-        cli_put_raw("# CMDS: PING FW? SD? SD INIT SD TEST SPI LB HELP\n");
+        cli_put_raw("# CMDS: PING FW? SD? SD INIT SD TEST SPI LB ABI? HELP\n");
     }
     else
     {

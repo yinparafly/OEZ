@@ -16,7 +16,14 @@
 // 获得绝对值
 #define ABS(a)      (a>0 ? a:(-a))
 
+extern volatile uint32_t Encoder_Count;
+extern volatile int32_t  Motor_dir;
+extern volatile uint32_t Encoder_PulsePerRev;
+extern volatile uint32_t Encoder_Index_Count;
+
 void Encoder_Init(void);
+void Encoder_Periodic_Update(void);
+void Motor_Init(void);
 int32_t Get_Encoder_Dir(void);
 uint32_t Get_Encoder_Value(void);
 void Motor_Set_PWM(uint8_t Mode, uint16_t Speed);
