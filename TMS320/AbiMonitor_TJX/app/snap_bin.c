@@ -18,18 +18,22 @@ static uint32_t  g_alive_ms = 0;
 static bool      g_staging = false;
 static uint32_t  g_staging_t0 = 0;
 static uint32_t  g_cap_ms  = 2000;
+snap_done_fn snap_done_cb = 0;
 
 static void push_ring(uint32_t t_us, int64_t counts, uint32_t idx) {
     SnapPoint *p = &g_ring[g_ring_w];
-    p->t_us=t_us; p->counts=counts; p->index_n=idx;
+    p->t_us=t_us; p->counts_lo=(uint32_t)counts; p->counts_hi=(int32_t)(counts>>32); p->index_n=idx;
     g_ring_w = (g_ring_w + 1) % RING_CAP;
     if (g_ring_n < RING_CAP) g_ring_n++;
 }
 static void push_snap(uint32_t t_us, int64_t counts, uint32_t idx) {
     if (g_snap_n < SNAP_CAP) {
         SnapPoint *p = &g_snap[g_snap_n++];
-        p->t_us=t_us; p->counts=counts; p->index_n=idx;
+        p->t_us=t_us; p->counts_lo=(uint32_t)counts; p->counts_hi=(int32_t)(counts>>32); p->index_n=idx;
     }
+}
+static int64_t pt_counts(const SnapPoint *p) {
+    return ((int64_t)p->counts_hi << 32) | (uint32_t)p->counts_lo;
 }
 static void backtrack(void) {
     unsigned int n = (g_ring_n < BACKTRACK_N) ? g_ring_n : BACKTRACK_N;
@@ -38,7 +42,7 @@ static void backtrack(void) {
     for (i = 0; i < n; i++) {
         SnapPoint *p = &g_ring[(start + i) % RING_CAP];
         if (i == 0) base = p->t_us;
-        push_snap(p->t_us - base, p->counts, p->index_n);
+        push_snap(p->t_us - base, pt_counts(p), p->index_n);
     }
     g_ring_n = 0;  /* consumed the ring */
 }
@@ -49,7 +53,7 @@ static void flush_ring(void) {
         SnapPoint *p = &g_ring[rd];
         uint32_t t = p->t_us - g_ring_t0;
         if (g_snap_n == 0) base = t;
-        push_snap(t - base, p->counts, p->index_n);
+        push_snap(t - base, pt_counts(p), p->index_n);
         g_ring_n--;
     }
 }
@@ -109,6 +113,8 @@ void snap_poll(uint32_t rpm) {
         if (ms - g_alive_ms >= SNAP_ALIVE_MS) {
             g_alive = false;
             g_armed = false;   /* done → disarm */
+            if (snap_done_cb && g_snap_n > 0)
+                snap_done_cb((uint32_t)g_snap_n, (uint32_t)(g_snap_n * 16u));
         }
     }
 }
@@ -118,6 +124,17 @@ bool snap_dump_ready(void){ return snap_done(); }
 bool snap_full(void)      { return g_snap_n >= SNAP_CAP; }
 uint32_t snap_data_bytes(void){ return (uint32_t)(g_snap_n * 16U); }
 const unsigned char *snap_data(void) { return (const unsigned char *)g_snap; }
+
+/* C28x 内存 word 寻址：uchar* 步进=16 位。逐 word 拆分导出字节流（协议小端序） */
+void snap_dump_stream(snap_byte_fn out) {
+    const uint16_t *w = (const uint16_t *)g_snap;
+    uint32_t i, nw = g_snap_n * 8u;   /* 每点 8 words = 16 字节 */
+    for (i = 0; i < nw; i++) {
+        uint16_t wd = w[i];
+        out((unsigned char)(wd & 0xFFu));
+        out((unsigned char)(wd >> 8));
+    }
+}
 void snap_set_ms(uint32_t ms) { g_cap_ms = ms; }
 void snap_force_done(void) { g_recording=false; g_alive=true; g_alive_ms=0; }
 uint32_t snap_remain_ms(void) {

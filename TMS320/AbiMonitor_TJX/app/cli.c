@@ -3,6 +3,7 @@
 #include "eqep_abi.h"
 #include "speed_est.h"
 #include "snap_bin.h"
+#include "bsp_motor_hallencoder.h"
 #include "fatfs/diskio.h"
 #include "board.h"
 #include "driverlib.h"
@@ -48,6 +49,19 @@ void cli_put_raw_bytes(const unsigned char *buf, uint32_t len)
         SCI_writeCharArray(CLI_SCI_BASE, &dat, 1);
     }
 }
+
+/* DUMP BIN 点阵导出回调：发送字节 + 累计 CRC32（与发送流同源） */
+static uint32_t g_dump_crc = 0xFFFFFFFFUL;
+void cli_dump_byte(uint8_t b)
+{
+    uint16_t dat = (uint16_t)b;
+    SCI_writeCharArray(CLI_SCI_BASE, &dat, 1);
+    g_dump_crc ^= b;
+    uint32_t i;
+    for (i = 0; i < 8; i++)
+        g_dump_crc = (g_dump_crc >> 1) ^ ((g_dump_crc & 1u) ? 0xEDB88320UL : 0UL);
+}
+uint32_t cli_dump_crc_get(void) { return ~g_dump_crc; }
 
 // ---- RX 环形缓冲区（ISR 写入，主循环读取） ----
 #define CLI_RX_BUF_SIZE 128
@@ -238,11 +252,21 @@ static void cli_handle(char *line)
             hdr[2]=(uint8_t)(magic>>16); hdr[3]=(uint8_t)(magic>>24);
             hdr[4]=(uint8_t)n; hdr[5]=(uint8_t)(n>>8);
             hdr[6]=(uint8_t)hz; hdr[7]=(uint8_t)(hz>>8);
-            crc = snap_crc32(snap_data(), snap_data_bytes());
             cli_put_raw_bytes(pre, 11);
             cli_put_raw_bytes(hdr, 8);
-            cli_put_raw_bytes(snap_data(), snap_data_bytes());
-            cli_put_raw_bytes((const unsigned char *)&crc, 4);
+            /* 逐字节发送点阵并同步累计 CRC（C28x word 寻址：必须与发送同一字节流） */
+            g_dump_crc = 0xFFFFFFFFUL;
+            snap_dump_stream(cli_dump_byte);
+            crc = cli_dump_crc_get();
+            /* CRC 字段同样需拆 word（uchar* 步进=16 位，不可直接遍历 uint32） */
+            {
+                unsigned char crc_b[4];
+                crc_b[0] = (unsigned char)(crc & 0xFFu);
+                crc_b[1] = (unsigned char)((crc >> 8) & 0xFFu);
+                crc_b[2] = (unsigned char)((crc >> 16) & 0xFFu);
+                crc_b[3] = (unsigned char)((crc >> 24) & 0xFFu);
+                cli_put_raw_bytes(crc_b, 4);
+            }
             cli_printf("# BIN END %lu\n", (unsigned long)n);
         }
     }
@@ -263,6 +287,19 @@ static void cli_handle(char *line)
                    (unsigned long)abi_iel_dbg(),
                    (int)abi_gear(),
                    (unsigned long)abi_last_period_us());
+    }
+    else if (strncmp(line, "MOTOR", 5) == 0)
+    {
+        int m = 0, s = 0;
+        if (sscanf(line + 5, "%d %d", &m, &s) == 2)
+        {
+            Motor_Set_PWM((uint8_t)m, (uint16_t)s);
+            cli_put_raw("# MOTOR ok\n");
+        }
+        else
+        {
+            cli_put_raw("# MOTOR <dir 1/2> <spd 0-9999>\n");
+        }
     }
     else if (strcmp(line, "HELP") == 0)
     {

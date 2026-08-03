@@ -39,6 +39,13 @@ static int32_t  g_pi_int    = 0;
 static uint16_t pi_target_rpm = 0;
 static uint8_t  g_seq_done  = 0;   // 全部科目跑完 → 停止电机，不再循环
 
+/* SNAP 数据就绪（ALIVE 结束）→ 主动推 # SNAP done=1（ESP32 兼容事件） */
+static void snap_done_evt(uint32_t n, uint32_t bytes)
+{
+    cli_printf("# SNAP n=%lu bytes=%lu armed=0 rec=0 alive=0 done=1\n",
+               (unsigned long)n, (unsigned long)bytes);
+}
+
 // PID 闭环：调整脉宽档位使实际转速逼近目标 RPM (feedback from UTO speed_est)
 static void Motor_CloseLoop(uint32_t tick)
 {
@@ -93,12 +100,12 @@ void main(void)
     abi_init();
     spd_init();
     snap_alloc();
+    snap_done_cb = snap_done_evt;
     g_seq_start = g_tick_1khz;
 
     while(1)
     {
-        // Motor always off (closed-loop test disabled for clean snap test)
-        Motor_Set_PWM(1, 0);
+        // Motor state kept by CLI (MOTOR <dir> <spd> / MOTOR 0 0 to stop)
 
         /* Minimal 1Hz status line */
         static uint32_t dbg_tick = 0;
