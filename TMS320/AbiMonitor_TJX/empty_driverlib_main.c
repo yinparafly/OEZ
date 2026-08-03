@@ -109,7 +109,7 @@ void main(void)
 
         /* Minimal 1Hz status line */
         static uint32_t dbg_tick = 0;
-        if (g_tick_1khz - dbg_tick >= 1000) {
+        if (!g_dump_active && g_tick_1khz - dbg_tick >= 1000) {
             dbg_tick = g_tick_1khz;
             uint32_t rpm = spd_rpm();
             lc_printf("RPM=[%lu] SNAP=[%u/%u]\r\n",
@@ -123,7 +123,7 @@ void main(void)
            L,rpm.x,dir,armed,phase,remain,log_n
            phase: 0=idle 2=recording；remain=剩余记录 ms */
         static uint32_t l_tick = 0;
-        if (g_tick_1khz - l_tick >= 100) {
+        if (!g_dump_active && g_tick_1khz - l_tick >= 100) {
             l_tick = g_tick_1khz;
             uint32_t rpm = spd_rpm();
             int dir = (rpm > 0) ? 1 : 0;

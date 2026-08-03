@@ -13,6 +13,8 @@
 
 #define CLI_SCI_BASE Debug_Serial_BASE
 
+volatile int g_dump_active = 0;
+
 static void cli_putc(char c)
 {
     if (c == '\n')
@@ -230,7 +232,7 @@ static void cli_handle(char *line)
     else if (strcmp(line, "SNAP?") == 0)
     {
         cli_printf("# SNAP n=%u bytes=%lu armed=%d rec=%d alive=%d done=%d\n",
-                   (unsigned)snap_data_bytes()/16, (unsigned long)snap_data_bytes(),
+                   (unsigned)(snap_data_bytes()/16U), (unsigned long)((uint32_t)snap_data_bytes()),
                    snap_armed(), (int)g_recording, (int)g_alive, (int)snap_done());
     }
     else if (strcmp(line, "DUMP BIN") == 0)
@@ -243,6 +245,7 @@ static void cli_handle(char *line)
         }
         else
         {
+            g_dump_active = 1;   /* 帧期间禁止 L 帧/RPM 文本混入 */
             static const unsigned char pre[11] = {0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0x55};
             unsigned char hdr[8];
             uint32_t magic = 0xAB1C0002UL;
@@ -268,6 +271,7 @@ static void cli_handle(char *line)
                 cli_put_raw_bytes(crc_b, 4);
             }
             cli_printf("# BIN END %lu\n", (unsigned long)n);
+            g_dump_active = 0;
         }
     }
     else if (strcmp(line, "SPD?") == 0)

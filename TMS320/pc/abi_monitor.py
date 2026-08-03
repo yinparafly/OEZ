@@ -207,7 +207,7 @@ def recompute_rows_rpm_from_counts(
     for r, rpm in zip(rows, rpms):
         direc = 1 if rpm > 0.5 else (-1 if rpm < -0.5 else 0)
         lst = list(r)
-        lst[1] = float(rpm)
+        lst[1] = abs(float(rpm))
         if len(lst) > 2:
             lst[2] = direc
         out.append(tuple(lst))
@@ -220,7 +220,7 @@ def _points_to_rows_v1(payload: bytes, n: int) -> list[tuple]:
         t_us, rpm_x10, direc, _pad, index_n = struct.unpack_from(
             _SNAP_FMT_V1, payload, i * SNAP_POINT_SIZE_V1
         )
-        rows.append((t_us / 1000.0, rpm_x10 / 10.0, int(direc), 1, int(index_n), 0, 0))
+        rows.append((t_us / 1000.0, abs(rpm_x10 / 10.0), int(direc), 1, int(index_n), 0, 0))
     return rows
 
 
@@ -246,7 +246,7 @@ def _points_to_rows_v2(
     for i in range(n):
         rpm = rpms[i]
         direc = 1 if rpm > 0.5 else (-1 if rpm < -0.5 else 0)
-        rows.append((t_list[i] / 1000.0, rpm, direc, 1, idx_list[i], 0, 0, c_list[i]))
+        rows.append((t_list[i] / 1000.0, abs(rpm), direc, 1, idx_list[i], 0, 0, c_list[i]))
     return rows
 
 
@@ -1891,7 +1891,7 @@ class App(tk.Tk):
             self.play_i += 1
             self.var_rpm.set(f"{rpm:.1f}")
             self.var_dir.set(
-                "正转 +" if direction > 0 else ("反转 −" if direction < 0 else "静止")
+                "顺时针" if direction > 0 else ("逆时针" if direction < 0 else "静止")
             )
             if unix > 0:
                 ts = datetime.fromtimestamp(unix / 1000.0).strftime("%H:%M:%S.%f")[:-3]
@@ -2771,7 +2771,7 @@ class App(tk.Tk):
                 return
             self.var_rpm.set(f"{rpm:.1f}")
             self.var_dir.set(
-                "正转 +" if direction > 0 else ("反转 −" if direction < 0 else "静止")
+                "顺时针" if direction > 0 else ("逆时针" if direction < 0 else "静止")
             )
             # 监控记录中 UI 只做极简更新
             if armed and phase in (1, 2):

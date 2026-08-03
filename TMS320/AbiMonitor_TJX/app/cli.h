@@ -14,4 +14,7 @@ void cli_put_raw(const char *s);
 void cli_printf(const char *fmt, ...);
 void cli_put_raw_bytes(const unsigned char *buf, uint32_t len);
 
+/* 非零时禁止文本输出（DUMP BIN 二进制帧期间置位） */
+extern volatile int g_dump_active;
+
 #endif

@@ -12,14 +12,14 @@ volatile uint32_t g_us_tick_snap = 0;
 
 void abi_clock_tick(void) {
     g_us64 += 1000;
-    g_us_tick_snap = HWREG(myCPUTIMER0_BASE + CPUTIMER_O_TCR);
+    g_us_tick_snap = HWREG(myCPUTIMER0_BASE + CPUTIMER_O_TIM);   /* 递减计数在 TIM（TCR 是控制位） */
 }
 
 uint64_t abi_now_us(void) {
     uint64_t base;
     uint32_t cnt, elap;
     base = g_us64;
-    cnt  = HWREG(myCPUTIMER0_BASE + CPUTIMER_O_TCR);
+    cnt  = HWREG(myCPUTIMER0_BASE + CPUTIMER_O_TIM);
     if (cnt <= g_us_tick_snap)
         elap = g_us_tick_snap - cnt;
     else

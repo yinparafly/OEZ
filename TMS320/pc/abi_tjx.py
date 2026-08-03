@@ -58,7 +58,7 @@ def parse_snap_bindump(raw: bytes, steps: int = 4000):
     for i in range(n):
         rpm = rpms[i]
         direc = 1 if rpm > 0.5 else (-1 if rpm < -0.5 else 0)
-        rows.append((t_list[i] / 1000.0, rpm, direc, 1, idx_list[i], 0, 0, c_list[i]))
+        rows.append((t_list[i] / 1000.0, abs(rpm), direc, 1, idx_list[i], 0, 0, c_list[i]))
     return n, hz, rows
 
 def parse_bin_frame(buf: bytes):

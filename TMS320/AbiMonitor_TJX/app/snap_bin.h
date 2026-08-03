@@ -4,9 +4,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define SNAP_CAP      600
-#define RING_CAP      300
-#define BACKTRACK_N   100
+#define SNAP_CAP      4400
+#define RING_CAP      600
+#define BACKTRACK_N   400
 #define SNAP_STEPS    4000
 
 /* ESP32 v2 16B 点格式（紧凑布局，全 4B 成员保证无 padding）：

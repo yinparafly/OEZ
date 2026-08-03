@@ -84,6 +84,28 @@ ESP32 工程（`D:\oezcon\mcoder\ESP32_AS5047P_ABI_Monitor\`）只读，仅作�
 
 ---
 
+
+### 2026-08-03：端到端打通 → 三个真实 bug 修复（全链路 CRC 验证通过）
+- **背景**：8-02 晚已能构建烧录，但 DUMP BIN 一直 CRC 不匹配、SNAP? 显示 n=304/4400 混乱。
+- **定位过程（数据驱动）**：
+  1. 先疑 L 帧混入 DUMP 字节流（加 g_dump_active 保护帧期间禁文本）——**不是根因但保留**（防 70KB 帧期间主循环文本输出）。
+  2. 加 DBG 打印（ALLOC/TRIG/CAP/ALIVEOUT）实测状态机 → 记录完整（TRIG→CAP 2000ms→ALIVEOUT），**记录本身正常**。
+  3. 暴力搜索点阵长度：crc 字段位置读出的"值"= 相邻点的 t_us（0x24FCE→0x251C2 步进 500µs）→
+     **点阵实际发送 4400 点，而 hdr 写 n=304**。
+- **根因（C28x 16 位整数陷阱）**：`g_snap_n * 16U` 中 `g_snap_n` 是 `unsigned int`（**C28x 为 16 位**），
+  4400×16 = 70400 → **截断为 4864**（mod 65536）→ SNAP? 与 DUMP hdr 都显示/写入 n=304；
+  `snap_dump_stream` 用 `* 8u`（4400×8=35200 不溢出）照常发 4400 点 → **hdr 与点阵不一致 → CRC 永远失败**。
+- **修复**：`(uint32_t)g_snap_n * 16UL`（snap_data_bytes / done_cb）；SNAP? 打印改 `(unsigned)(snap_data_bytes()/16U)`。
+- **最终验证（实测）**：hdr n=4400 hz=2000，**CRC=MATCH**，4400 点，dt_avg=500.006µs（精确 2kHz），
+  rpm_absmax=2197（MOTOR 1 2000 预期）；ARM→转动→自动触发→记录 2000ms→ALIVE→DUMP→PC 解析全通。
+- **时间戳修复确认**：abi_now_us 改读 CPUTIMER_O_TIM 后 t 完美 500µs 递增（此前 TCR 常量 → 1ms 重复）。
+- **方向需求（用户）**：转速永远为正 + 方向（顺时针/逆时针）独立给出；PC 解析层 rpm 取 abs、
+  direc 保留符号，UI 文字改"顺时针/逆时针"（映射负=逆时针，待实测确认，用户自行可调）。
+- **遗留**：counts 恒负（编码器极性，MOTOR 1/2 同向——Motor_Set_PWM 忽略 Mode 只写单路 EPWM1 CMPA）；
+  SD 卡无应答（r1=0xFF）继续挂起；GitHub push 失败（连接重置）待重推。
+- **经验（C28x 专属）**：unsigned int=16 位，任何跨 16 位边界的乘法必须先提升 32 位
+  （`(uint32_t)x * 16UL`），否则静默截断——排查"数值显示异常/校验不匹配"先查字宽。
+
 ## 过程发现的问题（全部记录，供以后项目借鉴）
 
 ### 问题 1（核心）：F28P55x eQEP 捕获单元没有中断

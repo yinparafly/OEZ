@@ -11,19 +11,15 @@ MEMORY
    RAMLS2           : origin = 0x009000, length = 0x000800
    RAMLS3           : origin = 0x009800, length = 0x000800
    RAMLS4           : origin = 0x00A000, length = 0x000800
-   RAMLS5           : origin = 0x00A800, length = 0x000800
-   RAMLS6           : origin = 0x00B000, length = 0x000800
-   RAMLS7           : origin = 0x00B800, length = 0x000800
-   RAMLS8           : origin = 0x014000, length = 0x002000  // When configured as CLA program use the address 0x4000
-   RAMLS9           : origin = 0x016000, length = 0x002000  // When configured as CLA program use the address 0x6000
+    RAMLS5           : origin = 0x00A800, length = 0x000800
+    RAMLS6           : origin = 0x00B000, length = 0x000800
+    RAMLS7           : origin = 0x00B800, length = 0x000800
 
-   // RAMLS8_CLA    : origin = 0x004000, length = 0x002000  // Use only if configured as CLA program memory
-   // RAMLS9_CLA    : origin = 0x006000, length = 0x002000  // Use only if configured as CLA program memory
+    RAMGS0A          : origin = 0x00C000, length = 0x001000   /* .text 补区 */
 
-   RAMGS0           : origin = 0x00C000, length = 0x002000
-   RAMGS1           : origin = 0x00E000, length = 0x002000
-   RAMGS2           : origin = 0x010000, length = 0x002000
-   RAMGS3           : origin = 0x012000, length = 0x002000
+    /* RAMGS0B-3 + RAMLS8/9 物理连续（0xD000-0x17FFF，无洞），合并为连续数据区
+       .bss 是 blocked section（EABI 结构体页对齐优化），必须整段放入连续内存 */
+    RAMDATA          : origin = 0x00D000, length = 0x00B000
 
    /* Flash Banks (128 sectors each) */
    FLASH_BANK0     : origin = 0x080000, length = 0x20000
@@ -45,29 +41,25 @@ MEMORY
 SECTIONS
 {
    codestart        : > BEGIN
-   .text            : >> RAMLS0 | RAMLS1 | RAMLS2 | RAMLS3 | RAMLS4 | RAMLS5 | RAMLS6 | RAMLS7 | RAMGS0 | RAMGS1
+   .text            : >> RAMLS0 | RAMLS1 | RAMLS2 | RAMLS3 | RAMLS4 | RAMLS5 | RAMLS6 | RAMLS7 | RAMGS0A
    .cinit           : > RAMM0
    .switch          : > RAMM0
    .reset           : > RESET, TYPE = DSECT /* not used, */
 
    .stack           : > RAMM1
 #if defined(__TI_EABI__)
-    .bss             : >> RAMLS5 | RAMLS6 | RAMLS7 | RAMLS8 | RAMLS9 | RAMGS0 | RAMGS1 | RAMGS2
+    .bss             : > RAMDATA
     .bss:output      : > RAMLS3
     .init_array      : > RAMM0
-    .const           : >> RAMGS3
-    .data            : > RAMLS4
-    .sysmem          : > RAMLS4
+    .const           : >> RAMDATA
+    .data            : > RAMDATA
+    .sysmem          : > RAMDATA
 #else
    .pinit           : > RAMM0
    .ebss            : >> RAMLS5 | RAMLS6
    .econst          : > RAMLS5
    .esysmem         : > RAMLS5
 #endif
-
-   ramgs0 : > RAMGS0
-   ramgs1 : > RAMGS1
-   ramgs2 : > RAMGS2
 
     .TI.ramfunc : {} > RAMM0
 
