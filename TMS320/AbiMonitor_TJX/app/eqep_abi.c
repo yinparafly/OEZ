@@ -53,7 +53,8 @@ void abi_init(void)
     g_iel_db  = 0;
     g_prev_us = 0;
 
-    /* Enable UTO, keep IEL. Disable PCM and QDC interrupts */
+    /* Enable UTO, keep IEL. Disable PCM and QDC interrupts.
+       Also clear QPOSCTL — SysConfig writes 0xFFFF (corrupted by cycles=0). */
     EQEP_disableInterrupt(Module_EQEP_BASE,
         EQEP_INT_POS_COMP_MATCH | EQEP_INT_DIR_CHANGE);
     EQEP_enableInterrupt(Module_EQEP_BASE, EQEP_INT_UNIT_TIME_OUT);
@@ -61,7 +62,13 @@ void abi_init(void)
     EQEP_setLatchMode(Module_EQEP_BASE,
         EQEP_LATCH_CNT_READ_BY_CPU | EQEP_LATCH_UNIT_TIME_OUT);
 
+    /* Fix corrupted QPOSCTL: disable PCM compare + clear PCSPW garbage */
+    EALLOW;
+    HWREGH(Module_EQEP_BASE + EQEP_O_QPOSCTL) = 0x0000;
+    EDIS;
+
     /* Disable index reset: keep QPOSCNT monotonic for proper delta calc */
+    EQEP_disableInterrupt(Module_EQEP_BASE, EQEP_INT_DIR_CHANGE);
     EQEP_setPositionCounterConfig(Module_EQEP_BASE, EQEP_POSITION_RESET_MAX_POS, 0xFFFFFFFEu);
 
     g_prev_pos = HWREG(Module_EQEP_BASE + EQEP_O_QPOSCNT);
