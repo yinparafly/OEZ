@@ -112,6 +112,21 @@ void main(void)
         cli_task();
         snap_poll(spd_rpm());
 
+        /* 10Hz L 短帧遥测（ESP32 兼容格式，UI 零解析改动）
+           L,rpm.x,dir,armed,phase,remain,log_n
+           phase: 0=idle 2=recording；remain=剩余记录 ms */
+        static uint32_t l_tick = 0;
+        if (g_tick_1khz - l_tick >= 100) {
+            l_tick = g_tick_1khz;
+            uint32_t rpm = spd_rpm();
+            int dir = (rpm > 0) ? 1 : 0;
+            int armed = snap_armed();
+            int phase = g_recording ? 2 : 0;
+            cli_printf("L,%lu.0,%d,%d,%d,%lu,%u\n",
+                       (unsigned long)rpm, dir, armed, phase,
+                       (unsigned long)snap_remain_ms(), (unsigned)g_snap_n);
+        }
+
         /* LED indicators based on snap state */
         {
             int armed = snap_armed();

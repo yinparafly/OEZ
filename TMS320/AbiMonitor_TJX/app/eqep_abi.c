@@ -76,6 +76,7 @@ void abi_init(void)
 
 int64_t  abi_counts(void)        { return g_counts; }
 uint32_t abi_index_n(void)       { return g_index; }
+void     abi_reset_index(void)   { DINT; g_index = 0; EINT; }
 int      abi_gear(void)          { return ABI_GEAR_4X; }
 void     abi_set_gear(int g)     { (void)g; }
 uint32_t abi_last_period_us(void){ return g_period; }

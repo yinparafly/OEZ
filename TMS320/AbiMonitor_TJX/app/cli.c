@@ -39,6 +39,16 @@ void cli_printf(const char *fmt, ...)
     cli_put_raw(buf);
 }
 
+/* 原始字节输出（不经 \n→\r\n 转换）— 供 DUMP BIN 二进制帧使用 */
+void cli_put_raw_bytes(const unsigned char *buf, uint32_t len)
+{
+    while (len-- > 0)
+    {
+        uint16_t dat = (uint16_t)(*buf++);
+        SCI_writeCharArray(CLI_SCI_BASE, &dat, 1);
+    }
+}
+
 // ---- RX 环形缓冲区（ISR 写入，主循环读取） ----
 #define CLI_RX_BUF_SIZE 128
 static volatile char  cli_rx_buf[CLI_RX_BUF_SIZE];
@@ -162,10 +172,6 @@ static void cli_handle(char *line)
         /* TIME <unix_ms> — set base time for SD filenames */
         cli_put_raw("# TIME stub (SD not active)\n");
     }
-    else if (strcmp(line, "TIME") == 0)
-    {
-        cli_put_raw("# TIME stub\n");
-    }
     else if (strncmp(line, "TIME ", 5) == 0)
     {
         cli_printf("# TIME=%s (stub)\n", line + 5);
@@ -173,10 +179,12 @@ static void cli_handle(char *line)
     else if (strcmp(line, "MONITOR START") == 0)
     {
         snap_alloc();
+        snap_arm();
         cli_put_raw("# ARMED\n");
     }
     else if (strcmp(line, "MONITOR STOP") == 0)
     {
+        snap_disarm();
         snap_force_done();
         cli_put_raw("# STOPPED\n");
     }
@@ -188,11 +196,55 @@ static void cli_handle(char *line)
         if (ms > 0) snap_set_ms(ms);
         cli_printf("# REC MS=%lu\n", ms);
     }
+    else if (strcmp(line, "REC NOW") == 0)
+    {
+        /* 立即完成当前记录（ESP32 直采语义）→ ALIVE → 可 DUMP BIN */
+        snap_force_done();
+        cli_printf("# RECORD done n=%u → ALIVE then SD SAVE\n",
+                   (unsigned)(snap_data_bytes() / 16U));
+    }
+    else if (strcmp(line, "LOG CLEAR") == 0)
+    {
+        snap_alloc();
+        cli_put_raw("# LOG CLEARED\n");
+    }
+    else if (strcmp(line, "REVS CLEAR") == 0)
+    {
+        abi_reset_index();
+        cli_put_raw("# REVS CLEARED\n");
+    }
     else if (strcmp(line, "SNAP?") == 0)
     {
         cli_printf("# SNAP n=%u bytes=%lu armed=%d rec=%d alive=%d done=%d\n",
                    (unsigned)snap_data_bytes()/16, (unsigned long)snap_data_bytes(),
                    snap_armed(), (int)g_recording, (int)g_alive, (int)snap_done());
+    }
+    else if (strcmp(line, "DUMP BIN") == 0)
+    {
+        /* ESP32 v2 兼容 BIN 帧：AA×10+55 + magic + n + hz + 16B 点阵 + crc32 */
+        uint32_t n = snap_data_bytes() / 16U;
+        if (n == 0 || snap_data_bytes() == 0)
+        {
+            cli_put_raw("# SNAP empty\n");
+        }
+        else
+        {
+            static const unsigned char pre[11] = {0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0x55};
+            unsigned char hdr[8];
+            uint32_t magic = 0xAB1C0002UL;
+            uint32_t hz   = 2000UL;
+            uint32_t crc;
+            hdr[0]=(uint8_t)(magic); hdr[1]=(uint8_t)(magic>>8);
+            hdr[2]=(uint8_t)(magic>>16); hdr[3]=(uint8_t)(magic>>24);
+            hdr[4]=(uint8_t)n; hdr[5]=(uint8_t)(n>>8);
+            hdr[6]=(uint8_t)hz; hdr[7]=(uint8_t)(hz>>8);
+            crc = snap_crc32(snap_data(), snap_data_bytes());
+            cli_put_raw_bytes(pre, 11);
+            cli_put_raw_bytes(hdr, 8);
+            cli_put_raw_bytes(snap_data(), snap_data_bytes());
+            cli_put_raw_bytes((const unsigned char *)&crc, 4);
+            cli_printf("# BIN END %lu\n", (unsigned long)n);
+        }
     }
     else if (strcmp(line, "SPD?") == 0)
     {

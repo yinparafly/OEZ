@@ -9,6 +9,7 @@
 void abi_init(void);
 int64_t  abi_counts(void);
 uint32_t abi_index_n(void);
+void     abi_reset_index(void);
 uint64_t abi_now_us(void);
 int      abi_gear(void);
 void     abi_set_gear(int gear);

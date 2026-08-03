@@ -13,6 +13,7 @@ static int64_t   g_ring_last_c = 0;
 static bool      g_ring_ok = false;
 bool      g_recording = false;
 bool      g_alive = false;
+static bool      g_armed  = false;
 static uint32_t  g_alive_ms = 0;
 static bool      g_staging = false;
 static uint32_t  g_staging_t0 = 0;
@@ -58,7 +59,9 @@ bool snap_alloc(void) {
     g_recording=false; g_alive=false; g_staging=false;
     return true;
 }
-int  snap_armed(void) { return g_staging||g_recording||g_alive; }
+void snap_arm(void)   { g_armed = true; }
+void snap_disarm(void){ g_armed = false; }
+int  snap_armed(void) { return g_armed || g_staging || g_recording || g_alive; }
 
 void snap_on_event(uint32_t t_us, int64_t counts, uint32_t idx) {
     if (!g_ring_ok) { g_ring_t0=t_us; g_ring_last_c=counts; g_ring_ok=true; }
@@ -105,6 +108,7 @@ void snap_poll(uint32_t rpm) {
     if (g_alive && !g_recording) {
         if (ms - g_alive_ms >= SNAP_ALIVE_MS) {
             g_alive = false;
+            g_armed = false;   /* done → disarm */
         }
     }
 }
@@ -116,6 +120,11 @@ uint32_t snap_data_bytes(void){ return (uint32_t)(g_snap_n * 16U); }
 const unsigned char *snap_data(void) { return (const unsigned char *)g_snap; }
 void snap_set_ms(uint32_t ms) { g_cap_ms = ms; }
 void snap_force_done(void) { g_recording=false; g_alive=true; g_alive_ms=0; }
+uint32_t snap_remain_ms(void) {
+    if (!g_recording) return 0;
+    uint32_t el = spd_abs_ms() - g_alive_ms;
+    return (el < g_cap_ms) ? (g_cap_ms - el) : 0;
+}
 
 uint32_t snap_crc32(const unsigned char *buf, uint32_t len) {
     uint32_t crc = 0xFFFFFFFFu; uint32_t i, j;

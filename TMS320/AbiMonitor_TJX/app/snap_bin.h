@@ -19,6 +19,8 @@ typedef struct {
 
 bool snap_alloc(void);
 void snap_free(void);
+void snap_arm(void);
+void snap_disarm(void);
 int  snap_armed(void);
 
 /* Called from 2kHz UTO ISR — push point to ring buffer */
@@ -35,6 +37,7 @@ uint32_t snap_data_bytes(void);
 const unsigned char *snap_data(void);
 void     snap_set_ms(uint32_t ms);
 void     snap_force_done(void);
+uint32_t snap_remain_ms(void);
 
 /* CLI debugging */
 extern unsigned int g_snap_n;
