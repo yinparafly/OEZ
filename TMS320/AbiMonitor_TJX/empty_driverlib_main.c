@@ -97,39 +97,8 @@ void main(void)
 
     while(1)
     {
-        // 闭环测试序列状态机（由 1kHz 节拍驱动，跑完即停，不循环）
-        // 状态 0/2/4 = 停 5s，状态 1/3 = 斜坡启动+闭环锁定目标 RPM 20s
-        {
-            uint32_t t = g_tick_1khz;
-            if (!g_seq_done && g_seq_state % 2 == 0) {
-                Motor_Set_PWM(1, 0);
-                if (t - g_seq_start >= 5000) {
-                    g_seq_state++; g_seq_start = t;
-                    g_speed = 0; g_pi_int = 0;
-                    g_ctrl_tick = t; g_ramp_tick = t;
-                }
-            } else if (!g_seq_done) {
-                uint8_t idx = (uint8_t)((g_seq_state - 1) / 2);
-                if (idx < SEQ_TARGET_CNT) {
-                    pi_target_rpm = g_seq_targets[idx];
-                    Motor_CloseLoop(t);
-                    Motor_Set_PWM(1, g_speed);
-                    if (t - g_seq_start >= 20000) {
-                        Motor_Set_PWM(1, 0);
-                        if (idx + 1 >= SEQ_TARGET_CNT) {
-                            g_seq_done = 1;   // 全部科目完成：停机保持
-                        } else {
-                            g_seq_state++;
-                        }
-                        g_seq_start = t;
-                    }
-                } else {
-                    g_seq_state = 0; g_seq_start = t;
-                }
-            } else {
-                Motor_Set_PWM(1, 0);   // 测试完成：电机保持停止
-            }
-        }
+        // Motor always off (closed-loop test disabled for clean snap test)
+        Motor_Set_PWM(1, 0);
 
         /* Minimal 1Hz status line */
         static uint32_t dbg_tick = 0;
