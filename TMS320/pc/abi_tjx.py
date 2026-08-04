@@ -1,8 +1,8 @@
 import re, struct
 SNAP_PREAMBLE = b"\xAA" * 10 + b"\x55"
-SNAP_MAGIC_V2 = 0xAB1C0002
-SNAP_POINT_SIZE_V2 = 16
-SNAP_POINT_FMT = "<IqI"          # t_us u32, counts i64, index_n u32 (LE)
+SNAP_MAGIC_V3 = 0xAB1C0003
+SNAP_POINT_SIZE_V3 = 20
+SNAP_POINT_FMT = "<IqIi"          # t_us u32, counts i64, index_n u32, event_rpm i32 (LE)
 
 def snap_crc32(data: bytes) -> int:
     crc = 0xFFFFFFFF
@@ -39,26 +39,28 @@ def parse_snap_bindump(raw: bytes, steps: int = 4000):
     if len(raw) < 12:
         raise ValueError(f"bin too short: {len(raw)}")
     magic, n, hz = struct.unpack_from("<IHH", raw, 0)
-    if magic != SNAP_MAGIC_V2:
-        raise ValueError(f"bad magic 0x{magic:08X}")
-    need = 8 + n * SNAP_POINT_SIZE_V2 + 4
+    if magic != SNAP_MAGIC_V3:
+        raise ValueError(f"bad magic 0x{magic:08X} expected 0x{SNAP_MAGIC_V3:08X}")
+    need = 8 + n * SNAP_POINT_SIZE_V3 + 4
     if len(raw) < need:
         raise ValueError(f"bin len {len(raw)} < need {need}")
-    payload = raw[8:8 + n * SNAP_POINT_SIZE_V2]
-    (crc,) = struct.unpack_from("<I", raw, 8 + n * SNAP_POINT_SIZE_V2)
+    payload = raw[8:8 + n * SNAP_POINT_SIZE_V3]
+    (crc,) = struct.unpack_from("<I", raw, 8 + n * SNAP_POINT_SIZE_V3)
     got = snap_crc32(payload)
     if got != crc:
         raise ValueError(f"CRC mismatch got=0x{got:08X} expect=0x{crc:08X}")
-    t_list, c_list, idx_list = [], [], []
+    t_list, c_list, idx_list, erpm_list = [], [], [], []
     for i in range(n):
-        t_us, counts, index_n = struct.unpack_from(SNAP_POINT_FMT, payload, i * SNAP_POINT_SIZE_V2)
+        t_us, counts, index_n, event_rpm = struct.unpack_from(SNAP_POINT_FMT, payload, i * SNAP_POINT_SIZE_V3)
         t_list.append(int(t_us)); c_list.append(int(counts)); idx_list.append(int(index_n))
+        erpm_list.append(int(event_rpm))
     rpms = rpm_from_counts_series(t_list, c_list, steps=steps)
     rows = []
     for i in range(n):
         rpm = rpms[i]
         direc = 1 if rpm > 0.5 else (-1 if rpm < -0.5 else 0)
-        rows.append((t_list[i] / 1000.0, abs(rpm), direc, 1, idx_list[i], 0, 0, c_list[i]))
+        rows.append((t_list[i] / 1000.0, abs(rpm), direc, 1, idx_list[i],
+                     0, 0, c_list[i], erpm_list[i]))
     return n, hz, rows
 
 def parse_bin_frame(buf: bytes):

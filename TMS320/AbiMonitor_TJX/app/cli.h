@@ -17,4 +17,8 @@ void cli_put_raw_bytes(const unsigned char *buf, uint32_t len);
 /* 非零时禁止文本输出（DUMP BIN 二进制帧期间置位） */
 extern volatile int g_dump_active;
 
+/* 电机活动标志：MOTOR <dir> <spd> 置 1；MOTOR 0 0 / 看门狗停机 清 0。
+   main 看门狗用（PWM 活动但 0.5s 无编码器事件 → 停机） */
+extern volatile uint32_t g_motor_active;
+
 #endif

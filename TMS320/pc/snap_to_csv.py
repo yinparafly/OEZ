@@ -66,6 +66,7 @@ def main() -> int:
                 "S_rpm_integ",
                 "I0",
                 "length_per_I",
+                "event_rpm",
             ]
         )
         for i, r in enumerate(rows):
@@ -81,6 +82,7 @@ def main() -> int:
                     f"{s_rpm[i][2]:.6f}",
                     i0,
                     args.len_i,
+                    int(r[8]) if len(r) > 8 else 0,
                 ]
             )
     s_end = series[-1][2] if series else 0.0

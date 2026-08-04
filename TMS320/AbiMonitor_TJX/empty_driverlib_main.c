@@ -30,14 +30,15 @@ static const uint16_t g_seq_targets[SEQ_TARGET_CNT] = { 1500u, 2000u };  // 目�
 #define SEQ_ADJ_MAX    100u          // 闭环单次最大调整
 #define SEQ_SPD_MIN    800u
 #define SEQ_SPD_MAX    9000u
-static uint8_t  g_seq_state = 0;
+static uint8_t  g_seq_state = 0;       /* 0=idle 1=ramp 2=hold 3=stop_wait 4=done */
 static uint32_t g_seq_start = 0;
 static uint32_t g_ctrl_tick = 0;
 static uint32_t g_ramp_tick = 0;
 static uint16_t g_speed     = 0;
 static int32_t  g_pi_int    = 0;
 static uint16_t pi_target_rpm = 0;
-static uint8_t  g_seq_done  = 0;   // 全部科目跑完 → 停止电机，不再循环
+static uint8_t  g_seq_done  = 0;       /* 全部科目跑完 → 停止电机，不再循环 */
+static uint8_t  g_seq_idx   = 0;       /* 当前科目序号 0..SEQ_TARGET_CNT-1 */
 
 /* SNAP 数据就绪（ALIVE 结束）→ 主动推 # SNAP done=1（ESP32 兼容事件） */
 static void snap_done_evt(uint32_t n, uint32_t bytes)
@@ -119,6 +120,16 @@ void main(void)
         cli_task();
         snap_poll(spd_rpm());
 
+        /* 400Hz 闭环节拍（每 2ms，spec §4.3a-D1）：
+           仅在无手动 MOTOR 且序列未完成时驱动闭环测试。 */
+        {
+            static uint32_t s_cl_tick = 0;
+            if (g_tick_1khz - s_cl_tick >= 2) {
+                s_cl_tick = g_tick_1khz;
+                seq_tick_400hz(s_cl_tick);
+            }
+        }
+
         /* 10Hz L 短帧遥测（ESP32 兼容格式，UI 零解析改动）
            L,rpm.x,dir,armed,phase,remain,log_n
            phase: 0=idle 2=recording；remain=剩余记录 ms */
@@ -132,6 +143,68 @@ void main(void)
             cli_printf("L,%lu.0,%d,%d,%d,%lu,%u\n",
                        (unsigned long)rpm, dir, armed, phase,
                        (unsigned long)snap_remain_ms(), (unsigned)g_snap_n);
+
+            /* 电机安全看门狗：MOTOR 命令了转动，但最近 0.5s 无编码器事件 → 停机
+               （防堵转/断线/脱耦；u32 回绕安全——间隔 < 2^31µs ≈ 35min）。 */
+            if (g_motor_active) {
+                uint32_t now_us = (uint32_t)(abi_now_us() & 0xFFFFFFFFuL);
+                uint32_t gap = now_us - abi_last_event_us();
+                if (gap > 500000u) {
+                    Motor_Set_PWM(1, 0);
+                    g_motor_active = 0;
+    }
+}
+
+/* 400Hz 抽取 + 闭环序列状态机（spec v3.1 §4.3b，Task 3）
+   主循环每约 2.5ms 调用一次；回退到 500ms 时视为闭环低速扫描。 */
+static void seq_tick_400hz(uint32_t tick)
+{
+    if (g_seq_done || g_motor_active)
+        return;   /* 序列已完成 或 CLI MOTOR 手动接管 */
+
+    switch (g_seq_state) {
+    case 0: /* idle → start */
+        g_seq_state = 1;
+        g_seq_start = tick;
+        g_seq_idx   = 0;
+        g_speed     = 0;
+        g_pi_int    = 0;
+        Motor_Set_PWM(1, 0);
+        break;
+    case 1: /* ramp: 斜坡加速到目标 */
+        pi_target_rpm = g_seq_targets[g_seq_idx];
+        Motor_CloseLoop(tick);
+        if (g_speed >= pi_target_rpm - 50u) {
+            g_seq_state = 2;
+            g_seq_start = tick; /* hold start */
+        }
+        break;
+    case 2: /* hold: 闭环稳定保持 */
+        Motor_CloseLoop(tick);
+        if (tick - g_seq_start >= SEQ_HOLD_MS * 1000u / 400u) {
+            g_seq_state = 3;
+            g_seq_start = tick;
+            Motor_Set_PWM(1, 0);  /* 停止 */
+            g_speed = 0;
+            g_pi_int = 0;
+        }
+        break;
+    case 3: /* stop_wait: 科目间停机 */
+        if (tick - g_seq_start >= SEQ_STOP_MS * 1000u / 400u) {
+            g_seq_idx++;
+            if (g_seq_idx >= SEQ_TARGET_CNT) {
+                g_seq_state = 4;
+                g_seq_done  = 1;
+            } else {
+                g_seq_state = 1;  /* ramp next target */
+                g_seq_start = tick;
+            }
+        }
+        break;
+    default: /* done: nothing */
+        break;
+    }
+}
         }
 
         /* LED indicators based on snap state */

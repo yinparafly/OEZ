@@ -14,6 +14,7 @@
 #define CLI_SCI_BASE Debug_Serial_BASE
 
 volatile int g_dump_active = 0;
+volatile uint32_t g_motor_active = 0;   /* 电机活动标志（见 cli.h） */
 
 static void cli_putc(char c)
 {
@@ -217,7 +218,7 @@ static void cli_handle(char *line)
         /* 立即完成当前记录（ESP32 直采语义）→ ALIVE → 可 DUMP BIN */
         snap_force_done();
         cli_printf("# RECORD done n=%u → ALIVE then SD SAVE\n",
-                   (unsigned)(snap_data_bytes() / 16U));
+                   (unsigned)(snap_data_bytes() / 20U));
     }
     else if (strcmp(line, "LOG CLEAR") == 0)
     {
@@ -232,13 +233,13 @@ static void cli_handle(char *line)
     else if (strcmp(line, "SNAP?") == 0)
     {
         cli_printf("# SNAP n=%u bytes=%lu armed=%d rec=%d alive=%d done=%d\n",
-                   (unsigned)(snap_data_bytes()/16U), (unsigned long)((uint32_t)snap_data_bytes()),
+                   (unsigned)(snap_data_bytes()/20U), (unsigned long)((uint32_t)snap_data_bytes()),
                    snap_armed(), (int)g_recording, (int)g_alive, (int)snap_done());
     }
     else if (strcmp(line, "DUMP BIN") == 0)
     {
-        /* ESP32 v2 兼容 BIN 帧：AA×10+55 + magic + n + hz + 16B 点阵 + crc32 */
-        uint32_t n = snap_data_bytes() / 16U;
+        /* v3 20B BIN 帧：AA×10+55 + magic + n + hz + 20B 点阵 (t_us+counts+index_n+event_rpm) + crc32 */
+        uint32_t n = snap_data_bytes() / 20U;
         if (n == 0 || snap_data_bytes() == 0)
         {
             cli_put_raw("# SNAP empty\n");
@@ -248,7 +249,7 @@ static void cli_handle(char *line)
             g_dump_active = 1;   /* 帧期间禁止 L 帧/RPM 文本混入 */
             static const unsigned char pre[11] = {0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0xAA,0x55};
             unsigned char hdr[8];
-            uint32_t magic = 0xAB1C0002UL;
+            uint32_t magic = 0xAB1C0003UL;
             uint32_t hz   = 2000UL;
             uint32_t crc;
             hdr[0]=(uint8_t)(magic); hdr[1]=(uint8_t)(magic>>8);
@@ -276,21 +277,61 @@ static void cli_handle(char *line)
     }
     else if (strcmp(line, "SPD?") == 0)
     {
-        cli_printf("# RPM=%lu gear=%d ms=%lu\n", (unsigned long)spd_rpm(), spd_gear(), (unsigned long)spd_abs_ms());
+        cli_printf("# RPM=%lu gear=%d ms=%lu qupr=%lu\n",
+                   (unsigned long)spd_rpm(), spd_gear(),
+                   (unsigned long)spd_abs_ms(),
+                   (unsigned long)abi_get_current_qupr());
     }
     else if (strcmp(line, "ABI?") == 0)
     {
         DINT;
         int64_t cnt = abi_counts();
         EINT;
-        cli_printf("# ABI cnt=%lld idx=%lu miss=%lu pcm=%lu qdc=%lu iel=%lu g=%d per=%lu\n",
+        cli_printf("# ABI cnt=%lld idx=%lu miss=%lu pcm=%lu qdc=%lu iel=%lu g=%d per=%lu"
+                   " rpm=%ld qupr=%lu idle=%lu sim=%lu div=%lu\n",
                    cnt, (unsigned long)abi_index_n(),
                    (unsigned long)abi_missed_events(),
                    (unsigned long)abi_pcm_dbg(),
                    (unsigned long)abi_qdc_dbg(),
                    (unsigned long)abi_iel_dbg(),
                    (int)abi_gear(),
-                   (unsigned long)abi_last_period_us());
+                   (unsigned long)abi_last_period_us(),
+                   (long)abi_get_latest_rpm(),
+                   (unsigned long)abi_get_current_qupr(),
+                   (unsigned long)abi_get_uto_idle_evt(),
+                   (unsigned long)abi_sim_get(),
+                   (unsigned long)abi_snap_div());
+    }
+    else if (strncmp(line, "SIM", 3) == 0)
+    {
+        /* SIM <k>   软模拟倍频 k（2/4/8…）：rpm/counts 均为假值（等效 k×rpm），
+                     用于验证高速记录管线（电机物理上限 ~5555rpm 之外）。
+           SIM OFF   还原真实信号（K=1），一键回到实机模式。
+           圈数校验注意：counts ÷ 4000 ÷ K = 真实圈数。 */
+        if (strncmp(line, "SIM OFF", 7) == 0)
+        {
+            abi_sim_set(1);
+            cli_put_raw("# SIM OFF (K=1, real)\n");
+        }
+        else if (strncmp(line, "SIM ", 4) == 0)
+        {
+            unsigned long k = 0;
+            const char *p = line + 4;
+            while (*p >= '0' && *p <= '9') { k = k * 10 + (*p - '0'); p++; }
+            if (k >= 2 && k <= 100u)
+            {
+                abi_sim_set((uint32_t)k);
+                cli_printf("# SIM K=%lu (FAKE rpm/counts x%lu)\n", k, k);
+            }
+            else
+            {
+                cli_put_raw("# SIM <k 2..100> | SIM OFF\n");
+            }
+        }
+        else
+        {
+            cli_printf("# SIM K=%lu\n", (unsigned long)abi_sim_get());
+        }
     }
     else if (strncmp(line, "MOTOR", 5) == 0)
     {
@@ -298,6 +339,9 @@ static void cli_handle(char *line)
         if (sscanf(line + 5, "%d %d", &m, &s) == 2)
         {
             Motor_Set_PWM((uint8_t)m, (uint16_t)s);
+            /* 电机活动标志：main 看门狗用它判断"命令了转动"
+               （MOTOR <dir> <spd> 即命令；0/0 或超时停机清除）。 */
+            g_motor_active = ((m != 0) && (s > 0)) ? 1u : 0u;
             cli_put_raw("# MOTOR ok\n");
         }
         else
