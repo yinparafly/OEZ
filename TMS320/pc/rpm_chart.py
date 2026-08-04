@@ -164,10 +164,16 @@ class RpmChart(ttk.Frame):
         return (vx1 - vx0) < (fx1 - fx0) * 0.98
 
     def set_extra_data(self, extras: list[list[float]]) -> None:
-        """每个 series 的点级额外值列表（如 counts），用于角度计算。"""
+        """每个 series 的点级额外值列表（如 counts），用于角度计算。
+        调用方在 set_series 后调用，传入 [[s0_counts], [s1_counts], ...]。
+        _find_nearest 会自动回退到 series[0] 的 counts。"""
         self._extras = extras
 
     # ---- 测量工具（单击选点A+B，算Δt+Δrpm+Δangle） ----
+    # 流程：单击 → _on_measure_click → _data_at_xy(像素→数据) → _find_nearest(最近点)
+    #        → 存 _measure_a，再击存 _measure_b → redraw 绘竖线+标注
+    #        → get_measure_info 返回 Δt/Δrpm/转角/磁极数
+    # 转角公式：Δcounts / 4000(步/圈) * 360° * 7(磁极对)
 
     def _find_nearest(self, tx: float, ty: float) -> tuple[float, float, float]:
         """在已显示的 series 中找最近数据点，返回(t_sec, rpm, counts)。

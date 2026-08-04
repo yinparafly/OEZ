@@ -1749,7 +1749,7 @@ class CurveStudio(tk.Toplevel):
                 mark_out=mark_out,
                 preserve_view=preserve_view,
             )
-            # 测量工具：传 counts 数据用于角度计算
+            # 测量工具：传 counts 数据用于角度计算（Δcounts/4000*360*7）
             extras = p.get("ys_counts")
             if extras:
                 self.chart.set_extra_data([extras])
