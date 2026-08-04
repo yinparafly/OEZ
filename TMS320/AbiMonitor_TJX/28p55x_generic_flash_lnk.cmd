@@ -7,23 +7,12 @@ MEMORY
    RAMM1            : origin = 0x000400, length = 0x000400
 
    RAMLS0           : origin = 0x008000, length = 0x000800
-   RAMLS1           : origin = 0x008800, length = 0x000800
-   RAMLS2           : origin = 0x009000, length = 0x000800
-   RAMLS3           : origin = 0x009800, length = 0x000800
-   RAMLS4           : origin = 0x00A000, length = 0x000800
-   RAMLS5           : origin = 0x00A800, length = 0x000800
-   RAMLS6           : origin = 0x00B000, length = 0x000800
-   RAMLS7           : origin = 0x00B800, length = 0x000800
-   RAMLS8           : origin = 0x014000, length = 0x002000  // When configured as CLA program use the address 0x4000
-   RAMLS9           : origin = 0x016000, length = 0x002000  // When configured as CLA program use the address 0x6000
+   /* RAMLS1-7 连续 14K words，供 .bss/.data/.sysmem */
+   RAMLS17          : origin = 0x008800, length = 0x003800
 
-   // RAMLS8_CLA    : origin = 0x004000, length = 0x002000  // Use only if configured as CLA program memory
-   // RAMLS9_CLA    : origin = 0x006000, length = 0x002000  // Use only if configured as CLA program memory
-
-   RAMGS0           : origin = 0x00C000, length = 0x002000
-   RAMGS1           : origin = 0x00E000, length = 0x002000
-   RAMGS2           : origin = 0x010000, length = 0x002000
-   RAMGS3           : origin = 0x012000, length = 0x002000
+   RAMGS0A          : origin = 0x00C000, length = 0x001000
+   /* GS0B(0xD000)+GS1+GS2+GS3+LS8(CPU1 0x14000)+LS9(CPU1 0x16000) 连续 44K words，供 g_snap */
+   RAMDATA          : origin = 0x00D000, length = 0x00B000
 
    /* Flash Banks (128 sectors each) */
    FLASH_BANK0     : origin = 0x080002, length = 0x1FFFE
@@ -52,22 +41,21 @@ SECTIONS
 
    .stack           : > RAMM1
 #if defined(__TI_EABI__)
-   .bss             : > RAMLS5
-   .bss:output      : > RAMLS3
+   .bss             : > RAMLS17
+   .bss:output      : > RAMLS17
    .init_array      : > FLASH_BANK0, ALIGN(8)
    .const           : > FLASH_BANK0, ALIGN(8)
-   .data            : > RAMLS5  | RAMLS6
-   .sysmem          : > RAMLS4
+   .data            : > RAMLS17
+   .sysmem          : > RAMLS17
 #else
    .pinit           : > FLASH_BANK0, ALIGN(8)
-   .ebss            : >> RAMLS5 | RAMLS6
+   .ebss            : >> RAMLS17
    .econst          : > FLASH_BANK0, ALIGN(8)
-   .esysmem         : > RAMLS5
+   .esysmem         : > RAMLS17
 #endif
 
-   ramgs0 : > RAMGS0
-   ramgs1 : > RAMGS1
-   ramgs2 : > RAMGS2
+   /* event_rpm 快照缓冲 44K words */
+   .snapbuf : > RAMDATA
 
    #if defined(__TI_EABI__)
        .TI.ramfunc : {} LOAD = FLASH_BANK0,

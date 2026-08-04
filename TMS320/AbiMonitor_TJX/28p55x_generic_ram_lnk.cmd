@@ -15,6 +15,8 @@ MEMORY
     RAMLS6           : origin = 0x00B000, length = 0x000800
     RAMLS7           : origin = 0x00B800, length = 0x000800
 
+    RAMLS89          : origin = 0x004000, length = 0x004000   /* LS8+LS9 连续（.bss 补区） */
+
     RAMGS0A          : origin = 0x00C000, length = 0x001000   /* .text 补区 */
 
     /* RAMGS0B-3 + RAMLS8/9 物理连续（0xD000-0x17FFF，无洞），合并为连续数据区
@@ -48,12 +50,13 @@ SECTIONS
 
    .stack           : > RAMM1
 #if defined(__TI_EABI__)
-    .bss             : > RAMDATA
-    .bss:output      : > RAMLS3
+    .snapbuf         : > RAMDATA
+    .bss             : > RAMLS89
+    .bss:output      : > RAMLS89
     .init_array      : > RAMM0
-    .const           : >> RAMDATA
-    .data            : > RAMDATA
-    .sysmem          : > RAMDATA
+    .const           : > RAMLS89
+    .data            : > RAMLS89
+    .sysmem          : > RAMLS89
 #else
    .pinit           : > RAMM0
    .ebss            : >> RAMLS5 | RAMLS6

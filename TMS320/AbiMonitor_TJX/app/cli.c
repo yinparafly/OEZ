@@ -277,10 +277,12 @@ static void cli_handle(char *line)
     }
     else if (strcmp(line, "SPD?") == 0)
     {
-        cli_printf("# RPM=%lu gear=%d ms=%lu qupr=%lu\n",
-                   (unsigned long)spd_rpm(), spd_gear(),
+        cli_printf("# RPM=%ld gear=%d ms=%lu qupr=%lu uto=%lu freq=%lu\n",
+                   (long)spd_rpm(), spd_gear(),
                    (unsigned long)spd_abs_ms(),
-                   (unsigned long)abi_get_current_qupr());
+                   (unsigned long)abi_get_current_qupr(),
+                   (unsigned long)abi_uto_period_us(),
+                   (unsigned long)abi_uto_freq_hz());
     }
     else if (strcmp(line, "ABI?") == 0)
     {
@@ -288,7 +290,7 @@ static void cli_handle(char *line)
         int64_t cnt = abi_counts();
         EINT;
         cli_printf("# ABI cnt=%lld idx=%lu miss=%lu pcm=%lu qdc=%lu iel=%lu g=%d per=%lu"
-                   " rpm=%ld qupr=%lu idle=%lu sim=%lu div=%lu\n",
+                   " rpm=%ld qupr=%lu uto=%lu nom=%lu idle=%lu sim=%lu div=%lu\n",
                    cnt, (unsigned long)abi_index_n(),
                    (unsigned long)abi_missed_events(),
                    (unsigned long)abi_pcm_dbg(),
@@ -298,6 +300,8 @@ static void cli_handle(char *line)
                    (unsigned long)abi_last_period_us(),
                    (long)abi_get_latest_rpm(),
                    (unsigned long)abi_get_current_qupr(),
+                   (unsigned long)abi_uto_period_us(),
+                   (unsigned long)abi_nom_rpm(),
                    (unsigned long)abi_get_uto_idle_evt(),
                    (unsigned long)abi_sim_get(),
                    (unsigned long)abi_snap_div());

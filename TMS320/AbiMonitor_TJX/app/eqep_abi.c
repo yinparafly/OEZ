@@ -207,6 +207,7 @@ void abi_init(void)
     s_uto_idle_evt    = 0;
     s_zero_dc_cnt     = 0;
     s_held_rpm        = 0;
+    s_last_event_us   = (uint32_t)(abi_now_us() & 0xFFFFFFFFuL);   /* 看门狗从"现在"起算 */
 #ifdef DEBUG
     s_isr_dbg_max   = 0;
     s_isr_dbg_sum   = 0;
@@ -232,6 +233,13 @@ uint32_t abi_get_uto_idle_evt(void){ return s_uto_idle_evt; }
 uint32_t abi_get_current_qupr(void){ return s_current_qupr; }
 uint32_t abi_snap_div(void)       { return s_snap_div; }
 uint32_t abi_last_event_us(void)  { return s_last_event_us; }   /* 真实事件时刻 */
+
+/* ---- Task 4 遥测换算：QUPR(150MHz tick) ↔ µs/Hz/nominal rpm ----
+   QUPR 以 SYSCLK(150MHz) 计数：uto_us = QUPR/150，freq_hz = 150MHz/QUPR，
+   nom_rpm = N_MIN×2_250_000/QUPR（当前周期档对应的名义转速）。 */
+uint32_t abi_uto_period_us(void) { return s_current_qupr / 150u; }
+uint32_t abi_uto_freq_hz(void)   { return 150000000u / s_current_qupr; }
+uint32_t abi_nom_rpm(void)       { return (uint32_t)((uint64_t)N_MIN * EQEP_CLK_COEFF / s_current_qupr); }
 
 /* ---- SIM 软模拟倍频接口（spec v3.1 §调试辅助） ----
    K=1 → 还原真实信号（默认值，出厂/实机必为 1）。
@@ -303,9 +311,6 @@ if (has_event) {
                 s_snap_evt_cnt = 0;
                 snap_on_event(us_now, g_counts, g_index, event_rpm); /* 每 div 事件记 1 点 */
             }
-            if (dt_us != 0u)                           /* UTO 周期测量（上轮→本轮） */
-                g_period = dt_us;
-        }
             if (dt_us != 0u)                           /* UTO 周期测量（上轮→本轮） */
                 g_period = dt_us;
         }

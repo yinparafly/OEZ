@@ -1,7 +1,12 @@
 #include "snap_bin.h"
 #include "eqep_abi.h"
 #include "speed_est.h"
+#include "driverlib.h"
 #include <string.h>
+
+/* g_snap 44K words 独占 RAMDATA（linker: .snapbuf > RAMDATA）；
+   其余 .bss（FATFS 等 ~6K words）放 RAMLS89，避免 .bss 总量超 RAM 连续区。 */
+#pragma DATA_SECTION(g_snap, ".snapbuf")
 
 static SnapPoint g_snap[SNAP_CAP];
 unsigned int g_snap_n = 0;

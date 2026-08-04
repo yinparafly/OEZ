@@ -30,19 +30,19 @@ void Encoder_Init(void)
 
 /******************************************************************
  * 函 数 名 称：Motor_Init
- * 函 数 说 明：EPWM1A 输出 50Hz RC 电调信号（1ms 停 / 2ms 全速）
+ * 函 数 说 明：EPWM1A 输出 400Hz RC 电调信号（1ms 停 / 2ms 全速）
  * 函 数 形 参：无
  * 函 数 返 回：无
  * 备       注：SYSCLK=150MHz，TBCLK=150M/64=2.34375MHz
-               TBPRD=46875 -> 50Hz；CMPA: 2343(1ms) ~ 4687(2ms)
-******************************************************************/
+                TBPRD=5859 -> 400Hz；CMPA: 2343(1ms) ~ 4687(2ms)
+ ******************************************************************/
 void Motor_Init(void)
 {
     GPIO_setPinConfig(GPIO_0_EPWM1_A);
     GPIO_setPadConfig(0, GPIO_PIN_TYPE_STD);
 
     EPWM_setClockPrescaler(EPWM1_BASE, EPWM_CLOCK_DIVIDER_64, EPWM_HSCLOCK_DIVIDER_1);
-    EPWM_setTimeBasePeriod(EPWM1_BASE, 46875);
+    EPWM_setTimeBasePeriod(EPWM1_BASE, 5859);
     EPWM_setTimeBaseCounter(EPWM1_BASE, 0);
     EPWM_setCounterCompareShadowLoadMode(EPWM1_BASE,
         EPWM_COUNTER_COMPARE_A, EPWM_COMP_LOAD_ON_CNTR_ZERO);

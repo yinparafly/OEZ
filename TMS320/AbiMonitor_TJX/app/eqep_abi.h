@@ -37,6 +37,16 @@ uint32_t abi_get_uto_idle_evt(void);
 /* 当前实际写入 QUPRD 的周期值（CLI ABI? 调试用） */
 uint32_t abi_get_current_qupr(void);
 
+/* ---- Task 4 遥测换算（spec v3.1 Task 4）----
+ * 均由当前 QUPR 换算（SYSCLK 150MHz）：
+ *   abi_uto_period_us() = 当前 UTO 周期 µs（QUPR/150）
+ *   abi_uto_freq_hz()   = 当前 UTO 刷新频率 Hz（150MHz/QUPR）
+ *   abi_nom_rpm()       = 当前 QUPR 对应的名义转速（N_MIN×2_250_000/QUPR）
+ */
+uint32_t abi_uto_period_us(void);
+uint32_t abi_uto_freq_hz(void);
+uint32_t abi_nom_rpm(void);
+
 /* ---- 记录层事件抽稀（spec v3.1 §记录分级） ----
  * 返回 snap 记录当前档位 div：每 div 个【真实事件】记 1 点。
  *   1=全记  2=隔1记1  4=隔3记1  8=隔7记1  16=隔15记1

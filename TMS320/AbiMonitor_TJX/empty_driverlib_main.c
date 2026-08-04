@@ -30,6 +30,8 @@ static const uint16_t g_seq_targets[SEQ_TARGET_CNT] = { 1500u, 2000u };  // 目�
 #define SEQ_ADJ_MAX    100u          // 闭环单次最大调整
 #define SEQ_SPD_MIN    800u
 #define SEQ_SPD_MAX    9000u
+#define SEQ_HOLD_MS    15000u        /* hold 阶段保持时间 ms */
+#define SEQ_STOP_MS    3000u         /* 科目间停机等待 ms */
 static uint8_t  g_seq_state = 0;       /* 0=idle 1=ramp 2=hold 3=stop_wait 4=done */
 static uint32_t g_seq_start = 0;
 static uint32_t g_ctrl_tick = 0;
@@ -39,6 +41,8 @@ static int32_t  g_pi_int    = 0;
 static uint16_t pi_target_rpm = 0;
 static uint8_t  g_seq_done  = 0;       /* 全部科目跑完 → 停止电机，不再循环 */
 static uint8_t  g_seq_idx   = 0;       /* 当前科目序号 0..SEQ_TARGET_CNT-1 */
+
+static void seq_tick_400hz(uint32_t tick);
 
 /* SNAP 数据就绪（ALIVE 结束）→ 主动推 # SNAP done=1（ESP32 兼容事件） */
 static void snap_done_evt(uint32_t n, uint32_t bytes)
@@ -59,7 +63,7 @@ static void Motor_CloseLoop(uint32_t tick)
     }
     if (tick - g_ctrl_tick >= SEQ_CTRL_MS) {
         g_ctrl_tick = tick;
-        uint32_t rpm_now = spd_rpm();
+        int32_t rpm_now = spd_rpm();
         if (rpm_now > 0) {
             int32_t err = (int32_t)pi_target_rpm - (int32_t)rpm_now;
             g_pi_int += err;
@@ -112,9 +116,9 @@ void main(void)
         static uint32_t dbg_tick = 0;
         if (!g_dump_active && g_tick_1khz - dbg_tick >= 1000) {
             dbg_tick = g_tick_1khz;
-            uint32_t rpm = spd_rpm();
-            lc_printf("RPM=[%lu] SNAP=[%u/%u]\r\n",
-                      (unsigned long)rpm, (unsigned)g_snap_n, (unsigned)SNAP_CAP);
+            int32_t rpm = spd_rpm();
+            lc_printf("RPM=[%ld] SNAP=[%u/%u]\r\n",
+                      (long)rpm, (unsigned)g_snap_n, (unsigned)SNAP_CAP);
         }
 
         cli_task();
@@ -136,12 +140,13 @@ void main(void)
         static uint32_t l_tick = 0;
         if (!g_dump_active && g_tick_1khz - l_tick >= 100) {
             l_tick = g_tick_1khz;
-            uint32_t rpm = spd_rpm();
+            int32_t rpm = spd_rpm();
             int dir = (rpm > 0) ? 1 : 0;
             int armed = snap_armed();
             int phase = g_recording ? 2 : 0;
+            uint32_t rpm_mag = (rpm < 0) ? (uint32_t)(-rpm) : (uint32_t)rpm;
             cli_printf("L,%lu.0,%d,%d,%d,%lu,%u\n",
-                       (unsigned long)rpm, dir, armed, phase,
+                       (unsigned long)rpm_mag, dir, armed, phase,
                        (unsigned long)snap_remain_ms(), (unsigned)g_snap_n);
 
             /* 电机安全看门狗：MOTOR 命令了转动，但最近 0.5s 无编码器事件 → 停机
@@ -152,6 +157,32 @@ void main(void)
                 if (gap > 500000u) {
                     Motor_Set_PWM(1, 0);
                     g_motor_active = 0;
+                }
+            }
+        }
+
+        /* LED indicators based on snap state */
+        {
+            int armed = snap_armed();
+            if (snap_done()) {
+                GPIO_writePin(RGB_B, 0);  /* B on */
+                GPIO_writePin(RGB_G, 0);  /* G on → purple */
+            } else if (g_alive) {
+                GPIO_writePin(RGB_B, 1);
+                GPIO_writePin(RGB_G, 0);  /* G on → green */
+            } else if (g_recording) {
+                static int blip = 0;
+                blip++;
+                GPIO_writePin(RGB_G, blip & 4 ? 0 : 1); /* G flash → recording */
+                GPIO_writePin(RGB_B, 1);
+            } else if (armed) {
+                GPIO_writePin(RGB_B, 0);  /* B on → blue */
+                GPIO_writePin(RGB_G, 1);
+            } else {
+                GPIO_writePin(RGB_B, 1);
+                GPIO_writePin(RGB_G, 1);  /* both off */
+            }
+        }
     }
 }
 
@@ -203,32 +234,6 @@ static void seq_tick_400hz(uint32_t tick)
         break;
     default: /* done: nothing */
         break;
-    }
-}
-        }
-
-        /* LED indicators based on snap state */
-        {
-            int armed = snap_armed();
-            if (snap_done()) {
-                GPIO_writePin(RGB_B, 0);  /* B on */
-                GPIO_writePin(RGB_G, 0);  /* G on → purple */
-            } else if (g_alive) {
-                GPIO_writePin(RGB_B, 1);
-                GPIO_writePin(RGB_G, 0);  /* G on → green */
-            } else if (g_recording) {
-                static int blip = 0;
-                blip++;
-                GPIO_writePin(RGB_G, blip & 4 ? 0 : 1); /* G flash → recording */
-                GPIO_writePin(RGB_B, 1);
-            } else if (armed) {
-                GPIO_writePin(RGB_B, 0);  /* B on → blue */
-                GPIO_writePin(RGB_G, 1);
-            } else {
-                GPIO_writePin(RGB_B, 1);
-                GPIO_writePin(RGB_G, 1);  /* both off */
-            }
-        }
     }
 }
 
