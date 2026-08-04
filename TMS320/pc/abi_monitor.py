@@ -103,18 +103,22 @@ class SegmentRecord:
 
 SNAP_MAGIC_V1 = 0xAB1C0001  # t_us,rpm_x10,dir,pad,index_n (12B) — 旧
 SNAP_MAGIC_V2 = 0xAB1C0002  # t_us,counts,index_n (16B) — 转速由上位机算
-SNAP_MAGIC = SNAP_MAGIC_V2
+SNAP_MAGIC_V3 = 0xAB1C0003  # t_us,counts,index_n,event_rpm (20B) — 双曲线诊断
+SNAP_MAGIC = SNAP_MAGIC_V3
 SNAP_POINT_SIZE_V1 = 12
 SNAP_POINT_SIZE_V2 = 16
-SNAP_POINT_SIZE = SNAP_POINT_SIZE_V2
+SNAP_POINT_SIZE_V3 = 20
+SNAP_POINT_SIZE = SNAP_POINT_SIZE_V3
 SNAP_PREAMBLE = bytes([0xAA] * 10 + [0x55])
 ABI_STEPS_PER_REV = 4000  # C2000 电机编码器 PPR（ESP32 版为 1000）
 # 上位机默认差分窗（与 v39 板端接近；可在曲线工作室再平滑）
 HOST_VEL_WIN = 32
 _SNAP_FMT_V1 = "<IhbBI"
 _SNAP_FMT_V2 = "<IqI"  # t_us u32, counts i64, index_n u32
+_SNAP_FMT_V3 = "<IqIi" # t_us u32, counts i64, index_n u32, event_rpm i32
 assert struct.calcsize(_SNAP_FMT_V1) == SNAP_POINT_SIZE_V1
 assert struct.calcsize(_SNAP_FMT_V2) == SNAP_POINT_SIZE_V2
+assert struct.calcsize(_SNAP_FMT_V3) == SNAP_POINT_SIZE_V3
 
 
 def app_dir() -> Path:
@@ -178,6 +182,34 @@ def rpm_from_counts_series(
             continue
         out[i] = (dc / steps) * (1_000_000.0 / dt) * 60.0
     return out
+
+
+def auto_vel_win(
+    xs: Sequence[float],
+    *,
+    target_ms: float = 5.0,
+    min_win: int = 4,
+    max_win: int = 128,
+) -> int:
+    """根据点间距估算最优速度差分窗（维持 ~target_ms 物理时间窗）。
+
+    xs: 相对秒序列（不要求等间隔，取前 50 点中位 dt）
+    返回: 奇数窗宽, [min_win, max_win]
+    用处: 抽稀后点距变小（高速 dt~136µs → 窗≈37），全记录点距大（低速 dt~500µs → 窗≈9）
+    """
+    n = len(xs)
+    if n < 2:
+        return min_win
+    sample = min(n - 1, 50)
+    dts = sorted(float(xs[i + 1]) - float(xs[i]) for i in range(sample))
+    median_dt = dts[len(dts) // 2]
+    if median_dt <= 1e-12:
+        return min_win
+    target_s = target_ms / 1000.0
+    w = max(min_win, min(max_win, int(target_s / median_dt)))
+    if w % 2 == 0:
+        w = min(max_win, w + 1)  # 奇偶调整后不得越 max_win
+    return w
 
 
 def row_has_counts(row: tuple) -> bool:
@@ -250,11 +282,51 @@ def _points_to_rows_v2(
     return rows
 
 
+def _points_to_rows_v3(
+    payload: bytes,
+    n: int,
+    *,
+    steps: int = ABI_STEPS_PER_REV,
+    vel_win: int = HOST_VEL_WIN,
+) -> list[tuple]:
+    t_list: list[int] = []
+    c_list: list[int] = []
+    idx_list: list[int] = []
+    erpm_list: list[int] = []
+    for i in range(n):
+        t_us, counts, index_n, event_rpm = struct.unpack_from(
+            _SNAP_FMT_V3, payload, i * SNAP_POINT_SIZE_V3
+        )
+        t_list.append(int(t_us))
+        c_list.append(int(counts))
+        idx_list.append(int(index_n))
+        erpm_list.append(int(event_rpm))
+    rpms = rpm_from_counts_series(t_list, c_list, steps=steps, vel_win=vel_win)
+    rows: list[tuple] = []
+    for i in range(n):
+        rpm = rpms[i]
+        direc = 1 if rpm > 0.5 else (-1 if rpm < -0.5 else 0)
+        rows.append((t_list[i] / 1000.0, abs(rpm), direc, 1, idx_list[i],
+                     0, 0, c_list[i], erpm_list[i]))
+    return rows
+
+
 def parse_snap_bindump(raw: bytes) -> tuple[int, int, list[tuple]]:
-    """解析 magic+n+hz+payload+crc（raw 已去掉 preamble）。支持 v1/v2。"""
+    """解析 magic+n+hz+payload+crc（raw 已去掉 preamble）。支持 v1/v2/v3。"""
     if len(raw) < 12:
         raise ValueError(f"bin too short: {len(raw)}")
     magic, n, hz = struct.unpack_from("<IHH", raw, 0)
+    if magic == SNAP_MAGIC_V3:
+        pt = SNAP_POINT_SIZE_V3
+        need = 8 + n * pt + 4
+        if len(raw) < need:
+            raise ValueError(f"bin len {len(raw)} < need {need}")
+        payload = raw[8 : 8 + n * pt]
+        (crc,) = struct.unpack_from("<I", raw, 8 + n * pt)
+        got = snap_crc32(payload)
+        if got != crc:
+            raise ValueError(f"CRC mismatch got=0x{got:08X} expect=0x{crc:08X}")
+        return n, hz, _points_to_rows_v3(payload, n)
     if magic == SNAP_MAGIC_V2:
         pt = SNAP_POINT_SIZE_V2
         need = 8 + n * pt + 4
@@ -291,15 +363,18 @@ def parse_snap_file(raw: bytes) -> tuple[int, int, list[tuple]]:
         raw = raw[len(SNAP_PREAMBLE) :]
     if len(raw) >= 12:
         magic = struct.unpack_from("<I", raw, 0)[0]
-        if magic in (SNAP_MAGIC_V1, SNAP_MAGIC_V2):
+        if magic in (SNAP_MAGIC_V1, SNAP_MAGIC_V2, SNAP_MAGIC_V3):
             return parse_snap_bindump(raw)
+    if len(raw) % SNAP_POINT_SIZE_V3 == 0 and len(raw) >= SNAP_POINT_SIZE_V3:
+        n = len(raw) // SNAP_POINT_SIZE_V3
+        return n, 2000, _points_to_rows_v3(raw, n)
     if len(raw) % SNAP_POINT_SIZE_V2 == 0 and len(raw) >= SNAP_POINT_SIZE_V2:
         n = len(raw) // SNAP_POINT_SIZE_V2
         return n, 2000, _points_to_rows_v2(raw, n)
     if len(raw) % SNAP_POINT_SIZE_V1 == 0 and len(raw) >= SNAP_POINT_SIZE_V1:
         n = len(raw) // SNAP_POINT_SIZE_V1
         return n, 2000, _points_to_rows_v1(raw, n)
-    raise ValueError(f"raw snap size {len(raw)} not multiple of 12 or 16")
+    raise ValueError(f"raw snap size {len(raw)} not multiple of 12, 16 or 20")
 
 
 def filter_snap_rows(
