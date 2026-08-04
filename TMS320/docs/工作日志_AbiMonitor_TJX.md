@@ -106,6 +106,69 @@ ESP32 工程（`D:\oezcon\mcoder\ESP32_AS5047P_ABI_Monitor\`）只读，仅作�
 - **经验（C28x 专属）**：unsigned int=16 位，任何跨 16 位边界的乘法必须先提升 32 位
   （`(uint32_t)x * 16UL`），否则静默截断——排查"数值显示异常/校验不匹配"先查字宽。
 
+### 2026-08-03（续）：尖刺修复 + 安全停机 + event_rpm 双曲线诊断 + 自适应平滑计划
+
+#### 1. 尖刺根因分析与修复（数据驱动）
+- **现象**：CSV 中高速段（4300~5400rpm）出现偶发性尖刺（如 4276→4518rpm），伴有同戳双点。
+- **定位**：`t=434.198` 出现两次，counts 递增但时间戳相同 → PC 差分 dt≈0 → rpm 爆值。
+- **根因**：ISR（UTO→snap_on_event→push_ring）与 main 循环（backtrack/flush_ring）对 ring buffer 并发无锁。
+  抽稀后（div=8）ring 点间隔大（~136µs），backtrack 400 点跨越数十 ms，与 ISR push 竞争 → 部分点时间戳轻微乱序 →
+  flush_ring 兜底 `if (t < prev) t = prev` 制造同戳双点 → PC 端 dt=0 尖刺。
+- **修复**：
+  - `backtrack()` 加 DINT/EINT 临界区保护（`snap_bin.c:47-54`），ISR 暂停期间 QPOSCNT 硬件继续计数，
+    恢复后 ISR 一次性差分处理，不丢位置。
+  - `flush_ring()` 单调兜底从 `t = prev`（等戳）改为 `t = prev + 1`（强制单调，杜绝等戳双点）。
+    即电路学上仍可能有乱序，但绝不会产生 dt=0 → PC 差分安全（`snap_bin.c:66-67`）。
+
+#### 2. 电机安全看门狗
+- **需求**：给了 PWM 但 0.5s 无编码器事件 → 自动停机（防堵转/断线/脱耦）。
+- **实现**：
+  - `eqep_abi.c`：ISR 内 has_event 时记录 `s_last_event_us`，导出 `abi_last_event_us()`。
+  - `cli.c/cli.h`：新增 `g_motor_active` 标志，MOTOR 命令置 1、MOTOR 0 0 / 看门狗停机清 0。
+  - `empty_driverlib_main.c`（待完成）：主循环检测 `g_motor_active && (now - last_evt) > 500ms` → 停机。
+
+#### 3. rpm 波动诊断 + event_rpm 双曲线对比（进行中）
+- **现象**：1200rpm 曲线光滑，5500rpm 持续小毛刺（±几十 rpm 波动）。是真实转速抖动还是计算伪影？
+- **分析**：低速 div=1 每事件记录，时间戳精确；高速 div=8 每 8 事件记录一点，时间抖动被累积放大。
+  两种 RPM 算法对比可确诊：
+  - **counts 差分法**（当前）：`Δcounts / Δt * 系数`，vel_win=16 平滑 → 曲线工作室当前显示。
+  - **period 直算法**（新增）：每个记录点携带 `event_rpm = dpos×15000/dt_us`（ISR 瞬时值）→
+    若两条曲线波动一致 → 真实电机转速抖动；若 period 更平滑 → counts 差分法引入伪影。
+- **实施方案**：SnapPoint 从 16B 扩到 20B（加 `int32_t event_rpm`），BIN 帧 magic→0xAB1C0003。
+  固件/PC 解析器同步更新（详见下方任务清单）。
+  - 臂环预触发段 event_rpm=0（ring 点未存 period），记录段 (ALIVE) 携带真实瞬时 rpm。
+- **后续**：诊断完成后，曲线工作室加自适应平滑选项（低速小窗保留细节，高速大窗消毛刺），
+  不改固件格式——纯 PC 端可视化特性。
+
+#### 当前任务清单
+
+| # | 任务 | 状态 | 涉及文件 |
+|---|------|------|----------|
+| 1 | SnapPoint 加 `int32_t event_rpm`（16B→20B） | 已做 | `snap_bin.h` |
+| 2 | `push_ring/push_snap/snap_on_event` 传 event_rpm | 已做 | `snap_bin.c` |
+| 3 | `snap_data_bytes` 16→20、`snap_dump_stream` 8→10 | 已做 | `snap_bin.c` |
+| 4 | ISR 传 event_rpm 给 snap_on_event | 已做 | `eqep_abi.c` |
+| 5 | DUMP BIN magic→0xAB1C0003, n 除数 16→20 | 已做 | `cli.c` |
+| 6 | Python 解析器更新 (FMT `<IqIi>`, 20B, magic V3) | 已做 | `pc/abi_tjx.py`, `pc/abi_monitor.py` |
+| 7 | main 看门狗检测（0.5s 无事件 → 停机） | 已做 | `empty_driverlib_main.c` |
+| 8 | event_rpm 双曲线显示（曲线工作室绿色线） | 已做 | `pc/curve_studio.py`, `pc/snap_to_csv.py` |
+| 9 | 曲线工作室自适应平滑（auto vel_win） | 已做 | `pc/abi_monitor.py`, `pc/curve_studio.py` |
+
+#### 4. 自适应平滑（2026-08-04 实施）
+
+**原理**：抽稀后不同转速段的记录点间距差异很大（低速 dt≈500µs、高速 dt≈136µs），
+固定 vel_win=32 导致高速速度窗仅 ~4.4ms（抖动量变大），低速速度窗 ~16ms（过平滑）。
+
+**实现**（纯 PC 端，不改固件）：
+- `abi_monitor.py` 新增 `auto_vel_win(xs, target_ms=5.0)`：取前 50 点中位 dt，
+  按 `int(5ms/dt)` 算最优窗（钳位 [4,128]，强制奇数）。高速 dt=136µs→vel_win=37（5.0ms窗），
+  低速 dt=500µs→vel_win=11（5.5ms窗）。
+- `curve_studio.py` 新增"自适应窗（auto vel_win）"复选框，启用后
+  `recompute_rows_rpm_from_counts(rows, vel_win=auto_vel_win(xs))` 重算 count差分 rpm。
+
+**效果**：勾选自适应窗后，各转速段速度窗口统一到 ~5ms 物理时间窗，
+高速毛刺被额外 2.3× 采样点缓冲消减，低速细节保留如旧。 |
+
 ## 过程发现的问题（全部记录，供以后项目借鉴）
 
 ### 问题 1（核心）：F28P55x eQEP 捕获单元没有中断
@@ -203,3 +266,66 @@ ESP32 工程（`D:\oezcon\mcoder\ESP32_AS5047P_ABI_Monitor\`）只读，仅作�
     - 构建：`D:\ti\ccs2011\ccs\eclipse\ccs-server-cli.bat -workspace <工程父目录> -application com.ti.ccs.apps.buildProject -ccs.projects <名> -ccs.configuration CPU1_RAM -ccs.buildType full -ccs.listErrors -ccs.autoImport`（autoImport 首次必需）。
     - 烧录：`D:\ti\ccs2011\ccs\ccs_base\DebugServer\bin\DSLite.exe load --config="<proj>\targetConfigs\TMS320F28P550SJ9.ccxml" <out>`；成功标志 `Running... Success`。
     - 陷阱：`ccs-serverc.exe` 只初始化不构建（假成功）；Theia ccstudio.exe 无头崩溃；改源码后必须把文件同步到构建副本（Copy-Item）再构建。
+
+---
+
+## 2026-08-04（续）Motor PWM 400Hz 电调修复 + Task 2-5 完成 + 测量工具
+
+### 1. 根因：电机不转（已修）
+- **问题**：HEAD 固件（ae7b9a0+工作树）的 FLASH 构建，电机完全不转，ABI? 显示 cnt=0、qdc=0、qupr=375000（静止档）。方案 A（32cae54 RAM）可转、方案 B 不转。
+- **排查过程**：
+  - 用户确认：供电、信号线 OK，ESC 信号线插 GPIO0（=EPWM1A）。
+  - 排除看门狗：`s_last_event_us` 初始化缺陷已修（`abi_init` 中 `s_last_event_us = now_us`），修复后仍不转。
+  - 排除链接布局：`28p55x_generic_flash_lnk.cmd` 合并 RAMLS1-7/GSDATA，`.TI.ramfunc`（205 words）未溢出。
+  - 排除 ESC 硬件：用户用航模信号发生器独立验证电调+电机正常。
+- **真因**：`Motor_Init` 配置的 **PWM 频率为 50Hz**（TBPRD=46875），但电调（航模无刷电调）期望 **400Hz**。
+  - 修改：TBPRD 46875 → 5859（2.34375MHz / 400）。
+  - CMPA 脉冲宽度不变：2343（1ms 停）~4687（2ms 全速）。
+- **验证**：`D:\temp\opencode\testA_ws\` 32cae54 RAM 方案 A 50Hz **同样不能转**（下午实测确认）→ MWENP-FIX 方案 B 400Hz 构建 **成功转动**，rpm≈4090，cnt 累计，动态 UTO 自适应生效。
+
+### 2. ESC 安全上电流程
+- **arm 时序**：上电后 ESC 需要 **≥5 秒** 以 1ms 停止脉宽（默认）建立连接，期间不应发任何油门命令。
+- **校准模式**：大部分航模电调支持最高→最低油门校准（`MOTOR 1 9999` → 听到蜂鸣 → `MOTOR 0 0`），本测试无需校准即可正常转动。
+
+### 3. Task 2（speed_est 事件流测速）完成
+- **修改文件**：`speed_est.c/h`、`empty_driverlib_main.c`、`app/cli.c`
+- **变更**：
+  - 删除 `spd_tick_1khz()` 内 1kHz 差分 + EMA 路径。
+  - `spd_rpm()` 改为 `int32_t`，直接原子读 `abi_get_latest_rpm()`（via event rpm）。
+  - 消费者（main.c Motor_CloseLoop、1Hz 状态线、L 遥测）统一使用 `int32_t`。
+  - SPD? 打印 `%ld` 符号位，L 帧打印 magnitude（保持 ESP32 兼容）。
+
+### 4. Task 4（遥测扩展）完成
+- **新增 ABI? 字段**：`uto=<µs>`（当前 UTO 周期 µs，= QUPR/150）、`nom=<rpm>`（名义转速，=22500000/QUPR）。
+- **新增 SPD? 字段**：`uto=<µs>`、`freq=<Hz>`（UTO 刷新频率，=150MHz/QUPR）。
+- **新增 accessor**：`abi_uto_period_us()`、`abi_uto_freq_hz()`、`abi_nom_rpm()`（在 `eqep_abi.c/h`）。
+
+### 5. Task 5（ISR 探针）完成
+- 在 `ABI?` 中增加 `isr_max=<cycles>` 和 `isr_avg=<cycles>`（仅 DEBUG 构建生效 `-define=DEBUG`）。
+- `SEQ` 命令：`seq_restart()` 重置闭环序列状态从 idle 重新开始。
+
+### 6. 弹射测速 BIN v3 格式验证
+- **BIN 捕获问题**：USB `DUMP BIN` 时 L 遥测帧（10Hz）与 BIN 数据混合在串口流中——`g_dump_active` 阻止 NEW L 帧，但 TX FIFO 已缓存的 L 帧先于 BIN 数据发送。
+- **修复**：`pc/capture_clean_bin.py` 自动清洗 L 帧，提取纯 BIN。
+- **格式验证**：`snap_clean.bin` → 4400 点 20B SnapPoint，peak rpm=4331，CRC 匹配，解析正确。
+- **curve_studio 兼容**：V3 20B（5×uint32 LE：`t_us, counts_lo, counts_hi, index_n, event_rpm`），event_rpm 曲线双协议同框显示。
+- **event_rpm 量化分析**（用户观察）：
+  - 低速（<2000rpm）：波动小（dt 大，量化细）。
+  - 高速（>4000rpm）：波动大（dt 小，dpos=1 的单步除分母把误差放大，属 `dpos/dt` 浮点量化极限，非采集缺陷）。
+  - 结论：弹射标定以 counts-diff RPM（蓝色/橙色）为准。
+
+### 7. curve_studio 测量工具
+- **功能**：M 键或"测距 (M)"按钮进入测距模式。
+  - 单击选点 A → 显示 t、rpm。
+  - 单击选点 B → 显示 Δt、Δrpm、转角（°）、圈数、磁极数（7 对极，Δcounts/4000×7）。
+  - 右击清除测量点。
+- **实现**：RpmChart 增加 `set_extra_data`（counts 数据透传），click→`_find_nearest` 回找最近数据点，Canvas 标注虚线+数值。
+
+### 8. 代码注释与提交纪律
+- 已提交 5 次（63d1b44、9785ae9、060ca2d、3a039b7），每次均有明确 commit message。
+- 计划文件对比结论：2026-08-04 adaptive-smooth 全完成；2026-08-03 uto-dynamicperiod Task 1-5/7 完成，Task 6/8 留待。
+
+### 待办
+- Task 6：闭环回归（需电调稳定工作 + 长时运行）
+- Task 8：SD 卡 CSV 日志（SD 槽缺上拉电阻，待用户测试 ESP32 方案）
+- 曲线工作室增加自适应速度窗验证（已实现，待实际弹射数据调参）
