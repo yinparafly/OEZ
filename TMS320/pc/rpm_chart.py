@@ -544,19 +544,19 @@ class RpmChart(ttk.Frame):
             py_a = sy(ra)
             c.create_line(pa, pt, pa, pt + ph, fill="#e74c3c", dash=(4, 2), width=1)
             c.create_oval(pa - 4, py_a - 4, pa + 4, py_a + 4, outline="#e74c3c", width=2)
-            c.create_text(pa, pt - 6, anchor="s", text=f"t={ta:.4f}", fill="#c0392b", font=("Segoe UI", 8, "bold"))
-            c.create_text(pa + 6, py_a, anchor="w", text=f"{ra:.0f}", fill="#c0392b", font=("Segoe UI", 8))
+            c.create_text(pa, pt + ph + 6, anchor="n", text=f"t={ta:.4f}s  {ra:.0f}rpm",
+                          fill="#c0392b", font=("Segoe UI", 8, "bold"))
             if self._measure_b is not None:
                 tb, rb, _cb = self._measure_b
                 pb = sx(tb)
                 py_b = sy(rb)
                 c.create_line(pb, pt, pb, pt + ph, fill="#e74c3c", dash=(4, 2), width=1)
                 c.create_oval(pb - 4, py_b - 4, pb + 4, py_b + 4, outline="#e74c3c", width=2)
-                c.create_text(pb, pt - 6, anchor="s", text=f"t={tb:.4f}", fill="#c0392b", font=("Segoe UI", 8, "bold"))
-                c.create_text(pb + 6, py_b, anchor="w", text=f"{rb:.0f}", fill="#c0392b", font=("Segoe UI", 8))
+                c.create_text(pb, pt + ph + 6, anchor="n", text=f"t={tb:.4f}s  {rb:.0f}rpm",
+                              fill="#c0392b", font=("Segoe UI", 8, "bold"))
                 mid_x = (pa + pb) / 2.0
                 info = self.get_measure_info()
-                c.create_text(mid_x, pt - 18, anchor="s", text=info,
+                c.create_text(mid_x, pt + ph + 20, anchor="n", text=info,
                               fill="#c0392b", font=("Segoe UI", 9, "bold"))
 
         if self._mark_in is not None and self._mark_out is not None:
