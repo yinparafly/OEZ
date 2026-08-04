@@ -163,6 +163,10 @@ class RpmChart(ttk.Frame):
         vx0, vx1 = self._view_xlim
         return (vx1 - vx0) < (fx1 - fx0) * 0.98
 
+    def set_extra_data(self, extras: list[list[float]]) -> None:
+        """每个 series 的点级额外值列表（如 counts），用于角度计算。"""
+        self._extras = extras
+
     # ---- 测量工具（单击选点A+B，算Δt+Δrpm+Δangle） ----
 
     def _find_nearest(self, tx: float, ty: float) -> tuple[float, float, float]:
