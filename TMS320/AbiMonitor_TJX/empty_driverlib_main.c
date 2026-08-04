@@ -237,6 +237,21 @@ static void seq_tick_400hz(uint32_t tick)
     }
 }
 
+/* 重置闭环序列状态并从 idle 重新开始（CLI SEQ 命令触发） */
+void seq_restart(void)
+{
+    Motor_Set_PWM(1, 0);
+    g_seq_state = 0;
+    g_seq_start = g_tick_1khz;
+    g_seq_idx   = 0;
+    g_seq_done  = 0;
+    g_speed     = 0;
+    g_pi_int    = 0;
+    g_ctrl_tick = g_tick_1khz;
+    g_ramp_tick = g_tick_1khz;
+    pi_target_rpm = 0;
+}
+
 __interrupt void INT_Debug_Serial_RX_ISR(void)
 {
     // 读取接收到的字符，推入 CLI 环形缓冲区（读 SCIRXBUF 会自动清除 RXRDY 标志）

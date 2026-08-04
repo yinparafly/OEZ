@@ -21,4 +21,7 @@ extern volatile int g_dump_active;
    main 看门狗用（PWM 活动但 0.5s 无编码器事件 → 停机） */
 extern volatile uint32_t g_motor_active;
 
+/* 重启闭环测试序列（重置所有状态并从头跑 1500→2000 RPM） */
+void seq_restart(void);
+
 #endif

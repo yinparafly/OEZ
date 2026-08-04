@@ -289,8 +289,17 @@ static void cli_handle(char *line)
         DINT;
         int64_t cnt = abi_counts();
         EINT;
+#ifdef DEBUG
+        uint32_t _im = abi_isr_dbg_max_cycles();
+        uint32_t _ic = abi_isr_dbg_count();
+        uint32_t _ia = _ic ? (abi_isr_dbg_sum_cycles() / _ic) : 0u;
+#endif
         cli_printf("# ABI cnt=%lld idx=%lu miss=%lu pcm=%lu qdc=%lu iel=%lu g=%d per=%lu"
-                   " rpm=%ld qupr=%lu uto=%lu nom=%lu idle=%lu sim=%lu div=%lu\n",
+                   " rpm=%ld qupr=%lu uto=%lu nom=%lu idle=%lu sim=%lu div=%lu"
+#ifdef DEBUG
+                   " isr_max=%lu isr_avg=%lu"
+#endif
+                   "\n",
                    cnt, (unsigned long)abi_index_n(),
                    (unsigned long)abi_missed_events(),
                    (unsigned long)abi_pcm_dbg(),
@@ -304,7 +313,11 @@ static void cli_handle(char *line)
                    (unsigned long)abi_nom_rpm(),
                    (unsigned long)abi_get_uto_idle_evt(),
                    (unsigned long)abi_sim_get(),
-                   (unsigned long)abi_snap_div());
+                   (unsigned long)abi_snap_div()
+#ifdef DEBUG
+                   , (unsigned long)_im, (unsigned long)_ia
+#endif
+                   );
     }
     else if (strncmp(line, "SIM", 3) == 0)
     {
@@ -352,6 +365,11 @@ static void cli_handle(char *line)
         {
             cli_put_raw("# MOTOR <dir 1/2> <spd 0-9999>\n");
         }
+    }
+    else if (strcmp(line, "SEQ") == 0)
+    {
+        seq_restart();
+        cli_put_raw("# SEQ restart\n");
     }
     else if (strcmp(line, "HELP") == 0)
     {
