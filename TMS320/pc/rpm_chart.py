@@ -182,16 +182,16 @@ class RpmChart(ttk.Frame):
                 dx = (x - tx) / ((x1 - x0) or 0.001)
                 dy = (y - ty) / ((y1 - y0) or 1.0)
                 d2 = dx * dx + dy * dy
-                    if d2 < best_d2:
-                        best_d2 = d2
-                        best_pt = (x, y)
-                        # 取 counts：优先 series 本身，否则用 series[0] 的 counts（同一时间线）
-                        c = 0.0
-                        if si < len(self._extras) and pi < len(self._extras[si]):
-                            c = self._extras[si][pi]
-                        elif len(self._extras) > 0 and pi < len(self._extras[0]):
-                            c = self._extras[0][pi]
-                        best_c = c
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_pt = (x, y)
+                    # 取 counts：优先 series 本身，否则用 series[0] 的 counts（同一时间线）
+                    c = 0.0
+                    if si < len(self._extras) and pi < len(self._extras[si]):
+                        c = self._extras[si][pi]
+                    elif len(self._extras) > 0 and pi < len(self._extras[0]):
+                        c = self._extras[0][pi]
+                    best_c = c
         return (best_pt[0], best_pt[1], best_c) if best_pt else (tx, ty, 0.0)
 
     def _data_at_xy(self, cx: float, cy: float) -> tuple[float, float, float]:
