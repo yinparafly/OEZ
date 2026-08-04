@@ -23,6 +23,7 @@ class RpmChart(ttk.Frame):
         self._ylabel = "Y"
         self._series: list[tuple[list[float], list[float], str, str]] = []
         # each: xs, ys, color, label
+        self._extras: list[list[float]] = []  # 每点的 counts（用于角度计算）
         self._full_xlim: tuple[float, float] | None = None
         self._full_ylim: tuple[float, float] | None = None
         self._view_xlim: tuple[float, float] | None = None
@@ -44,6 +45,11 @@ class RpmChart(ttk.Frame):
         self._xf: tuple[float, float, float, float] | None = None
         self._yf: tuple[float, float, float, float] | None = None  # y0,y1,pt,ph
         self._on_view_change = None  # optional callback()
+        self._on_measure_change = None  # optional callback(dt, drpm)
+
+        # 测量工具：单击选点A → 单击选点B → 右击清除
+        self._measure_a: tuple[float, float, float] | None = None  # (t_sec, rpm, counts)
+        self._measure_b: tuple[float, float, float] | None = None
 
         self.canvas = tk.Canvas(self, background=self._bg, highlightthickness=0, height=360)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -52,6 +58,7 @@ class RpmChart(ttk.Frame):
         self.canvas.bind("<Button-4>", lambda e: self._zoom_wheel(e, +1))  # Linux up
         self.canvas.bind("<Button-5>", lambda e: self._zoom_wheel(e, -1))  # Linux down
         self.canvas.bind("<Double-Button-1>", lambda _e: self.reset_view())
+        # Button-1 测量点击由上层 CurveStudio _on_chart_press 统一派发
 
     def set_line_color(self, color: str) -> None:
         self._line = color or self._line
@@ -114,6 +121,7 @@ class RpmChart(ttk.Frame):
         preserve_view: bool = True,
     ) -> None:
         self._series = [(list(xs), list(ys), col, lab) for xs, ys, col, lab in series]
+        self._extras = []  # extras 由外部单独设（set_extra_data）
         if title is not None:
             self._title = title
         if xlabel is not None:
@@ -154,6 +162,99 @@ class RpmChart(ttk.Frame):
         fx0, fx1 = self._full_xlim
         vx0, vx1 = self._view_xlim
         return (vx1 - vx0) < (fx1 - fx0) * 0.98
+
+    # ---- 测量工具（单击选点A+B，算Δt+Δrpm+Δangle） ----
+
+    def _find_nearest(self, tx: float, ty: float) -> tuple[float, float, float]:
+        """在已显示的 series 中找最近数据点，返回(t_sec, rpm, counts)。
+        counts 来自 set_extra_data，用于角度计算。"""
+        best_pt = None
+        best_c = 0.0
+        best_d2 = float("inf")
+        for si, (xs, ys, _col, _lab) in enumerate(self._series):
+            for pi, (x, y) in enumerate(zip(xs, ys)):
+                if not self._view_xlim or not self._view_ylim:
+                    continue
+                x0, x1 = self._view_xlim
+                y0, y1 = self._view_ylim
+                if x < x0 or x > x1 or y < y0 or y > y1:
+                    continue
+                dx = (x - tx) / ((x1 - x0) or 0.001)
+                dy = (y - ty) / ((y1 - y0) or 1.0)
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_pt = (x, y)
+                    # 获取该点的 counts 值
+                    if si < len(self._extras) and pi < len(self._extras[si]):
+                        best_c = self._extras[si][pi]
+                    else:
+                        best_c = 0.0
+        return (best_pt[0], best_pt[1], best_c) if best_pt else (tx, ty, 0.0)
+
+    def _data_at_xy(self, cx: float, cy: float) -> tuple[float, float, float]:
+        """Canvas 像素坐标 → 最近数据点(t_sec, rpm, counts)。"""
+        if not self._xf or not self._yf:
+            return (cx, cy, 0.0)
+        x0, x1, pl, pw = self._xf
+        y0, y1, pt, ph = self._yf
+        if pw <= 0 or ph <= 0:
+            return (cx, cy, 0.0)
+        tx = x0 + (cx - pl) / pw * (x1 - x0)
+        ty = y1 - (cy - pt) / ph * (y1 - y0)
+        return self._find_nearest(tx, ty)
+
+    def _on_measure_click(self, event) -> None:
+        """单击选测量点：第一次设A，第二次设B，第三次重置A。"""
+        t, rpm, counts = self._data_at_xy(event.x, event.y)
+        pt = (t, rpm, counts)
+        if self._measure_a is None:
+            self._measure_a = pt
+            self._measure_b = None
+        elif self._measure_b is None:
+            self._measure_b = pt
+        else:
+            self._measure_a = pt
+            self._measure_b = None
+        self.redraw()
+        if self._on_measure_change:
+            self._on_measure_change(self.get_measure_info())
+
+    def _on_measure_clear(self, _event) -> None:
+        """右击清除测量标记。"""
+        self._measure_a = None
+        self._measure_b = None
+        self.redraw()
+        if self._on_measure_change:
+            self._on_measure_change("")
+
+    def get_measure_info(self) -> str:
+        """返回 Δt, Δrpm, 转角 文本。"""
+        if self._measure_a is None:
+            return ""
+        ta, ra, ca = self._measure_a
+        if self._measure_b is None:
+            return f"A: t={ta:.4f}s  rpm={ra:.0f}"
+        tb, rb, cb = self._measure_b
+        dt = tb - ta
+        drpm = rb - ra
+        dc = cb - ca                 # Δcounts (步数)
+        revs = abs(dc) / 4000.0      # 圈数
+        deg = revs * 360.0           # 角度
+        poles = revs * 7.0           # 磁极数（7 对极）
+        parts = []
+        dabs = abs(dt)
+        if dabs < 0.001:
+            parts.append(f"Δt={dt*1e6:.0f}µs")
+        elif dabs < 1:
+            parts.append(f"Δt={dt*1000:.1f}ms")
+        else:
+            parts.append(f"Δt={dt:.4f}s")
+        parts.append(f"Δrpm={drpm:.0f}")
+        parts.append(f"转角={deg:.1f}°")
+        parts.append(f"圈={revs:.4f}")
+        parts.append(f"磁极≈{poles:.1f}个")
+        return "  ".join(parts)
 
     def set_selection_rect(
         self, rect: tuple[float, float, float, float] | None
@@ -429,6 +530,28 @@ class RpmChart(ttk.Frame):
 
         def sy(y: float) -> float:
             return pt + ph - (y - y0) / (y1 - y0) * ph
+
+        # ---- 测量工具标注 ----
+        if self._measure_a is not None:
+            ta, ra, _ca = self._measure_a
+            pa = sx(ta)
+            py_a = sy(ra)
+            c.create_line(pa, pt, pa, pt + ph, fill="#e74c3c", dash=(4, 2), width=1)
+            c.create_oval(pa - 4, py_a - 4, pa + 4, py_a + 4, outline="#e74c3c", width=2)
+            c.create_text(pa, pt - 6, anchor="s", text=f"t={ta:.4f}", fill="#c0392b", font=("Segoe UI", 8, "bold"))
+            c.create_text(pa + 6, py_a, anchor="w", text=f"{ra:.0f}", fill="#c0392b", font=("Segoe UI", 8))
+            if self._measure_b is not None:
+                tb, rb, _cb = self._measure_b
+                pb = sx(tb)
+                py_b = sy(rb)
+                c.create_line(pb, pt, pb, pt + ph, fill="#e74c3c", dash=(4, 2), width=1)
+                c.create_oval(pb - 4, py_b - 4, pb + 4, py_b + 4, outline="#e74c3c", width=2)
+                c.create_text(pb, pt - 6, anchor="s", text=f"t={tb:.4f}", fill="#c0392b", font=("Segoe UI", 8, "bold"))
+                c.create_text(pb + 6, py_b, anchor="w", text=f"{rb:.0f}", fill="#c0392b", font=("Segoe UI", 8))
+                mid_x = (pa + pb) / 2.0
+                info = self.get_measure_info()
+                c.create_text(mid_x, pt - 18, anchor="s", text=info,
+                              fill="#c0392b", font=("Segoe UI", 9, "bold"))
 
         if self._mark_in is not None and self._mark_out is not None:
             xa = sx(min(self._mark_in, self._mark_out))

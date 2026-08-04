@@ -155,7 +155,7 @@ class CurveStudio(tk.Toplevel):
         ]
         CurveStudio._uid += 1
         self._active = 0
-        self._tool = tk.StringVar(value="cut")  # cut | select | exclude
+        self._tool = tk.StringVar(value="cut")  # cut | select | exclude | measure
         self._exclude_action = tk.StringVar(value="mask")  # mask | delete
         self._select_shape = tk.StringVar(value="rect")  # rect | lasso
         self._drag_start_px: tuple[float, float] | None = None
@@ -207,6 +207,8 @@ class CurveStudio(tk.Toplevel):
         self.bind("<KeyPress-E>", lambda e: self._set_tool("exclude"))
         self.bind("<KeyPress-b>", lambda e: self._set_tool("exclude"))  # 兼容旧快捷键
         self.bind("<KeyPress-B>", lambda e: self._set_tool("exclude"))
+        self.bind("<KeyPress-m>", lambda e: self._set_tool("measure"))
+        self.bind("<KeyPress-M>", lambda e: self._set_tool("measure"))
         self.bind("<Control-z>", lambda e: self._undo_spike())
         self.bind("<Control-Z>", lambda e: self._undo_spike())
         self.bind("<Delete>", lambda e: self._on_delete_key())
@@ -246,6 +248,10 @@ class CurveStudio(tk.Toplevel):
             font=("Segoe UI", 10, "bold"),
         )
         self.btn_tool_excl.pack(side=tk.LEFT, padx=6)
+        self.btn_tool_meas = tk.Button(
+            row1, text="测距 (M)", width=10, command=lambda: self._set_tool("measure")
+        )
+        self.btn_tool_meas.pack(side=tk.LEFT, padx=3)
         ttk.Label(row1, text="刀口 t=").pack(side=tk.LEFT, padx=(16, 0))
         ttk.Label(row1, textvariable=self.var_cut_t, width=10).pack(side=tk.LEFT)
 
@@ -484,6 +490,7 @@ class CurveStudio(tk.Toplevel):
         self.chart.canvas.bind("<ButtonRelease-1>", self._on_chart_release)
         self.chart.canvas.bind("<Enter>", self._chart_enter)
         self.chart.canvas.bind("<Leave>", self._chart_leave)
+        self.chart.canvas.bind("<Button-3>", lambda e: self._on_measure_clear())
         self.chart.canvas.configure(cursor="crosshair", takefocus=True)
 
         # 时间线轨道
@@ -843,6 +850,7 @@ class CurveStudio(tk.Toplevel):
             self.btn_tool_cut.configure(**(on if tool == "cut" else idle))
             self.btn_tool_sel.configure(**(on if tool == "select" else idle))
             self.btn_tool_excl.configure(**(on_ex if tool == "exclude" else idle))
+            self.btn_tool_meas.configure(**(on if tool == "measure" else idle))
 
     def _tool_hint(self) -> None:
         tool = self._tool.get()
@@ -860,6 +868,9 @@ class CurveStudio(tk.Toplevel):
                 self.chart.canvas.focus_set()
             except tk.TclError:
                 pass
+        elif tool == "measure":
+            self.chart.canvas.configure(cursor="crosshair")
+            self.var_status.set("测距：单击选点A · 再单击选点B · 右击清除")
         else:
             self.chart.canvas.configure(cursor="arrow")
             self.var_status.set("选择模式：点曲线设刀口，点时间线选段")
@@ -1018,7 +1029,14 @@ class CurveStudio(tk.Toplevel):
                 break
         self.refresh()
 
+    def _on_measure_clear(self) -> None:
+        """右击清除测量标记。"""
+        self.chart._on_measure_clear(None)
+
     def _on_chart_press(self, evt) -> None:
+        if self._tool.get() == "measure":
+            self.chart._on_measure_click(evt)
+            return
         if self._tool.get() == "exclude":
             self._drag_start_px = (float(evt.x), float(evt.y))
             if self._select_shape.get() == "lasso":
@@ -1731,6 +1749,10 @@ class CurveStudio(tk.Toplevel):
                 mark_out=mark_out,
                 preserve_view=preserve_view,
             )
+            # 测量工具：传 counts 数据用于角度计算
+            extras = p.get("ys_counts")
+            if extras:
+                self.chart.set_extra_data([extras])
         elif view == "counts":
             ys_c = p.get("ys_counts") or []
             if not p.get("has_counts"):
