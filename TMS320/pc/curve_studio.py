@@ -38,6 +38,7 @@ from snap_edit import (
 
 try:
     from abi_monitor import (
+        auto_vel_win,
         recompute_rows_rpm_from_counts,
         row_counts,
         row_has_counts,
@@ -51,6 +52,9 @@ except Exception:  # noqa: BLE001 — 独立跑 curve_studio 时可能无完整 
 
     def recompute_rows_rpm_from_counts(rows: list, **_kw) -> list:
         return list(rows)
+
+    def auto_vel_win(xs, **_kw) -> int:
+        return 32  # fallback: default HOST_VEL_WIN
 
 
 def _point_in_poly(x: float, y: float, poly: Sequence[tuple[float, float]]) -> bool:
@@ -182,6 +186,8 @@ class CurveStudio(tk.Toplevel):
         self.var_startup_t = tk.StringVar(value="—")
         self.var_show_raw = tk.BooleanVar(value=True)
         self.var_show_smooth = tk.BooleanVar(value=True)
+        self.var_show_erpm = tk.BooleanVar(value=True)   # event_rpm 双曲线诊断
+        self.var_auto_win = tk.BooleanVar(value=False)   # 自适应速度窗
         self.var_view = tk.StringVar(value="rpm")
         self.var_status = tk.StringVar(value="")
         self.var_cut_t = tk.StringVar(value="—")
@@ -320,6 +326,18 @@ class CurveStudio(tk.Toplevel):
             overlay,
             text="平滑后",
             variable=self.var_show_smooth,
+            command=self.refresh,
+        ).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(
+            overlay,
+            text="event_rpm（周期直算·绿色）",
+            variable=self.var_show_erpm,
+            command=self.refresh,
+        ).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(
+            overlay,
+            text="自适应窗（auto vel_win）",
+            variable=self.var_auto_win,
             command=self.refresh,
         ).pack(side=tk.LEFT, padx=8)
         ttk.Button(overlay, text="只看原始", command=self._show_only_raw).pack(side=tk.LEFT, padx=4)
@@ -1502,6 +1520,8 @@ class CurveStudio(tk.Toplevel):
         n_clips = len(self._clips)
         show_raw = bool(self.var_show_raw.get())
         show_sm = bool(self.var_show_smooth.get())
+        show_erpm = bool(self.var_show_erpm.get())
+        auto_win = bool(self.var_auto_win.get())
         view = self.var_view.get()
         ph = self.var_playhead
         preserve_view = self._last_plot_view == view
@@ -1529,6 +1549,8 @@ class CurveStudio(tk.Toplevel):
             "n_clips": n_clips,
             "show_raw": show_raw,
             "show_sm": show_sm,
+            "show_erpm": show_erpm,
+            "auto_win": auto_win,
             "view": view,
             "ph": ph,
             "preserve_view": preserve_view,
@@ -1558,6 +1580,9 @@ class CurveStudio(tk.Toplevel):
         i0 = snap["i0"]
         base = t_base_ms(rows)
         xs = [(float(r[0]) - base) / 1000.0 for r in rows]
+        if snap.get("auto_win"):
+            aw = auto_vel_win(xs, target_ms=5.0)
+            rows = recompute_rows_rpm_from_counts(rows, vel_win=aw)
         rpm_signed = [float(r[1]) for r in rows]
         idx = [i for i, m in enumerate(excl_mask) if m]
         if idx:
@@ -1570,6 +1595,8 @@ class CurveStudio(tk.Toplevel):
         ys_rpm_sm = [abs(v) for v in rpm_sm_signed]
         ys_counts = [float(r[7]) if len(r) > 7 and r[7] is not None else 0.0 for r in rows]
         has_counts = bool(rows) and len(rows[0]) > 7 and rows[0][7] is not None
+        ys_erpm = [float(abs(r[8])) if len(r) > 8 and r[8] is not None else 0.0 for r in rows]
+        has_erpm = bool(rows) and len(rows[0]) > 8 and rows[0][8] is not None
         n_excl = sum(1 for m in excl_mask if m)
         view = snap["view"]
         if view == "counts" and has_counts:
@@ -1614,6 +1641,8 @@ class CurveStudio(tk.Toplevel):
             "ys_rpm_sm": ys_rpm_sm,
             "ys_counts": ys_counts,
             "has_counts": has_counts,
+            "ys_erpm": ys_erpm,
+            "has_erpm": has_erpm,
             "ys_s": ys_s,
             "s_lab": s_lab,
             "tx": tx,
@@ -1627,6 +1656,8 @@ class CurveStudio(tk.Toplevel):
             "n_clips": snap["n_clips"],
             "show_raw": snap["show_raw"],
             "show_sm": snap["show_sm"],
+            "show_erpm": snap["show_erpm"],
+            "auto_win": snap["auto_win"],
             "view": snap["view"],
             "ph": snap["ph"],
             "preserve_view": snap["preserve_view"],
@@ -1677,6 +1708,13 @@ class CurveStudio(tk.Toplevel):
                     (xs, ys_rpm_sm, "#e67e22", f"|RPM|平滑后[{sm_tag}]{extra} peak={peak_sm:.0f}")
                 )
                 yhi = max(yhi, peak_sm * 1.15)
+            if p.get("has_erpm") and p.get("show_erpm"):
+                erpm = p["ys_erpm"]
+                epk = max(erpm) if erpm else 0.0
+                series.append(
+                    (xs, erpm, "#2ecc71", f"|event_rpm|(周期直算) peak={epk:.0f}")
+                )
+                yhi = max(yhi, epk * 1.15)
             if not series:
                 series.append((xs, ys_rpm, "#1a6fb5", "|RPM|"))
             self.chart.set_series(
