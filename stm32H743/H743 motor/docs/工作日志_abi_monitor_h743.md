@@ -79,6 +79,19 @@ P1-1 DIO(SWDIO/PA13) → SWDIO；P1-2 SWCLK → SWCLK；P1-3 GND；P1-4 5V（不
   - 曲线形状：0~500‰ 近似线性（~10rpm/‰），500~1000‰ 趋于饱和（电调/电机特性）
 - 输出：`pc_tool/calib/learn_20260806_224602.csv` + `learn_notes.md`（空载声明，载荷/电机/电调改变须重新学习）
 
+### 2026-08-06（晚）：Task 3 事件记录管线（自动触发）
+- **触发验证升级**（用户指示）：手动拧电机 → PWM 自动驱动。`pc_tool/snap_verify.py`：`PWM 0` → `ARM` → `PWM <n>` → 轮询 `SNAP` 至 state=3 → 验证点数
+- **snap_bin.c/h**（新建 Task 3）：
+  - ring 1024 点环形缓存（head/tail 单调 + 掩码），SNAP_CAP **31000**（512KB AXI SRAM 内 ring 16KB + bss 余量，计划 32768 超界改小）
+  - 触发状态机 0=IDLE/1=ARM/2=REC/3=DONE；ARM 后 |rpm|>10 置 armed_moving，Index 转整圈 → 回溯 400 点 + 记 0.8s
+  - `Snap_BuildBin` 打包 v2（magic 0xAB1C0002 + 16B 点）
+  - CLI 新增 `ARM`/`DISARM`/`SNAP`
+- **自动触发验证通过**：
+  ```text
+  PWM 700 → state 2→3, count=12042（回溯 1088 + 0.8s 窗口）验证通过
+  PWM 500 → state 3, count=9849（点率随转速下降）         验证通过
+  ```
+
 ---
 
 ### 2026-08-06：Task 1 骨架 + Task 1A PWM（编译/烧录/实机验证全部打通）

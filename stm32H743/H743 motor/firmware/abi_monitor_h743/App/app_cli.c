@@ -10,6 +10,7 @@
 #include "app_config.h"
 #include "app_pwm.h"
 #include "abi.h"
+#include "snap_bin.h"
 #include "usart.h"
 #include "stm32h7xx_hal.h"
 #include <stdlib.h>
@@ -61,6 +62,9 @@ static void cli_help(void)
     put("RPM [ON|OFF]    - 转速（ON 每秒回显一次）\r\n");
     put("CNT              - counts + Index + µs\r\n");
     put("IDX              - Index 圈数\r\n");
+    put("ARM              - 预置触发（|rpm|>10 且转过一圈 → 回溯400点+记0.8s）\r\n");
+    put("DISARM           - 取消触发预置\r\n");
+    put("SNAP             - 状态/点数\r\n");
     put("DBG              - GPIO 电平 + TIM2 寄存器\r\n");
 }
 
@@ -153,6 +157,15 @@ static void cli_idx(void)
     put("idx = "); put_u32(Abi_GetIndexCnt()); put("\r\n");
 }
 
+/* SNAP：状态/点数（验证自动触发用） */
+static void cli_snap(void)
+{
+    put("snap: state="); put_u32(Snap_State());
+    put(" (0=idle 1=arm 2=rec 3=done), count="); put_u32(Snap_Count());
+    put(" ready="); put_u32(Snap_IsReady());
+    put("\r\n");
+}
+
 /* 诊断：GPIO 电平 + TIM2 寄存器（调试用） */
 static void cli_dbg(void)
 {
@@ -188,6 +201,9 @@ static void Cli_Process(const char *line, uint16_t len)
     else if (strcmp(argv[0], "RPM") == 0)        cli_rpm(n, argv);
     else if (strcmp(argv[0], "CNT") == 0)        cli_cnt();
     else if (strcmp(argv[0], "IDX") == 0)        cli_idx();
+    else if (strcmp(argv[0], "ARM") == 0)        { Snap_Arm();    put("armed (等转速过阈+一整圈自动触发)\r\n"); }
+    else if (strcmp(argv[0], "DISARM") == 0)     { Snap_Disarm(); put("disarmed\r\n"); }
+    else if (strcmp(argv[0], "SNAP") == 0)       cli_snap();
     else if (strcmp(argv[0], "DBG") == 0)        cli_dbg();
     else {
         put("未知命令: "); put(argv[0]); put(" (输入 HELP)\r\n");

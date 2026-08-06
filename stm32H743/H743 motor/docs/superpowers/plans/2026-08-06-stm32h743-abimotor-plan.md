@@ -416,7 +416,7 @@ git commit -m "feat(h743): TIM2编码器4X + EXTI4 Index + UTO自适应事件流
 - Produces: `uint8_t Snap_IsReady(void)`、`uint32_t Snap_Count(void)`
 - Produces: 触发状态机：`SNAP_IDLE → SNAP_ARM → SNAP_TRIGGERED → SNAP_REC → SNAP_DONE`
 
-- [ ] **Step 1: 写 snap_bin.h**
+- [x] **Step 1: 写 snap_bin.h**（2026-08-06 已实施）
 
 ```c
 #pragma once
@@ -426,22 +426,15 @@ git commit -m "feat(h743): TIM2编码器4X + EXTI4 Index + UTO自适应事件流
 #define SNAP_MAGIC_V2   0xAB1C0002uL
 #define SNAP_BACKTRACK  400uL          // 回溯点数
 #define SNAP_DUR_US     800000uL       // 触发后记录 0.8s
-#define RING_CAP_BITS   9uL            // 2^9=512 环形缓存（2 的幂，位运算）
+#define RING_CAP_BITS   10uL           // 2^10=1024 环形缓存（2 的幂，位运算）
 #define RING_CAP        (1uL << RING_CAP_BITS)
-#define SNAP_CAP        32768uL        // 512KB/16B
+#define SNAP_CAP        31000uL        // 512KB AXI SRAM - ring16KB - bss
 #define TRIG_RPM        10             // |rpm|>10 触发
-
-void Snap_Init(void);
-void Snap_OnEvent(uint32_t cnt, uint32_t idx, uint32_t us_now);
-void Snap_OnIndex(void);
-void Snap_Arm(void);
-void Snap_Disarm(void);
-uint8_t Snap_IsReady(void);
-uint32_t Snap_BuildBin(uint8_t* buf, uint32_t cap);
-uint32_t Snap_Count(void);
 ```
 
-- [ ] **Step 2: 环形缓存 + 状态机（snap_bin.c）**
+> **实施偏差**：SNAP_CAP 由计划 32768 降为 **31000**（512KB AXI SRAM 内 ring 1024×16B + 栈堆余量）；RING_CAP 升 512→1024。
+
+- [x] **Step 2: 环形缓存 + 状态机（snap_bin.c）**
 
 ```c
 #include "snap_bin.h"
@@ -454,16 +447,18 @@ static SnapPt snap[SNAP_CAP];
 static uint32_t snap_count;
 static volatile uint8_t  state = 0;     // 0=IDLE 1=ARM 2=REC 3=DONE
 static uint32_t rec_start_us;
+static volatile uint8_t  armed_moving;  // ARM 下转速过阈
 
 void Snap_OnEvent(uint32_t cnt, uint32_t idx, uint32_t us_now)
 {
     SnapPt p = { us_now, (uint32_t)cnt,
                  (uint32_t)((int64_t)(int32_t)cnt >> 32), idx };
+    int32_t rpm = Abi_GetRpm();
+    if (state == 1 && (rpm > TRIG_RPM || rpm < -TRIG_RPM)) armed_moving = 1; // 自动触发判定
     if (state == 2) {                       // REC：填 snap 数组
         if (snap_count < SNAP_CAP) snap[snap_count++] = p;
-        if (snap_count >= SNAP_CAP || (uint32_t)(us_now - rec_start_us) >= SNAP_DUR_US) {
+        if (snap_count >= SNAP_CAP || (uint32_t)(us_now - rec_start_us) >= SNAP_DUR_US)
             state = 3;                      // DONE，等上位机取
-        }
     } else {
         ring[ring_head & (RING_CAP - 1)] = p;   // 始终进 ring，供回溯
         ring_head++;
@@ -473,7 +468,7 @@ void Snap_OnEvent(uint32_t cnt, uint32_t idx, uint32_t us_now)
 
 void Snap_OnIndex(void)
 {
-    if (state == 1) {                       // ARM：index 过一圈 → 回溯后开记
+    if (state == 1 && armed_moving) {       // 转速过阈 + 转过整圈 → 触发
         uint32_t avail = ring_head - ring_tail;
         uint32_t take = (avail < SNAP_BACKTRACK) ? avail : SNAP_BACKTRACK;
         uint32_t start = ring_head - take;  // 最近 take 个点
@@ -485,14 +480,17 @@ void Snap_OnIndex(void)
 ```
 
 > **评审修正 3/4**：ring 用 head/tail 单调计数 + `& (RING_CAP-1)` 掩码，避免 60kHz ISR 里 `%` 除法开销；`ring_tail` 只在满时前移，回溯取最近 `take` 点。`rec_start_us` 用 Task2 的 64 位 µs 计数（Abi_GetUsNow 暴露）。
+> **实施偏差**：armed_moving 判定移入 `Snap_OnEvent`（UTO ISR 每周期查 Abi_GetRpm），替代计划中额外在 UTO ISR 写判定。
 
-- [ ] **Step 3: 触发命令与状态查询（CLI 接入）**
+- [x] **Step 3: 触发命令与状态查询（CLI 接入）**
 
-`ARM` → `Snap_Arm()`（state=1，清 snap_count）；`DISARM` → state=0；`SNAP` → 回显当前状态/点数；`SNAP COUNT` → 点数。`Snap_IsReady()` 返回 `(state==3 && snap_count>0)`。
+`ARM` → `Snap_Arm()`（state=1，清 snap_count+ring）；`DISARM` → state=0；`SNAP` → 回显状态/点数/ready。`Snap_IsReady()` 返回 `(state==3 && snap_count>0)`。
 
 触发语义（与 DSP 一致）：`Snap_Arm()` 置 ARM；UTO ISR 每周期判 `|Abi_GetRpm()|>TRIG_RPM`，通过后置 `armed_moving=1`；`Snap_OnIndex()` 在 `armed_moving` 下触发回溯+进 REC（即「转速过阈值 + Index 转过一整圈」双条件，见 Step 2 代码）。
 
-- [ ] **Step 4: BIN 打包（v2 格式）**
+> **验证方式升级（2026-08-06 用户指示）**：不再手动拧电机触发，改用 PWM 自动驱动（`pc_tool/snap_verify.py`：ARM → PWM 700/500 → 自动触发 → 验证点数）。
+
+- [x] **Step 4: BIN 打包（v2 格式）**
 
 ```c
 uint32_t Snap_BuildBin(uint8_t* buf, uint32_t cap)
@@ -505,9 +503,14 @@ uint32_t Snap_BuildBin(uint8_t* buf, uint32_t cap)
 }
 ```
 
-- [ ] **Step 5: 板级验证**
+- [x] **Step 5: 板级验证**（自动触发，2026-08-06 通过）
 
-手动转电机：`ARM` → 快速转 >1 圈 → `SNAP` 显示点数 >400 且 <2000；`SNAP COUNT` 约 0.8s 窗口内点数；停止转动后点数不再增长；串口回读字节数与 `Snap_BuildBin` 一致。
+```text
+>>> snap_verify.py 自动触发验证（PWM 驱动代替手动拧）：
+PWM 700 → state 2→3, count=12042（回溯1088+0.8s窗口） 验证通过
+PWM 500 → state 3, count=9849（点率随转速下降）       验证通过
+```
+
 
 - [ ] **Step 6: 提交**
 

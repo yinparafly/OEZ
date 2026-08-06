@@ -39,6 +39,7 @@ C_SOURCES = \
   App/app_cli.c \
   App/app_pwm.c \
   App/abi.c \
+  App/snap_bin.c \
   Drivers/User/Src/led.c \
   Drivers/User/Src/usart.c \
   Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal.c \

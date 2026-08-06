@@ -18,6 +18,7 @@
 #include "app_config.h"
 #include "app_pwm.h"
 #include "abi.h"
+#include "snap_bin.h"
 
 void SystemClock_Config(void);
 
@@ -33,6 +34,7 @@ int main(void)
 	Config_Load();		// 读取 Flash 配置（失效则重置默认）
 	Pm_Init();			// 测试 PWM（TIM3_CH2/PA7，占空比 0）
 	Abi_Init();			// ABI 编码器：TIM2 4X + EXTI4 Index + TIM5 UTO
+	Snap_Init();		// Task 3 事件记录管线
 	Cli_Init();			// 打印 banner
 
 	while (1)
