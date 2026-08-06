@@ -1,0 +1,23 @@
+# ===== 编译产物（GNU Make + Keil）=====
+build/
+firmware/*/build/
+*.o
+*.d
+*.map
+*.elf
+*.bin
+*.hex
+*.axf
+*.lst
+*.crf
+*.dep
+MDK-ARM/*.uvguix.*
+MDK-ARM/RTE/_*
+
+# ===== 大体积参考资源（不入库，本地使用）=====
+1.封装库/
+2.参考例程/
+3.STM32相关手册/
+4.原理图和机械尺寸/
+5.软件工具/
+6.外置下载算法以及USB下载教程/

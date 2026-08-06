@@ -1,0 +1,97 @@
+# abi_monitor_h743 工作日志（STM32H743 ABI 编码器事件流监控/记录器）
+
+> 目的：按日期沉淀本项目的初始计划、过程发现、决策与依据，作为 STM32H7 项目经验基础。
+> 项目：`D:\oezcon\stm32H743\H743 motor\firmware\abi_monitor_h743\`（固件）
+> 计划：`docs\superpowers\plans\2026-08-06-stm32h743-abimotor-plan.md`（主计划）
+> 接线：`docs\接线文档.md`
+> 参考源：`2.参考例程\1.基础例程\1.LED闪烁`（Keil 模板）、`SDMMC-SD卡移植FatFSC`（SD 例程）
+
+---
+
+## 项目概述
+
+在 FK743M4-XIH6-V1.1（STM32H743XIH6）开发板上复刻 DSP 的 UTO 方案：AS5047P ABI 编码器
+（1000PPR → 4X=4000 计数/圈）事件流监控/记录器。BIN v2 16B 帧与原有 PC 工具字节级兼容
+（magic 0xAB1C0002）。
+
+- 设备：STM32H743XIH6（480MHz CM7，2MB Flash，512KB AXI SRAM）
+- 外设分配：编码器 A=PA5(TIM2_CH1)、B=PA1(TIM2_CH2)、Index=PA4(EXTI4)；
+  USART1=PA9/PA10 921600 8N1；LED=PC13（低电平点亮）；PWM=PA7(TIM3_CH2) 500Hz；
+  SDMMC1=PC8~12+PD2（Task 5）
+- 时钟链：HSE25 → SYSCLK480 → HCLK240 → APB1/2=120 → TIM5=240MHz（PSC=3 → 60MHz 刻度）
+- 记录规格：SNAP_CAP 3400 点、RING_CAP 1200 点、回溯 400 点（计划值，Task 2/3 实施）
+- 抽稀档位：3/4/5 档可配，默认 3 档 div 1/2/4 @ 4000/8000rpm，0.8s 窗口恒 ≤32k 点
+
+---
+
+## 工具链情况（2026-08-06 最终确定）
+
+本机**无 Keil UV4**（全盘搜索失败），编译/烧录改用：
+
+| 项 | 位置 | 说明 |
+|----|------|------|
+| GCC 编译器 | `D:\arm-official\arm-gnu-toolchain-13.2.Rel1-mingw-w64-i686-arm-none-eabi\bin\` | 13.2.1 **完整版（含 cc1.exe）** |
+| （不可用） | `D:\arm-gcc\xpack-arm-none-eabi-gcc-13.2.1-1.1` | xpack 版缺 cc1.exe，CreateProcess 失败，弃用 |
+| 构建驱动 | `mingw32-make`（`d:\TDM-GCC-64\bin\`） | 用 `Makefile`，-j8 并行编译 |
+| 烧录 | `D:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe` | **v2.15.0**，SWD HOTPLUG 模式 |
+| 备选烧录 | `D:\openocd\xpack-openocd-0.12.0-7\bin\openocd.exe` | ST-Link V2 探测验证可用（SWD DPIDR 0x6ba02477），未实际烧录 |
+
+### 关键命令
+```bat
+:: 编译（工程根目录）
+mingw32-make -j8 all
+
+:: 一键编译+烧录（build.bat）
+build.bat flash
+```
+
+### GNU 工具链新增文件（Keil 工程之外）
+- `gcc\startup_stm32h743xx.s`：GNU as 语法启动文件，向量表 166 项与 Keil 版逐项一致（自己数过）
+- `gcc\stm32h743xx_flash.ld`：链接脚本（FLASH 2MB @0x08000000，RAM 512K @0x24000000，stack 0x400 heap 0x200 与 Keil 一致）
+- `Makefile`：源文件清单与 uvprojx 完全一致（25 个 HAL + Core + App + Drivers/User）
+- `build.bat`：编译 + STM32_Programmer_CLI 烧录（`-w bin 0x08000000 -v -rst`）
+
+### 烧录接线（ST-Link V2，4 线）
+P1-1 DIO(SWDIO/PA13) → SWDIO；P1-2 SWCLK → SWCLK；P1-3 GND；P1-4 5V（不接 RST、不接 3.3V）
+
+### STM32CubeProgrammer CLI 注意
+- 连续执行可能报 `ST-LINK error (DEV_USB_COMM_ERR)`，等 2~3 秒重试即可（测试过 3 次）
+- 连接参数：`-c port=SWD mode=HOTPLUG`，识别 Device ID 0x450 = STM32H7xx，Flash 2MB
+
+---
+
+## 时间线
+
+### 2026-08-06：Task 1 骨架 + Task 1A PWM（编译/烧录/实机验证全部打通）
+- 拷贝 `1.LED闪烁` 例程 → `firmware\abi_monitor_h743`（完整 Keil 工程 + 源码）
+- 自建 `Drivers\User\Src\usart.c/h`（USART1 921600，中断收 FIFO，IRQ 直接在 usart.c，回调 `Cli_OnChar`）
+- 自建 `App\app_config.c/h`（3/4/5 档抽稀表 + Bank2 扇区 7 = 0x081E0000 Flash 持久化，
+  CRC16 查表校验，H7 32B FLASHWORD 编程）
+- 自建 `App\app_cli.c/h`（HELP/ID/CFG SHOW/SAVE/RESET/GEAR + PWM）
+- 自建 `App\app_pwm.c/h`（PA7/TIM3_CH2，500Hz：PSC=7 → 30MHz 计数率，ARR=59999，占空比 0..1000‰）
+- 手动 Keil 工程 uvprojx 同步：Application/App 组 + usart + hal_uart + hal_tim + include 路径
+
+### 编译过程发现并修复
+1. `usart.c` 笔误 `&gp` 应为 `&gpio`（GCC 报错才发现，Keil 没跑过）
+2. `app_config.c` CRC16 表原手工数据错乱（excess elements）→ 用脚本重新生成标准 256 项表替换
+3. `stm32h7xx_hal_conf.h` 需开 `HAL_UART_MODULE_ENABLED` 和 `HAL_TIM_MODULE_ENABLED`
+4. xpack GCC 缺 cc1.exe → 换 arm-official 完整版（`Makefile` 里 GCC_PREFIX 已改）
+
+### 实机验证（2026-08-06 下午）
+- **烧录成功**：`abi_monitor_h743.bin` 14.68KB → 0x08000000，verify + software reset 通过
+- **固件运行验证**：上电后读 Flash 配置区 `0x081E0000` = `A5A5C0DE 04020103` ——
+  Config_Load 检测无有效配置并写入默认档位成功（magic A5A5C0DE + gear_n=3, div 1/2/4），
+  证明 CPU/Flash/CRC/系统时钟全部正常
+- **板上 LED**：白灯=电源指示常亮（正常）；蓝灯=PC13 用户 LED 被 LED_Init() 点亮（低电平点亮，正常），
+  同时证明固件已启动
+- 待验证：串口 921600 交互（HELP/ID/CFG/PWM 命令）、PWM 波形输出（示波器/电机）
+
+---
+
+## 待办
+- [ ] 串口验证 CLI（A9/A10 USB-TTL 转接线）
+- [ ] Task 2：编码器 ABI 捕获（TIM2 边沿中断 + TIM5 64 位时间戳）
+- [ ] Task 3：事件存储/回溯/抽稀档位切换
+- [ ] Task 4：BIN v2 帧 + PC 工具联调
+- [ ] Task 5：SD 卡存储（SDMMC1）
+- [ ] 电机动力电源接入后才能做的：PWM 驱动电机 + 转速闭环验证（用户需在接线后提醒）
