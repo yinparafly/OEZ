@@ -19,13 +19,18 @@
 #include "app_pwm.h"
 #include "abi.h"
 #include "snap_bin.h"
+#include "sd_card.h"
+
+/* Task 4：DONE 自动备份去重标志（每次触发完成只尝试一次） */
+static uint8_t g_snap_autosaved;
 
 void SystemClock_Config(void);
 
 int main(void)
 {
+	/* 注意：不使能 DCache——SDMMC 内部 DMA 直访内存，DCache 会导致
+	 * 读写缓冲不一致（读回陈旧 cache/写时 DMA 取脏数据）。数据量小，无需 cache。 */
 	SCB_EnableICache();
-	SCB_EnableDCache();
 	HAL_Init();
 	SystemClock_Config();
 
@@ -36,11 +41,26 @@ int main(void)
 	Abi_Init();			// ABI 编码器：TIM2 4X + EXTI4 Index + TIM5 UTO
 	Snap_Init();		// Task 3 事件记录管线
 	Cli_Init();			// 打印 banner
+	SD_Init();			// Task 4 SD 卡（SDMMC1，失败不阻塞）
+	Sd_Mount();			// 卡已插则挂载（无卡约 5s 超时后继续）
+	g_snap_autosaved = 0;
 
 	while (1)
 	{
 		Pm_Tick();		// PWM 油门渐变逼近目标（电调安全斜坡）
 		Cli_Poll();		// 轮询处理命令行
+
+		/*
+		 * Task 4 自动备份：
+		 * Snap DONE 且卡已挂载 -> 写一次（成功/失败均只试一次，不阻塞主循环）。
+		 * 卡未挂载时跳过（用户 SD INIT 后其 Sd_SaveSnap 手动补录）。
+		 * DONE 状态保持，兼容 SNAP 轮询验证。
+		 */
+		if (Snap_IsReady() && !g_snap_autosaved) {
+			g_snap_autosaved = 1;
+			if (SD_CardMounted())
+				Sd_SaveSnap();		// 内部打印 ok/fail
+		}
 	}
 }
 

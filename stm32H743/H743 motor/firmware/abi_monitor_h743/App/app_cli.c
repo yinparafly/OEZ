@@ -11,6 +11,7 @@
 #include "app_pwm.h"
 #include "abi.h"
 #include "snap_bin.h"
+#include "sd_card.h"
 #include "usart.h"
 #include "stm32h7xx_hal.h"
 #include <stdlib.h>
@@ -62,9 +63,14 @@ static void cli_help(void)
     put("RPM [ON|OFF]    - 转速（ON 每秒回显一次）\r\n");
     put("CNT              - counts + Index + µs\r\n");
     put("IDX              - Index 圈数\r\n");
-    put("ARM              - 预置触发（|rpm|>10 且转过一圈 → 回溯400点+记0.8s）\r\n");
+    put("ARM              - 预置触发（|rpm|>10 且转过一圈 → 回溯400点+记0.5s）\r\n");
     put("DISARM           - 取消触发预置\r\n");
     put("SNAP             - 状态/点数\r\n");
+    put("SD INIT          - 初始化 SD 卡并挂载 FatFS\r\n");
+    put("SD SAVE          - 手动把当前 snap 备份为 S<秒>.BIN（不覆盖）\r\n");
+    put("SD LS            - 列出卡内文件\r\n");
+    put("SD STAT          - 卡信息\r\n");
+    put("SD RAW [w] sec  - 裸扇区读写（诊断底层）\r\n");
     put("DBG              - GPIO 电平 + TIM2 寄存器\r\n");
 }
 
@@ -166,6 +172,31 @@ static void cli_snap(void)
     put("\r\n");
 }
 
+/* SD 卡（Task 4）：INIT / SAVE / LS / STAT */
+static void cli_sd(uint8_t n, char *argv[])
+{
+if (n < 2 || strcmp(argv[1], "INIT") == 0) {
+        uint8_t r = Sd_Mount();
+        put("SD init "); put_u32(r);
+        put(" (0=ok 1=no-card 2=no-fat)\r\n");
+        return;
+    }
+    if (strcmp(argv[1], "SAVE") == 0) {
+        uint8_t e = Sd_SaveSnap();
+        put("SD save ret="); put_u32(e);
+        put(" (0=ok 1=no-card 2=no-data 3=fail)\r\n");
+        return;
+    }
+    if (strcmp(argv[1], "LS") == 0)   { Sd_Ls();   return; }
+    if (strcmp(argv[1], "RAW") == 0)  {
+        uint8_t w = (n >= 3 && strcmp(argv[2], "w") == 0) ? 1 : 0;
+        uint32_t sec = (n >= 3) ? strtoul(argv[w ? 3 : 2], 0, 0) : 0;
+        Sd_Raw(sec, w); return;
+    }
+    if (strcmp(argv[1], "STAT") == 0) { Sd_Stat(); return; }
+    put("用法: SD INIT|SAVE|LS|RAW [sector]|STAT\r\n");
+}
+
 /* 诊断：GPIO 电平 + TIM2 寄存器（调试用） */
 static void cli_dbg(void)
 {
@@ -204,6 +235,7 @@ static void Cli_Process(const char *line, uint16_t len)
     else if (strcmp(argv[0], "ARM") == 0)        { Snap_Arm();    put("armed (等转速过阈+一整圈自动触发)\r\n"); }
     else if (strcmp(argv[0], "DISARM") == 0)     { Snap_Disarm(); put("disarmed\r\n"); }
     else if (strcmp(argv[0], "SNAP") == 0)       cli_snap();
+    else if (strcmp(argv[0], "SD") == 0)         cli_sd(n, argv);
     else if (strcmp(argv[0], "DBG") == 0)        cli_dbg();
     else {
         put("未知命令: "); put(argv[0]); put(" (输入 HELP)\r\n");

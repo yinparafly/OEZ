@@ -28,7 +28,8 @@ LDFLAGS  = $(CPU) $(FPU) -T gcc/stm32h743xx_flash.ld --specs=nano.specs --specs=
 INCLUDES = -IApp -ICore/Inc -IDrivers/STM32H7xx_HAL_Driver/Inc \
            -IDrivers/STM32H7xx_HAL_Driver/Inc/Legacy \
            -IDrivers/CMSIS/Device/ST/STM32H7xx/Include -IDrivers/CMSIS/Include \
-           -IDrivers/User/Inc
+           -IDrivers/User/Inc \
+           -IFatFs
 
 C_SOURCES = \
   Core/Src/main.c \
@@ -40,8 +41,11 @@ C_SOURCES = \
   App/app_pwm.c \
   App/abi.c \
   App/snap_bin.c \
+  App/sd_card.c \
   Drivers/User/Src/led.c \
   Drivers/User/Src/usart.c \
+  FatFs/ff.c \
+  FatFs/diskio.c \
   Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal.c \
   Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_cortex.c \
   Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_tim.c \
@@ -61,7 +65,10 @@ C_SOURCES = \
   Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_i2c_ex.c \
   Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_exti.c \
   Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart.c \
-  Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart_ex.c
+  Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart_ex.c \
+  Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_sd.c \
+  Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_sd_ex.c \
+  Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_ll_sdmmc.c
 
 ASM_SOURCES = gcc/startup_stm32h743xx.s
 
@@ -77,6 +84,9 @@ $(BUILD)/%.o: Core/Inc/%.c | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILD)/%.o: App/%.c | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD)/%.o: FatFs/%.c | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILD)/%.o: Drivers/User/Src/%.c | $(BUILD)

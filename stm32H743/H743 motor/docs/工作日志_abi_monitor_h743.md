@@ -127,3 +127,33 @@ P1-1 DIO(SWDIO/PA13) â†’ SWDIOï¼›P1-2 SWCLK â†’ SWCLKï¼›P1-3 GNDï¼›P1-4 5Vï¼ˆä¸
 - [ ] Task 4ï¼šBIN v2 å¸§ + PC å·¥å…·è”è°ƒ
 - [ ] Task 5ï¼šSD å¡å­˜å‚¨ï¼ˆSDMMC1ï¼‰
 - [ ] ç”µæœºåŠ¨åŠ›ç”µæºæŽ¥å…¥åŽæ‰èƒ½åšçš„ï¼šPWM é©±åŠ¨ç”µæœº + è½¬é€Ÿé—­çŽ¯éªŒè¯ï¼ˆç”¨æˆ·éœ€åœ¨æŽ¥çº¿åŽæé†’ï¼‰
+
+---
+
+### 2026-08-07£ºTask 4 SD ¿¨´æ´¢£¨SDMMC1 + FatFS ×Ô¶¯±¸·Ý£¬ÉÏ°åÑéÖ¤Í¨¹ý£©
+- ¿½±´»ù´¡Àý³Ì FatFS£¨**R0.13**£ºff.c/ff.h/ffconf.h/integer.h/diskio.h£©¡ú `firmware/abi_monitor_h743/FatFS`£»ffconf£º`FF_USE_LFN=0`¡¢`FF_VOLUMES=1`¡¢`FF_MAX_SS=512`¡¢`FF_FS_TINY=1`
+- ×ÔÐ´ `FatFS/diskio.c` glue£¨²»ÓÃÀý³Ì sd_diskio/ff_gen_drv£©£ºHAL_SD ÂÖÑ¯¶ÁÐ´£¬ClockDiv=10 ¡ú 24MHz£»`get_fattime()` ·µ»Ø 0£¨ÎÞ RTC£©
+- ×Ô½¨ `App/sd_card.c/h`£ºSd_Init£¨ÃÝµÈ£©/Sd_Mount/Sd_SaveSnap/Sd_Ls/Sd_Raw/Sd_Stat
+- **ÎÄ¼þÃû·À¸²¸Ç£¨ÓÃ»§ÒªÇó£©**£º`S%07lu.BIN` Ãë¼¶Ê±¼ä´Á + `FA_CREATE_NEW`£¬FR_EXIST Ãë+1 ÖØÊÔ ¡Ü60£¬¾ø²»¸²¸Ç¾ÉÎÄ¼þ
+- Ð´¿¨Ö¡ = BIN v2 Ö¡ + **crc32**£¨snap_bin.c ÐÂÔö `Snap_Points()`/`Snap_Crc32()` È« 256 ±í£©£¬PC ¹¤¾ß `abi_monitor.py` ¿ÉÔ­Ñù½âÎö£»SNAP_HZ=1000
+- CLI£ºSD INIT/SAVE/LS/RAW [w]/STAT£»main.c Æô¶¯¹ÒÔØ + ×Ô¶¯±¸·Ý£¨½ö `SD_CardMounted() && !g_snap_autosaved` Ò»´ÎÐÔ£©
+- Makefile ¼Ó hal_sd/hal_sd_ex/ll_sdmmc/FatFs Ô´Óë±àÒë¹æÔò£»hal_conf ¿ª `HAL_SD_MODULE_ENABLED`
+### °å¼¶ÅÅ²éµÄÈý¸ö¿Ó£¨¾ùÒÑÐÞ¸´£©
+1. **Ö÷Ñ­»·ËøËÀ**£ºSnap_IsReady¡úSd_SaveSnap¡úÎ´¹ÒÔØ¿¨·´¸´×èÈû HAL ³¬Ê± ¡ú ¹ÒÔØ³É¹¦ + Ò»´ÎÐÔ±êÖ¾²Å×Ô¶¯±£´æ
+2. **DCache Óë SDMMC ÄÚ²¿ DMA ²»Ò»ÖÂ**£¨RAW ¶Á»ØÈ« 0£©¡ú **main.c ½ûÓÃ DCache**£¨½ö ICache£¬×¢ÊÍÔ­Òò£©
+3. **FatFS »º³å·Ç 4B ¶ÔÆë** ¡ú SDMMC ÄÚ²¿ DMA ±¨´í£¨FR_DISK_ERR£©¡ú diskio.c ¼Ó `uint32_t[128] aligned(8)` ÖÐ×ª + memcpy Â·¾¶
+### Êµ»úÑéÖ¤£¨2026-08-07£©
+- ¿¨ 16GB FAT32£¨SDHC£¬type=1, blocks=31116288£©£»´®¿Ú COM21 @ 921600
+- `pc_tool/sd_verify.py` È«×Ô¶¯£¨PWM600 ~1s ¼´Í££¬ÑéÖ¤ state=3 ¡ú SD SAVE ¡ú LS£©
+- **½á¹û£ºsave ret=0£¬S000018.BIN / S000020.BIN sz=101495 = 11+8+6342¡Á16+4 ¾«È·Ò»ÖÂ**£»Á½´Î±£´æ²»¸²¸Ç ?£»RAW Ð´¶Á»Ø match ?
+- ÈÎÎñ 4 Íê³É£»ºóÐø£ºFlash ³Ö¾Ã»¯±£´æ + README£¨¼Æ»® Task 5/Step2£©
+
+---
+
+## ´ý°ì
+- [ ] ´®¿ÚÑéÖ¤ CLI£¨A9/A10 USB-TTL ×ª½ÓÏß£©
+- [x] Task 2£º±àÂëÆ÷ ABI ²¶»ñ£¨TIM2 ±ßÑØÖÐ¶Ï + TIM5 64 Î»Ê±¼ä´Á£©
+- [x] Task 3£ºÊÂ¼þ´æ´¢/»ØËÝ/³éÏ¡µµÎ»ÇÐ»»
+- [x] Task 4£ºSD ¿¨´æ´¢£¨SDMMC1 + FatFS ×Ô¶¯±¸·Ý£©
+- [ ] Task 5£ºBIN v2 Ö¡ + PC ¹¤¾ßÁªµ÷ / Flash ³Ö¾Ã»¯±£´æ
+- [ ] µç»ú¶¯Á¦µçÔ´½ÓÈëºó²ÅÄÜ×öµÄ£ºPWM Çý¶¯µç»ú + ×ªËÙ±Õ»·ÑéÖ¤£¨ÓÃ»§ÐèÔÚ½ÓÏßºóÌáÐÑ£©

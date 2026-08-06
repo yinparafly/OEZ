@@ -531,11 +531,11 @@ git commit -m "feat(h743): 事件记录管线 ring回溯+0.8s触发记录 BIN v2
 - Consumes: `Snap_BuildBin`、`Snap_IsReady`
 - Produces: `uint8_t Sd_Init(void)`、`uint8_t Sd_SaveSnap(void)`（写 `snap_YYYYMMDD_HHMMSS.bin`，返回 0=成功）
 
-- [ ] **Step 1: 移植 FatFS（diskio 适配 SDMMC1）**
+- [x] **Step 1: 移植 FatFS（diskio 适配 SDMMC1）**
 
 直接使用基础例程 `SDMMC-SD卡移植FatFs` 的 FatFS 源（ff.c/ff.h/diskio.c/sd_diskio.c + ffconf.h），其 `sd_diskio.c` 已封装 SDMMC1 块读写（block 512B，4bit）。`ffconf.h`：`FF_FS_MINIMIZE=0`、`FF_USE_STRFUNC=2`、`FF_FS_RPATH=1`、`FF_USE_MKFS=1`。
 
-- [ ] **Step 2: sd_save.c**
+- [x] **Step 2: sd_save.c**
 
 ```c
 #include "ff.h"
@@ -568,15 +568,24 @@ uint8_t Sd_SaveSnap(void)
 
 `g_snap_seq`：`app_config.c` 里 `uint32_t g_snap_seq`，每次保存自增，可掉电保存到配置扇区。
 
-- [ ] **Step 3: CLI 接入**
+- [x] **Step 3: CLI 接入**
 
 `SD INIT` → 挂载结果；`SD SAVE` → 保存并回显文件名、字节数、耗时；`LS` → `f_findfirst` 列出 snap_*.bin。SD 卡初始化失败回显中文错误，不阻塞监控功能。
 
-- [ ] **Step 4: 板级验证**
+> **实施记录（与计划的偏差，2026-08-07）**：
+> - **未用参考例程的 sd_diskio.c/ff_gen_drv**，改为自写 `FatFs/diskio.c` glue（直接 HAL_SD_Read/WriteBlocks），FatFS 源码取自基础例程（**R0.13**：`FIL.obj.objsize`、diskio 用 `DWORD sector`，非 R0.15 LBA_t）。
+> - **不建 512KB 静态缓冲**：`SNAP_CAP=31000` 点 snap 数组已在 AXI SRAM，直接流式 `f_write`（FF_FS_TINY=1 用 FatFS 的 512B 尾部）。BSS 515856B，RAM 约余 8.4KB。
+> - **文件名防覆盖（用户要求）**：`S%07lu.BIN`（8.3 短名，秒级时间戳），`f_open(FA_CREATE_NEW)`，FR_EXIST 则秒+1 重试 ≤60，绝不覆盖旧文件；成功/失败均回显。
+> - **写卡帧 = BIN v2 + crc32**（zlib CRC32 全 256 表 `Snap_Crc32`），PC 端 `abi_monitor.py` 可原样解析。
+> - **三个板级坑（已修复）**：① 主循环挂载未成功时反复阻塞 → 仅 `SD_CardMounted() && !g_snap_autosaved` 一次性自动备份；② **DCache 与 SDMMC 内部 DMA 数据不一致（RAW 读回全 0）→ main.c 禁用 DCache**（只 ICache）；③ 非 4B 对齐缓冲触发 SDMMC DMA 对齐要求 → diskio.c 加 `uint32_t[128] aligned(8)` 中转，未对齐走 memcpy。
+> - 电机验证短暂（~1s 即 PWM 0），`sdr_verify.py` 全自动脚本（串口 COM21 @ 921600）。
+> - 用户要求"芯片保存之后，在卡里备份一份"——本任务只做 SD 备份路径；Flash 保存/断电恢复为后续任务（计划 `Flash 持久化`）。
 
-插卡（FAT32）→ `SD INIT` 成功；`ARM`+转电机 → `SD SAVE` 成功；`LS` 看到文件；拔出插 PC，文件能被原版 PC 工具曲线打开。
+- [x] **Step 4: 板级验证**
 
-- [ ] **Step 5: 提交**
+插卡（FAT32）→ `SD INIT` 成功；`ARM`+转电机 → `SD SAVE` 成功；`LS` 看到文件。**已上板验证**：PWM600 ~1s → state=3 count=6342 ready=1 → `SD save ret=0`，`S000018.BIN`/`S000020.BIN` **sz=101495 与帧长 11+8+6342×16+4 精确一致**；两次保存不覆盖 ✓；RAW 诊断写读回 match ✓。
+
+- [x] **Step 5: 提交**
 
 ```bash
 git add "H743 motor/firmware/abi_monitor_h743"
