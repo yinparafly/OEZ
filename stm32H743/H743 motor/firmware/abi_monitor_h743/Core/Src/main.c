@@ -17,6 +17,7 @@
 #include "app_cli.h"
 #include "app_config.h"
 #include "app_pwm.h"
+#include "abi.h"
 
 void SystemClock_Config(void);
 
@@ -31,10 +32,12 @@ int main(void)
 	Usart_Init();		// 串口 921600
 	Config_Load();		// 读取 Flash 配置（失效则重置默认）
 	Pm_Init();			// 测试 PWM（TIM3_CH2/PA7，占空比 0）
+	Abi_Init();			// ABI 编码器：TIM2 4X + EXTI4 Index + TIM5 UTO
 	Cli_Init();			// 打印 banner
 
 	while (1)
 	{
+		Pm_Tick();		// PWM 油门渐变逼近目标（电调安全斜坡）
 		Cli_Poll();		// 轮询处理命令行
 	}
 }

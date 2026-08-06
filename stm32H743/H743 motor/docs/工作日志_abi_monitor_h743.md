@@ -62,6 +62,25 @@ P1-1 DIO(SWDIO/PA13) → SWDIO；P1-2 SWCLK → SWCLK；P1-3 GND；P1-4 5V（不
 
 ## 时间线
 
+### 2026-08-06（晚）：Task 2 测速修复 + 油门特性自学习
+- **测速 bug 修复（3 个，rpm 从溢出垃圾值 → 正确读数）**：
+  1. TIM2 CNT 上电为垃圾值（曾读到 4294756902≈2³²-21万）→ `Abi_Init` 后 `__HAL_TIM_SET_COUNTER(&htim2, 0)` 清零起点
+  2. EXTI4 Index 配了 `RISING_FALLING` → idx 每转 +2（Δcnt/Δidx≈2000 而非 4000）→ 改只上升沿
+  3. 编码器 A/B 相序导致 TIM2 反向计数（正转 cnt 递减）→ UTO ISR 与 `Abi_GetCnt` 统一取反 `0u - CNT`，rpm 显示正数
+- 修复后交叉验证：PWM 900 → rpm≈6000，idx 增速一致（Δcnt/Δidx≈4000，每转 4000 counts 确认）
+- **rpm 合理性钳制**：±60000 rpm 超限截断（防单帧异常污染）
+- **新增 `pc_tool/learn_ramp.py` 油门特性自学习**（8 档连续爬升，每档 2s 斜坡+1s 采样×3，超 10000rpm 停机，finally 必 PWM 0）
+  - 首跑结果（空载）：
+    ```
+    125‰→1113rpm  250‰→3196  375‰→4571  500‰→5166
+    625‰→5472     750‰→5555  875‰→5800  1000‰→6303
+    启动油门 ≈ 125‰
+    ```
+  - 曲线形状：0~500‰ 近似线性（~10rpm/‰），500~1000‰ 趋于饱和（电调/电机特性）
+- 输出：`pc_tool/calib/learn_20260806_224602.csv` + `learn_notes.md`（空载声明，载荷/电机/电调改变须重新学习）
+
+---
+
 ### 2026-08-06：Task 1 骨架 + Task 1A PWM（编译/烧录/实机验证全部打通）
 - 拷贝 `1.LED闪烁` 例程 → `firmware\abi_monitor_h743`（完整 Keil 工程 + 源码）
 - 自建 `Drivers\User\Src\usart.c/h`（USART1 921600，中断收 FIFO，IRQ 直接在 usart.c，回调 `Cli_OnChar`）

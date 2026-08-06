@@ -9,7 +9,9 @@
 #include "app_cli.h"
 #include "app_config.h"
 #include "app_pwm.h"
+#include "abi.h"
 #include "usart.h"
+#include "stm32h7xx_hal.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -56,6 +58,10 @@ static void cli_help(void)
     put("CFG GEAR n d1..dn b1..b(n-1)\r\n");
     put("                  - 设置 n 档抽稀（5files_max=5, d=1/2/4/8/16, b 逐增）\r\n");
     put("PWM 0..1000      - 测试电机占空比（‰，0 停机）\r\n");
+    put("RPM [ON|OFF]    - 转速（ON 每秒回显一次）\r\n");
+    put("CNT              - counts + Index + µs\r\n");
+    put("IDX              - Index 圈数\r\n");
+    put("DBG              - GPIO 电平 + TIM2 寄存器\r\n");
 }
 
 static void cli_id(void)
@@ -117,6 +123,50 @@ static void cli_pwm(uint8_t n, char *argv[])
     put("PWM = "); put_u32(d); put("‰\r\n");
 }
 
+/* ---------- ABI 状态（Task 2） ---------- */
+
+static uint8_t cli_rpm_mon;   /* RPM ON 时每秒回显 */
+
+static void put_i32(int32_t v)
+{
+    if (v < 0) { put("-"); v = -v; }
+    put_u32((uint32_t)v);
+}
+
+static void cli_rpm(uint8_t n, char *argv[])
+{
+    if (n >= 2 && strcmp(argv[1], "ON") == 0)  { cli_rpm_mon = 1; put("rpm monitor on\r\n"); return; }
+    if (n >= 2 && strcmp(argv[1], "OFF") == 0) { cli_rpm_mon = 0; put("rpm monitor off\r\n"); return; }
+    put("rpm = "); put_i32(Abi_GetRpm()); put(" rpm, div = "); put_u32(Abi_GetDiv()); put("\r\n");
+}
+
+static void cli_cnt(void)
+{
+    put("cnt = "); put_u32(Abi_GetCnt());
+    put(", idx = "); put_u32(Abi_GetIndexCnt());
+    put(", us = "); put_u32(Abi_GetUsNow());
+    put("\r\n");
+}
+
+static void cli_idx(void)
+{
+    put("idx = "); put_u32(Abi_GetIndexCnt()); put("\r\n");
+}
+
+/* 诊断：GPIO 电平 + TIM2 寄存器（调试用） */
+static void cli_dbg(void)
+{
+    uint32_t idr = GPIOA->IDR;
+    put("PA1="); put_u32((idr >> 1) & 1);
+    put(" PA4="); put_u32((idr >> 4) & 1);
+    put(" PA5="); put_u32((idr >> 5) & 1);
+    put("  TIM2: SMCR="); put_u32(TIM2->SMCR);
+    put(" CCMR1="); put_u32(TIM2->CCMR1);
+    put(" CCER="); put_u32(TIM2->CCER);
+    put(" CNT="); put_u32(TIM2->CNT);
+    put("\r\n");
+}
+
 /* ---------- 行缓冲处理 ---------- */
 
 static void Cli_Process(const char *line, uint16_t len)
@@ -135,6 +185,10 @@ static void Cli_Process(const char *line, uint16_t len)
     else if (strcmp(argv[0], "ID") == 0)         cli_id();
     else if (strcmp(argv[0], "CFG") == 0)        cli_cfg(n, argv);
     else if (strcmp(argv[0], "PWM") == 0)        cli_pwm(n, argv);
+    else if (strcmp(argv[0], "RPM") == 0)        cli_rpm(n, argv);
+    else if (strcmp(argv[0], "CNT") == 0)        cli_cnt();
+    else if (strcmp(argv[0], "IDX") == 0)        cli_idx();
+    else if (strcmp(argv[0], "DBG") == 0)        cli_dbg();
     else {
         put("未知命令: "); put(argv[0]); put(" (输入 HELP)\r\n");
     }
@@ -172,6 +226,17 @@ void Cli_OnChar(char c)
 
 void Cli_Poll(void)
 {
+    static uint32_t last_ms;
+    if (!cli_rpm_mon) { last_ms = 0; return; }
+    uint32_t now = HAL_GetTick();
+    if (last_ms == 0) last_ms = now;
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+    put("rpm = "); put_i32(Abi_GetRpm());
+    put(", cnt = "); put_u32(Abi_GetCnt());
+    put(", idx = "); put_u32(Abi_GetIndexCnt());
+    put(", div = "); put_u32(Abi_GetDiv());
+    put("\r\n");
 }
 
 /* 供 usart.c / 其余模块复用的小工具 */

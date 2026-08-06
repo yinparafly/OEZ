@@ -386,11 +386,16 @@ uint32_t Abi_GetUsDelta(uint64_t prev) {                                // 差�
 
 UART 触发/回溯等需要 "当前 µs" 的地方统一走 `Abi_GetUsNow()`。
 
-- [ ] **Step 7: 板级验证**
+- [x] **Step 7: 板级验证**（2026-08-06 完成，含测速修复）
 
 电机手动/低速转动：`ID` 确认版本；CLI 加 `RPM` 命令每秒回显一次转速、`CNT` 回显 counts、`IDX` 回显 Index 次数。正向转一圈 → 约 +4000±校准偏差；Index 每圈 +1。空转无脉冲时 rpm→0。
 
-- [ ] **Step 8: 提交**
+> **实施偏差（2026-08-06 已验证）**：
+> - 实测修复 3 个 bug 后才获得正确读数（详见工作日志）：TIM2 CNT 上电垃圾值需清零；EXTI4 只能上升沿（RISING_FALLING 导致 idx 每转 +2）；A/B 相序反向需读数取反
+> - 实测每转确为 4000 counts（Δcnt/Δidx≈4000 交叉验证）；rpm 读数与 idx 速率一致，测速可靠
+> - `PWM` 驱动电机实测：PWM 900 → ~6000rpm（空载）；油门特性曲线见 `pc_tool/calib/learn_notes.md`
+
+- [x] **Step 8: 提交**
 
 ```bash
 git add "H743 motor/firmware/abi_monitor_h743"

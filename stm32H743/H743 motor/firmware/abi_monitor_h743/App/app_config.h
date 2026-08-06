@@ -36,6 +36,11 @@
 
 /*------------------------------------------ 接口 ------------------------------------*/
 
+extern uint32_t cfg_baud;
+extern uint8_t  cfg_gear_n;                          /* 当前档数 3/4/5 */
+extern uint8_t  cfg_gear_div[CFG_GEAR_MAX];          /* div 表 */
+extern uint32_t cfg_gear_bnd[CFG_GEAR_MAX - 1];      /* rpm 边界 */
+
 void    Config_Load(void);
 void    Config_Save(void);
 void    Config_Reset(void);
