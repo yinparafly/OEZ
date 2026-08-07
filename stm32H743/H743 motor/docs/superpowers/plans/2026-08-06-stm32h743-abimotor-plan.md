@@ -136,11 +136,11 @@ void Config_Load(void)
 
 `Config_Save()`：HAL_FLASH 擦扇区 + 编程写入；CRC 用查表法（代码里直接附 CRC16 表）。注意 H743 Flash 编程必须先在 `HAL_Init()` 后 `HAL_FLASH_Unlock()`；写完后 `HAL_FLASH_Lock()`；读配置不需解锁。
 
-- [ ] **Step 5: 板级验证**
+- [x] **Step 5: 板级验证**（2026-08-06 上板通过）
 
 串口助手 921600 发 `ID` → 回 `ABI-MONITOR-H743 v0.1`；`CFG GEAR 4 1 2000 2 4000 4 8000 8` → `OK`；`CFG SHOW` → 显示 4 档表；`CFG RESET` + 断电重启 → 恢复 3 档默认。LED1 闪烁确认主循环运行。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add "H743 motor/firmware/abi_monitor_h743"
@@ -163,7 +163,7 @@ git commit -m "feat(h743): 工程骨架+CLI+配置存取(3/4/5档可调)"
 - Produces: `void Snap_OnIndex(void)`（EXTI4 ISR 调用）
 - Produces: `int32_t Abi_GetRpm(void)`、`uint32_t Abi_GetIndexCnt(void)`、`uint32_t Abi_GetUsNow(void)`
 
-- [ ] **Step 1: 写头文件 abi.h（接口 + 常量）**
+- [x] **Step 1: 写头文件 abi.h（接口 + 常量）**
 
 ```c
 #pragma once
@@ -188,7 +188,7 @@ uint32_t Abi_GetUsNow(void);   // 64 位 µs 计数的低 32 位
 uint8_t Abi_GetDiv(void);
 ```
 
-- [ ] **Step 2: TIM2 编码器初始化（4X 模式）**
+- [x] **Step 2: TIM2 编码器初始化（4X 模式）**
 
 ```c
 // abi.c
@@ -225,7 +225,7 @@ void Abi_Init(void)
 
 PA5/PA1 上电后由 TIM2 编码器模块直接 4X 计数，CNT 读回即真实 counts（不用中断数边沿）。
 
-- [ ] **Step 3: EXTI4（Index）初始化 + ISR**
+- [x] **Step 3: EXTI4（Index）初始化 + ISR**
 
 ```c
 // PA4 接 Index，EXTI4（AS5047P 的 Index 为单脉冲，上升/下降沿均可）
@@ -253,7 +253,7 @@ void EXTI4_IRQHandler(void)
 }
 ```
 
-- [ ] **Step 4: UTO 自适应定时器（TIM5，32 位动态周期）**
+- [x] **Step 4: UTO 自适应定时器（TIM5，32 位动态周期）**
 
 时钟链（例程实测推导，务必运行时打印核对）：HSE=25MHz → PLL1 ×192/2 = **SYSCLK 480MHz** → AHB ÷2 = **HCLK 240MHz** → APB1 ÷2 = **PCLK1 120MHz** → TIM5 = **2×PCLK1 = 240MHz**（H7 规则：APB 预分频≠1 时定时器时钟 = APB×2；**不是 480MHz**——那需要 HCLK 也 480MHz，本例程没有）。
 
@@ -296,7 +296,7 @@ QUPR 换算（60MHz 刻度，DSP 是 150MHz → 刻度数 = QUPR_dsp × 60/150 =
 
 （若 TIM5 被占用可退回 TIM4 + Prescaler=39 → 6MHz 刻度、QUPR_MAX=15000 在 16 位内；本板 ioc 未用 TIM5，无冲突。）
 
-- [ ] **Step 5: UTO ISR —— 事件读取 + 64 位时间戳 + 动态周期 + 抽稀**
+- [x] **Step 5: UTO ISR —— 事件读取 + 64 位时间戳 + 动态周期 + 抽稀**
 
 ```c
 // stm32h7xx_it.c —— 全局 64 位刻度计数（纯硬件，无 HAL_GetTick 抖动）
@@ -354,7 +354,7 @@ uint8_t Abi_GetDiv(void)
 }
 ```
 
-- [ ] **Step 6: 测速（事件差分）**
+- [x] **Step 6: 测速（事件差分）**
 
 ```c
 static int32_t g_rpm;
@@ -512,7 +512,7 @@ PWM 500 → state 3, count=9849（点率随转速下降）       验证通过
 ```
 
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add "H743 motor/firmware/abi_monitor_h743"
@@ -683,7 +683,7 @@ git commit -m "feat(h743): Index实测步数 EMA 校准 + 方向极性可配"
 **Files:**
 - Modify: `firmware/abi_monitor_h743/README.md`（新建）
 
-- [ ] **Step 1: 全流程实测**
+- [x] **Step 1: 全流程实测**（2026-08-07 通过：ARM→PWM900 1.5s→自动done+Flash/SD保存→DUMP PC帧magic=AB1C0002 n=6850 crc校验→reset后stored=6850持久）
 
 1. 接线确认：**A→PA5（TIM2_CH1）、B→PA1（TIM2_CH2）、Index→PA4（EXTI4）**，GND 共地，3.3V 电平。PA0 也可用（丝印 A0 已引出），可作 A 信号备选（PA0=TIM2_CH1 同功能）。
 2. `ID`/`CFG SHOW` → 默认 3 档 1/2/4。
@@ -692,11 +692,11 @@ git commit -m "feat(h743): Index实测步数 EMA 校准 + 方向极性可配"
 5. 弹射场景模拟：0→6500rpm 快速拉升，验证 0.8s 窗口点数在各档位下 ≤ SNAP_CAP（div=1 峰值 21.3k 点、div=2 峰值 21.3k 点、div=4 峰值 12k 点，均 < 32k）。
 6. 断电重启 → 配置仍在（Flash 持久化）。
 
-- [ ] **Step 2: 写 README**
+- [x] **Step 2: 写 README**（Task5 已写，Task6 补 CAL/POL 命令）
 
 接线图、CLI 命令表、BIN v2 格式说明、PC 工具使用步骤（放 `H743 motor/README.md`）。**0.8s 窗口截断说明**（必写）：默认档位（1/2/4 @ 4000/8000）下记录点率 ≤ 26.7kHz（div=1@4000 峰值 21.3k 点/0.8s，div=2@8000 峰值 21.3k 点/0.8s，div=4@12000 峰值 12k 点/0.8s），0.8s 窗口恒不截断；**若手动把高速档 div 降到 1**（如 `CFG GEAR 3 1 4000 1 8000 1`），记录点率可能 > SNAP_CAP/0.8s，窗口被截短——事件点超 32768 即停，实际时长 = 32768/点率。
 
-- [ ] **Step 3: 提交**
+- [x] **Step 3: 提交**
 
 ```bash
 git add "H743 motor/firmware/abi_monitor_h743" "H743 motor/README.md"
