@@ -3165,7 +3165,14 @@ if __name__ == "__main__":
         _lock.bind(("127.0.0.1", _lock_port))
         _lock.listen(1)
     except OSError:
-        print("ABI monitor already running — exit duplicate")
+        # 已有实例在运行：提示而不是无声退出，避免"双击没反应"
+        import tkinter.messagebox as _mb
+
+        _mb.showerror(
+            "ABI 监控已打开",
+            "另一扇窗已经在运行。\n"
+            "请先关闭已打开的 ABI 监控窗口（或在任务管理器结束残留 python 进程），再重试。",
+        )
         sys.exit(0)
     # 保持引用，避免 GC 释放端口导致误开第二实例
     globals()["_ABI_UI_LOCK"] = _lock
