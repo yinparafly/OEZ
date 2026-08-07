@@ -6,10 +6,10 @@
 
 /* BIN v2 帧头 + 16B 事件点，与 PC 工具字节级兼容 */
 #define SNAP_MAGIC_V2   0xAB1C0002uL
-#define SNAP_BACKTRACK  400uL          /* 回溯点数 */
+#define SNAP_BACKTRACK  100uL          /* 触发回溯点数（实测触发前点基本为 0，100 足够） */
 #define SNAP_DUR_US     500000uL       /* 触发后记录 0.5s（用户定：减小窗口+SD实时写可行） */
 
-/* 环形缓存 2^10（避免数组超 RAM）：回溯 400 点 + 余量 */
+/* 环形缓存 2^10（避免数组超 RAM）：回溯 100 点 + 余量 */
 #define RING_CAP_BITS   10uL
 #define RING_CAP        (1uL << RING_CAP_BITS)
 
@@ -22,7 +22,7 @@
 #define SNAP_HZ         1000u
 
 void  Snap_Init(void);
-void  Snap_OnEvent(uint32_t cnt, uint32_t idx, uint32_t us_now);
+void  Snap_OnEvent(uint32_t cnt, uint32_t idx, uint32_t us_now, uint32_t sub_us);
 void  Snap_OnIndex(void);
 void  Snap_Arm(void);
 void  Snap_Disarm(void);

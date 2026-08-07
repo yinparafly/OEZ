@@ -40,12 +40,12 @@ void Snap_Disarm(void)
     state = 0; armed_moving = 0;
 }
 
-void Snap_OnEvent(uint32_t cnt, uint32_t idx, uint32_t us_now)
+void Snap_OnEvent(uint32_t cnt, uint32_t idx, uint32_t us_now, uint32_t sub_us)
 {
     SnapPt p;
     p.t_us = us_now;
     p.c_lo = cnt;
-    p.c_hi = 0;
+    p.c_hi = sub_us;              /* 亚µs 余数（0..59），LOG DUMP 复原全精度 */
     p.idx  = idx;
 
     /* 自动触发判定：ARM 且 |rpm| > 阈值 → 等下一 Index */

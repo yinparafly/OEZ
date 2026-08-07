@@ -19,6 +19,16 @@ uint32_t cfg_gear_bnd[CFG_GEAR_MAX - 1] = {4000, 8000, 0, 0}; /* 边界 rpm */
 uint32_t cfg_steps_per_rev = CFG_STEPS_PER_REV_DEFAULT;    /* 实测一圈步数（Index→Index EMA） */
 uint8_t  cfg_pol  = CFG_POL_DEFAULT;                        /* A/B 方向极性 */
 
+/* Task 8 动态滤波参数（全自动默认；人工范围/改表可覆盖） */
+uint8_t  cfg_flt_ema0 = FLT_EMA_DEF;
+uint8_t  cfg_flt_dpos = FLT_DPOS_DEF;
+uint8_t  cfg_flt_zero = FLT_ZERO_DEF;
+uint16_t cfg_flt_rate = FLT_RATE_DEF;
+uint8_t  cfg_flt_icf[FLT_ICF_N]     = FLT_ICF_DEF;
+uint16_t cfg_flt_bnd[FLT_ICF_N - 1] = FLT_BND_DEF;
+uint8_t  cfg_flt_icf_min = FLT_ICF_MIN_DEF;
+uint8_t  cfg_flt_icf_max = FLT_ICF_MAX_DEF;
+
 #define CFG_FLASH_SECTOR    7               /* 0x081E0000 = Bank2 第 8 个扇区（0..7）*/
 
 typedef struct {
@@ -29,6 +39,15 @@ typedef struct {
     uint8_t  pol;                        /* A/B 方向极性 */
     uint8_t  rsvd;
     uint32_t gear_bnd[CFG_GEAR_MAX - 1];
+    uint8_t  flt_ema0;
+    uint8_t  flt_dpos;
+    uint8_t  flt_zero;
+    uint8_t  flt_icf_min;
+    uint8_t  flt_icf_max;
+    uint8_t  pad1;
+    uint16_t flt_rate;
+    uint8_t  flt_icf[FLT_ICF_N];
+    uint16_t flt_bnd[FLT_ICF_N - 1];
     uint16_t crc;                        /* CRC16，查表 */
     uint16_t pad;
 } AppCfg;
@@ -89,6 +108,15 @@ static void Cfg_Default(AppCfg *c)
     c->gear_div[0] = 1; c->gear_div[1] = 2; c->gear_div[2] = 4;
     c->gear_bnd[0] = 4000; c->gear_bnd[1] = 8000;
     c->pol = CFG_POL_DEFAULT;
+    c->flt_ema0   = FLT_EMA_DEF;
+    c->flt_dpos   = FLT_DPOS_DEF;
+    c->flt_zero   = FLT_ZERO_DEF;
+    c->flt_rate   = FLT_RATE_DEF;
+    c->flt_icf[0] = 0x0F; c->flt_icf[1] = 0x0A; c->flt_icf[2] = 0x06;
+    c->flt_icf[3] = 0x04; c->flt_icf[4] = 0x01;
+    c->flt_bnd[0] = 500;  c->flt_bnd[1] = 1500; c->flt_bnd[2] = 4000; c->flt_bnd[3] = 8000;
+    c->flt_icf_min = FLT_ICF_MIN_DEF;
+    c->flt_icf_max = FLT_ICF_MAX_DEF;
     c->crc = Crc16((const uint8_t *)c, sizeof(AppCfg) - 4);
 }
 
@@ -107,6 +135,14 @@ void Config_Load(void)
     memcpy(cfg_gear_bnd, g_cfg.gear_bnd, sizeof(cfg_gear_bnd));
     cfg_steps_per_rev = g_cfg.steps_per_rev;
     cfg_pol = g_cfg.pol;
+    cfg_flt_ema0   = g_cfg.flt_ema0;
+    cfg_flt_dpos   = g_cfg.flt_dpos;
+    cfg_flt_zero   = g_cfg.flt_zero;
+    cfg_flt_rate   = g_cfg.flt_rate;
+    memcpy(cfg_flt_icf, g_cfg.flt_icf, sizeof(cfg_flt_icf));
+    memcpy(cfg_flt_bnd, g_cfg.flt_bnd, sizeof(cfg_flt_bnd));
+    cfg_flt_icf_min = g_cfg.flt_icf_min;
+    cfg_flt_icf_max = g_cfg.flt_icf_max;
 }
 
 void Config_Save(void)
@@ -138,6 +174,14 @@ static void Config_Persist(void)
     memcpy(g_cfg.gear_bnd, cfg_gear_bnd, sizeof(cfg_gear_bnd));
     g_cfg.steps_per_rev = cfg_steps_per_rev;
     g_cfg.pol           = cfg_pol;
+    g_cfg.flt_ema0   = cfg_flt_ema0;
+    g_cfg.flt_dpos   = cfg_flt_dpos;
+    g_cfg.flt_zero   = cfg_flt_zero;
+    g_cfg.flt_rate   = cfg_flt_rate;
+    memcpy(g_cfg.flt_icf, cfg_flt_icf, sizeof(cfg_flt_icf));
+    memcpy(g_cfg.flt_bnd, cfg_flt_bnd, sizeof(cfg_flt_bnd));
+    g_cfg.flt_icf_min = cfg_flt_icf_min;
+    g_cfg.flt_icf_max = cfg_flt_icf_max;
     g_cfg.crc = Crc16((const uint8_t *)&g_cfg, sizeof(AppCfg) - 4);
     Config_Save();
 }
@@ -189,5 +233,71 @@ void Config_SetStepsPerRev(uint32_t steps)
 void Config_SetPol(uint8_t pol)
 {
     cfg_pol = pol ? 1 : 0;
+    Config_Persist();
+}
+
+/*=================================== Task 8 动态滤波 =================================*/
+
+uint8_t  Config_GetFltEma(void)    { return cfg_flt_ema0; }
+uint8_t  Config_GetFltDpos(void)   { return cfg_flt_dpos; }
+uint8_t  Config_GetFltZero(void)   { return cfg_flt_zero; }
+uint16_t Config_GetFltRate(void)   { return cfg_flt_rate; }
+uint8_t  Config_GetFltIcf(uint8_t i)   { return (i < FLT_ICF_N) ? cfg_flt_icf[i] : 0; }
+uint16_t Config_GetFltBnd(uint8_t i)   { return (i < FLT_ICF_N - 1) ? cfg_flt_bnd[i] : 0; }
+uint8_t  Config_GetFltIcfMin(void) { return cfg_flt_icf_min; }
+uint8_t  Config_GetFltIcfMax(void) { return cfg_flt_icf_max; }
+
+uint8_t Config_SetFltEma(uint8_t v)    { if (v < 10 || v > 255) return 1; cfg_flt_ema0 = v; Config_Persist(); return 0; }
+uint8_t Config_SetFltDpos(uint8_t v)   { if (v < 2 || v > FLT_DPOS_MAX) return 1; cfg_flt_dpos = v; Config_Persist(); return 0; }
+uint8_t Config_SetFltZero(uint8_t v)   { if (v < 1 || v > FLT_ZERO_MAX) return 1; cfg_flt_zero = v; Config_Persist(); return 0; }
+uint8_t Config_SetFltRate(uint16_t v)  { if (v > FLT_RATE_MAX) return 1; cfg_flt_rate = v; Config_Persist(); return 0; }
+
+/* 改表项 i（0..4）：钳制到人工范围 [min,max] 内 */
+uint8_t Config_SetFltIcfTbl(uint8_t i, uint8_t v)
+{
+    if (i >= FLT_ICF_N || v > 0x0F) return 1;
+    if (v < cfg_flt_icf_min) v = cfg_flt_icf_min;
+    if (v > cfg_flt_icf_max) v = cfg_flt_icf_max;
+    cfg_flt_icf[i] = v;
+    Config_Persist();
+    return 0;
+}
+
+/* 改边界 i（0..3）：严格递增，且递增后仍单调 */
+uint8_t Config_SetFltBnd(uint8_t i, uint16_t v)
+{
+    if (i >= FLT_ICF_N - 1) return 1;
+    uint16_t lo = (i > 0) ? cfg_flt_bnd[i - 1] : 0;
+    uint16_t hi = (i < FLT_ICF_N - 2) ? cfg_flt_bnd[i + 1] : 0xFFFFu;
+    if (v <= lo || v >= hi) return 1;    /* 需严格递增 */
+    cfg_flt_bnd[i] = v;
+    Config_Persist();
+    return 0;
+}
+
+/* 人工范围：lo<=hi，且动态表所有值都应可落在范围内（这里只校验 lo<=hi，表值下次 SET 钳位） */
+uint8_t Config_SetFltRange(uint8_t lo, uint8_t hi)
+{
+    if (lo > 0x0F) lo = 0x0F;
+    if (hi > 0x0F) hi = 0x0F;
+    if (lo > hi) return 1;
+    cfg_flt_icf_min = lo;
+    cfg_flt_icf_max = hi;
+    Config_Persist();
+    return 0;
+}
+
+void Config_FltReset(void)
+{
+    cfg_flt_ema0   = FLT_EMA_DEF;
+    cfg_flt_dpos   = FLT_DPOS_DEF;
+    cfg_flt_zero   = FLT_ZERO_DEF;
+    cfg_flt_rate   = FLT_RATE_DEF;
+    uint8_t  def_icf[FLT_ICF_N]     = FLT_ICF_DEF;
+    uint16_t def_bnd[FLT_ICF_N - 1] = FLT_BND_DEF;
+    memcpy(cfg_flt_icf, def_icf, sizeof(cfg_flt_icf));
+    memcpy(cfg_flt_bnd, def_bnd, sizeof(cfg_flt_bnd));
+    cfg_flt_icf_min = FLT_ICF_MIN_DEF;
+    cfg_flt_icf_max = FLT_ICF_MAX_DEF;
     Config_Persist();
 }

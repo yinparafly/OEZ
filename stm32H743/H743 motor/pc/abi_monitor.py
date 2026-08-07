@@ -605,7 +605,7 @@ class App(tk.Tk):
 
         mon_box = ttk.LabelFrame(
             mid,
-            text="触发：武装环缓 → |RPM|>10 且 I 过1圈 → 回溯400点 + 再记2s → SD",
+            text="触发：武装环�?(|RPM|>10 �?I �?→ 回溯100点 + 再记2s �?SD",
             padding=12,
         )
         mon_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
@@ -693,6 +693,23 @@ class App(tk.Tk):
         ttk.Button(bf, text="回放该段", command=self._play_seg).pack(side=tk.LEFT, padx=2)
         self._set_mon_ui("idle")
 
+        # 动态滤波设置（收起/展开）
+        self._flt_expanded = False
+        self.var_flt_toggle = tk.StringVar(value="▶ 动态滤波设置（点击展开）")
+        # 测速滤波参数
+        self.var_flt_ema = tk.StringVar(value="150")
+        self.var_flt_dpos = tk.StringVar(value="6")
+        self.var_flt_zero = tk.StringVar(value="10")
+        self.var_flt_rate = tk.StringVar(value="0")
+        # IC 输入滤波动态表：icf[0..4] + bnd[0..3]
+        self.var_icf = tuple(tk.StringVar(value=v) for v in ("0x0F", "0x0A", "0x06", "0x04", "0x01"))
+        self.var_bnd = tuple(
+            tk.StringVar(value=v) for v in ("500", "1500", "4000", "8000")
+        )
+        # 人工范围钳制
+        self.var_flt_lo = tk.StringVar(value="0")
+        self.var_flt_hi = tk.StringVar(value="15")
+
         # 长采：默认可收起，需要时再展开
         self._cap_expanded = False
         self.var_cap_toggle = tk.StringVar(value="▶ 长采（点击展开）")
@@ -736,6 +753,62 @@ class App(tk.Tk):
         ttk.Button(self.cap_box, text="长采状态?", command=lambda: self._send("CAPTURE?")).pack(
             side=tk.LEFT, padx=2
         )
+
+        # ---- 动态滤波设置（可收起，Task 8）----
+        flt_wrap = ttk.Frame(self)
+        flt_wrap.pack(fill=tk.X, padx=8, pady=2)
+        self.btn_flt_toggle = ttk.Button(
+            flt_wrap, textvariable=self.var_flt_toggle, command=self._toggle_flt_panel
+        )
+        self.btn_flt_toggle.pack(fill=tk.X)
+        self.flt_box = ttk.LabelFrame(
+            flt_wrap, text="动态滤波：AUTO 全自动（按|rpm|查表·范围钳位）→ 人工可改", padding=8
+        )
+        # 默认收起，展开时才 pack
+        row0 = ttk.Frame(self.flt_box)
+        row0.pack(fill=tk.X, pady=2)
+        ttk.Label(row0, text="EMA‰:").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.var_flt_ema, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row0, text="dpos×:").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.var_flt_dpos, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row0, text="zero周期:").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.var_flt_zero, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row0, text="rate(rpm/s):").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.var_flt_rate, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Label(
+            row0,
+            text="(0=自动实测学习本机爬坡斜率；>0=手动指定您电机实测的爬坡斜率，超其 120% 判跳)",
+            foreground="#888",
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row0, text="范围(IC):").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.var_flt_lo, width=3).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row0, text="~").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.var_flt_hi, width=3).pack(side=tk.LEFT, padx=2)
+        row1 = ttk.Frame(self.flt_box)
+        row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text="ICF 表(val 0..15): ").pack(side=tk.LEFT)
+        for i, v in enumerate(self.var_icf):
+            ttk.Label(row1, text=f"icf[{i}]").pack(side=tk.LEFT, padx=(4, 0))
+            ttk.Entry(row1, textvariable=v, width=5).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(row1, text=" | 边界rpm: ").pack(side=tk.LEFT)
+        for i, v in enumerate(self.var_bnd):
+            ttk.Label(row1, text=f"bnd[{i}]").pack(side=tk.LEFT, padx=(4, 0))
+            ttk.Entry(row1, textvariable=v, width=6).pack(side=tk.LEFT, padx=(0, 2))
+        row2 = ttk.Frame(self.flt_box)
+        row2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(row2, text="应用到板子", command=self._apply_flt).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text="读取当前(FILT SHOW)", command=lambda: self._send("FILT SHOW")).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(row2, text="恢复自动默认(FILT RESET)", command=lambda: self._send("FILT RESET")).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Label(
+            row2,
+            text="解释：低速(0~500rpm)强滤波0x0F滤毛刺；高速(>8000rpm)弱滤波0x01防丢步；rate(0=实测学习)>0则限幅超其120%的跳变",
+            foreground="#666",
+        ).pack(side=tk.LEFT, padx=8)
+        # 展开状态由 _toggle_flt_panel 控制
 
         browse = ttk.LabelFrame(self, text="已接收数据 · 转速 vs 时间（可缩放）", padding=6)
         browse.pack(fill=tk.X, padx=8, pady=4)
@@ -2252,6 +2325,53 @@ class App(tk.Tk):
             self.cap_box.pack_forget()
             self.var_cap_toggle.set("▶ 长采（点击展开）")
 
+    def _toggle_flt_panel(self) -> None:
+        """展开/收起动态滤波设置（默认收起 → 全自动）。"""
+        self._flt_expanded = not getattr(self, "_flt_expanded", False)
+        if self._flt_expanded:
+            self.flt_box.pack(fill=tk.X, pady=(4, 0))
+            self.var_flt_toggle.set("▼ 动态滤波设置（点击收起）")
+        else:
+            self.flt_box.pack_forget()
+            self.var_flt_toggle.set("▶ 动态滤波设置（点击展开）")
+
+    def _parse_hex(self, s: str) -> int | None:
+        try:
+            return int(s.strip(), 0)
+        except ValueError:
+            return None
+
+    def _apply_flt(self) -> None:
+        """把面板值逐项下发（FILT …）：范围校验在固件端，成功后回显。"""
+        if not self.link:
+            messagebox.showwarning("滤波", "未连接")
+            return
+        try:
+            self._queue_cmd(f"FILT EMA {int(self.var_flt_ema.get())}")
+            self._queue_cmd(f"FILT DPOS {int(self.var_flt_dpos.get())}")
+            self._queue_cmd(f"FILT ZERO {int(self.var_flt_zero.get())}")
+            self._queue_cmd(f"FILT RATE {int(self.var_flt_rate.get())}")
+            lo = self._parse_hex(self.var_flt_lo.get())
+            hi = self._parse_hex(self.var_flt_hi.get())
+            if lo is None or hi is None:
+                messagebox.showwarning("滤波", "范围需为 0..15 整数")
+                return
+            self._queue_cmd(f"FILT RANGE {lo} {hi}")
+            for i, v in enumerate(self.var_icf):
+                val = self._parse_hex(v.get())
+                if val is None:
+                    messagebox.showwarning("滤波", f"icf[{i}] 需 0..15（可用 0x 前缀）")
+                    return
+                self._queue_cmd(f"FILT ICF {i} {val}")
+            for i, v in enumerate(self.var_bnd):
+                b = int(v.get())
+                self._queue_cmd(f"FILT BND {i} {b}")
+            self._queue_cmd("FILT SHOW")
+            self.var_info.set("动态滤波参数已下发（回显见日志）")
+        except ValueError:
+            messagebox.showwarning("滤波", "参数含非法数字")
+            self.var_info.set("滤波下发失败：参数非数字")
+
     def _open_curve_studio(self) -> None:
         """独立影视剪辑风格窗口：RPM / S积分 / 选区加速度。"""
         rec = self._selected_archive()
@@ -2875,6 +2995,12 @@ class App(tk.Tk):
             elif "NOISE" in line:
                 self._set_mon_ui("armed")
                 self.var_mon.set("噪声：临时池已丢弃")
+            elif "TRIGGER" in line and "record started" in line:
+                self._set_mon_ui("recording")
+                self.var_mon.set("已触发 · 记录中…（暂停刷新，完成后自动取回）")
+                self.var_info.set("H743 专注记录；完成后 UI 等 10s 自动下载")
+                self._plot_enabled.set(False)
+                self._toggle_plot()
             elif "DUMP BUSY" in line or "RECORD done" in line or line.startswith("# RECORD_DONE"):
                 # snap 路径：`RECORD done … → ALIVE then SD SAVE` — 等 SD/BLE PULL，勿发 LOG DUMP
                 if "RECORD done" in line and "SD SAVE" in line:
@@ -2903,7 +3029,7 @@ class App(tk.Tk):
                             self._dump_expect = n
                     except Exception:  # noqa: BLE001
                         pass
-                    self._schedule_read_once(150)
+                    self._schedule_read_once(10000)
             elif "AUTO DUMP PREP" in line or "AUTO DUMP FALLBACK" in line:
                 self._set_mon_ui("dumping")
                 self._ui_dumping = True

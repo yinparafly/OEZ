@@ -1648,8 +1648,6 @@ class CurveStudio(tk.Toplevel):
         sm_tag = p["sm_tag"]
         total = p["total"]
         show_raw, show_sm = p["show_raw"], p["show_sm"]
-        if not show_raw and not show_sm:
-            show_raw = True
         view = p["view"]
         preserve_view = p["preserve_view"]
         peak = max(ys_rpm) if ys_rpm else 0.0
@@ -1678,7 +1676,7 @@ class CurveStudio(tk.Toplevel):
                 )
                 yhi = max(yhi, peak_sm * 1.15)
             if not series:
-                series.append((xs, ys_rpm, "#1a6fb5", "|RPM|"))
+                series.append(([0.0, max(total, 0.01)], [0.0, 0.0], "#888", "未勾选曲线（勾选上方的线）"))
             self.chart.set_series(
                 series,
                 xlim=(0.0, max(total, 0.01)),
@@ -1780,16 +1778,18 @@ class CurveStudio(tk.Toplevel):
             if show_sm:
                 nr2, r20, r21 = _norm01(ys_rpm_sm)
                 series.append((xs, nr2, "#e67e22", f"RPM平滑后 [{r20:.0f}~{r21:.0f}]"))
-            ns, s0, s1 = _norm01(ys_s)
-            series.append((xs, ns, "#0b7a4b", f"S(←smooth) [{s0:.3g}~{s1:.3g}]"))
-            if tx and ay:
-                na, a0, a1 = _norm01(ay, signed=True)
-                series.append((tx, na, "#c0392b", f"a←rpm_smooth [{a0:.1f}~{a1:.1f}]"))
+                ns, s0, s1 = _norm01(ys_s)
+                series.append((xs, ns, "#0b7a4b", f"S(←smooth) [{s0:.3g}~{s1:.3g}]"))
+                if tx and ay:
+                    na, a0, a1 = _norm01(ay, signed=True)
+                    series.append((tx, na, "#c0392b", f"a←rpm_smooth [{a0:.1f}~{a1:.1f}]"))
+            if not series:
+                series.append(([0.0, max(total, 0.01)], [0.0, 0.0], "#888", "未勾选曲线"))
             self.chart.set_series(
                 series,
                 xlim=(0.0, max(total, 0.01)),
                 ylim=(-105, 105),
-                title="三线同图（S/a 基于平滑转速）",
+                title="三线同图（S/a 基于平滑转速，跟随「平滑后」勾选）",
                 xlabel="t (s)",
                 ylabel="%",
                 mark_in=mark_in,

@@ -83,6 +83,15 @@ static void cli_help(void)
     put("FSAVE            - 把当前 snap 写入芯片 Flash（掉电不丢）\r\n");
     put("DUMP             - 芯片记录按 PC 帧发出（abi_monitor.py 曲线还原）\r\n");
     put("DBG              - GPIO 电平 + TIM2 寄存器\r\n");
+    put("FILT SHOW        - 动态滤波参数\r\n");
+    put("FILT EMA <10..255>    - EMA α‰（默认 150）\r\n");
+    put("FILT DPOS <2..20>     - dpos 超限倍数 ×N_MIN（默认 6）\r\n");
+    put("FILT ZERO <1..60>     - 静止归零周期数（默认 10）\r\n");
+    put("FILT RATE <0..100000> - 爬坡斜率限幅 rpm/s（0=自动实测学习，默认 0）\r\n");
+    put("FILT ICF <i> <v>      - 动态表第 i 档滤波值 0..15（i=0..4）\r\n");
+    put("FILT BND <i> <rpm>    - 动态表第 i 边界 rpm（i=0..3，严格递增）\r\n");
+    put("FILT RANGE <lo> <hi>  - 人工范围钳制 0..15（lo<=hi）\r\n");
+    put("FILT RESET      - 恢复全自动默认表\r\n");
 }
 
 static void cli_id(void)
@@ -238,7 +247,12 @@ static void cli_monitor(uint8_t n, char *argv[])
     put("用法: MONITOR START|STOP\r\n");
 }
 
-/* LOG DUMP（PC UI 兼容）：snap 点按 D, 文本行回传 + D END（UI 自动拉取路径） */
+/* LOG DUMP（PC UI 兼容）：snap 点按 D, 文本行回传 + D END（UI 自动拉取路径）
+ * 测速对齐 ESP32 VEL_WINDOW：记录点多为抽稀事件（div≥1），裸相邻点差分会把
+ * UTO ARR 跳变/div 切换的非均匀间隔放大成尖刺（朋友分析②）。改为 LOG_WIN 点
+ * 窗口差分 rmp[i]=(c[i]-c[i-W])*60e6/((t[i]-t[i-W])*steps)，与固件/PC 多拍窗一致。 */
+#define LOG_DUMP_WIN 96
+
 static void cli_log_dump(void)
 {
     uint32_t n = Snap_Count();
@@ -247,11 +261,15 @@ static void cli_log_dump(void)
     uint32_t steps = Abi_GetStepsPerRev();
     for (uint32_t i = 0; i < n; i++) {
         int32_t rpm = 0;
-        if (i > 0) {
-            uint32_t dt_us = p[i].t_us - p[i - 1].t_us;
-            int32_t dc = (int32_t)(p[i].c_lo - p[i - 1].c_lo);
-            if (dt_us > 0)
-                rpm = (int32_t)(((int64_t)dc * 60000000LL) / (int64_t)dt_us / steps);
+        uint32_t j = (i >= LOG_DUMP_WIN) ? (i - LOG_DUMP_WIN) : 0;
+        if (j < i) {
+            /* 用亚µs 余数复原全精度时间（60MHz 刻度 → 量化误差 ~0.05%） */
+            uint64_t ti = (uint64_t)p[i].t_us * 60uLL + p[i].c_hi;
+            uint64_t tj = (uint64_t)p[j].t_us * 60uLL + p[j].c_hi;
+            uint64_t dt_tick = ti - tj;
+            int32_t dc = (int32_t)(p[i].c_lo - p[j].c_lo);
+            if (dt_tick > 0)
+                rpm = (int32_t)(((int64_t)dc * 60000000LL * 60LL) / (int64_t)dt_tick / steps);
         }
         int32_t dir = (rpm > 0) ? 1 : ((rpm < 0) ? -1 : 0);
         put("D,"); put_u32(p[i].t_us / 1000u);
@@ -323,7 +341,72 @@ static void cli_dbg(void)
     put(" CCMR1="); put_u32(TIM2->CCMR1);
     put(" CCER="); put_u32(TIM2->CCER);
     put(" CNT="); put_u32(TIM2->CNT);
+    put(" ICF="); put_u32(Abi_GetInputFilter());
     put("\r\n");
+}
+
+/* ---------- Task 8 动态滤波 ---------- */
+
+static void cli_filt_show(void)
+{
+    put("ema    = "); put_u32(Config_GetFltEma()); put("  (10..255 ‰)\r\n");
+    put("dpos   = "); put_u32(Config_GetFltDpos()); put("  (2..20 ×N_MIN)\r\n");
+    put("zero   = "); put_u32(Config_GetFltZero()); put("  (1..60 周期)\r\n");
+    put("rate   = "); put_u32(Config_GetFltRate()); put("  (低速 EMA: 200=20%%  <2000rpm;  中速 100=10%%  <4000rpm;  高速 40=4%%  >=4000rpm)\r\n");
+    put("range  = "); put_u32(Config_GetFltIcfMin()); put(".."); put_u32(Config_GetFltIcfMax());
+    put(" (IC 钳制范围 0..15)\r\n");
+    put("Table(|rpm|<bnd→icf):\r\n");
+    for (uint8_t i = 0; i < FLT_ICF_N; i++) {
+        put("  ["); put_u32(i); put("] icf="); put_u32(Config_GetFltIcf(i));
+        if (i + 1 < FLT_ICF_N) { put("  bnd="); put_u32(Config_GetFltBnd(i)); }
+        put("\r\n");
+    }
+    put("cur_icf(实时生效)="); put_u32(Abi_GetInputFilter()); put("\r\n");
+    put("icf 全自动: 按|rpm|查表档位 → 钳位到 range 内动态调整\r\n");
+}
+
+static void cli_filt(uint8_t n, char *argv[])
+{
+    if (n < 2 || strcmp(argv[1], "SHOW") == 0) { cli_filt_show(); return; }
+
+    if (strcmp(argv[1], "RESET") == 0)   { Config_FltReset(); put("filt reset done\r\n"); cli_filt_show(); return; }
+
+    if (n < 4) { put("用法: FILT <EMA|DPOS|ZERO|RATE|ICF|BND|RANGE> <值>\r\n"); return; }
+
+    if (strcmp(argv[1], "EMA") == 0) {
+        uint32_t v = strtoul(argv[2], 0, 0);
+        if (Config_SetFltEma((uint8_t)v)) { put("范围 10..255\r\n"); return; }
+        put("ema set = "); put_u32(cfg_flt_ema0); put("\r\n");
+    } else if (strcmp(argv[1], "DPOS") == 0) {
+        uint32_t v = strtoul(argv[2], 0, 0);
+        if (Config_SetFltDpos((uint8_t)v)) { put("范围 2..20\r\n"); return; }
+        put("dpos set = "); put_u32(cfg_flt_dpos); put("\r\n");
+    } else if (strcmp(argv[1], "ZERO") == 0) {
+        uint32_t v = strtoul(argv[2], 0, 0);
+        if (Config_SetFltZero((uint8_t)v)) { put("范围 1..60\r\n"); return; }
+        put("zero set = "); put_u32(cfg_flt_zero); put("\r\n");
+    } else if (strcmp(argv[1], "RATE") == 0) {
+        uint32_t v = strtoul(argv[2], 0, 0);
+        if (Config_SetFltRate((uint16_t)v)) { put("范围 0..100000\r\n"); return; }
+        put("rate set = "); put_u32(cfg_flt_rate); put("\r\n");
+    } else if (strcmp(argv[1], "RANGE") == 0) {
+        if (n < 4) { put("用法: FILT RANGE <lo> <hi>\r\n"); return; }
+        uint32_t lo = strtoul(argv[2], 0, 0), hi = strtoul(argv[3], 0, 0);
+        if (Config_SetFltRange((uint8_t)lo, (uint8_t)hi)) { put("需 lo<=hi, 0..15\r\n"); return; }
+        put("range set = "); put_u32(cfg_flt_icf_min); put(".."); put_u32(cfg_flt_icf_max); put("\r\n");
+    } else if (strcmp(argv[1], "ICF") == 0) {
+        if (n < 5) { put("用法: FILT ICF <i 0..4> <v 0..15>\r\n"); return; }
+        uint32_t i = strtoul(argv[2], 0, 0), v = strtoul(argv[3], 0, 0);
+        if (Config_SetFltIcfTbl((uint8_t)i, (uint8_t)v)) { put("i 0..4 / v 0..15\r\n"); return; }
+        put("icf["); put_u32(i); put("] set = "); put_u32(cfg_flt_icf[i]); put("\r\n");
+    } else if (strcmp(argv[1], "BND") == 0) {
+        if (n < 5) { put("用法: FILT BND <i 0..3> <rpm>\r\n"); return; }
+        uint32_t i = strtoul(argv[2], 0, 0), v = strtoul(argv[3], 0, 0);
+        if (Config_SetFltBnd((uint8_t)i, (uint16_t)v)) { put("需严格递增\r\n"); return; }
+        put("bnd 已设\r\n");
+    } else {
+        put("未知 FILT 子命令（FILT SHOW）\r\n");
+    }
 }
 
 /* ---------- 行缓冲处理 ---------- */
@@ -363,6 +446,7 @@ static void Cli_Process(const char *line, uint16_t len)
     else if (strcmp(argv[0], "FSAVE") == 0)      cli_fsave();
     else if (strcmp(argv[0], "DUMP") == 0)       cli_dump();
     else if (strcmp(argv[0], "DBG") == 0)        cli_dbg();
+    else if (strcmp(argv[0], "FILT") == 0)       cli_filt(n, argv);
     else {
         put("未知命令: "); put(argv[0]); put(" (输入 HELP)\r\n");
     }
@@ -379,17 +463,25 @@ void Cli_Init(void)
     put("输入 HELP 查看命令\r\n> ");
 }
 
-/* 接收一个字节：仅在收到 \r 或 \n 时判定一行结束 */
+static volatile uint8_t cli_line_ready;   /* ISR→主循环：一行就绪 */
+static char  cli_pending[CLI_LINE_MAX + 1];
+static volatile uint8_t cli_pending_len;
+
+/* 接收一个字节（来自 USART RX ISR）：仅缓冲，不在此处处理命令（防 ISR 内
+ * put() 阻塞 TX 死锁）。一行结束时设 ready 标志，交给主循环 Cli_Poll 处理。 */
 void Cli_OnChar(char c)
 {
     if (c == '\r' || c == '\n') {
-        if (cli_len) {
-            Cli_Process(cli_buf, cli_len);
+        if (cli_len && !cli_line_ready) {
+            cli_buf[cli_len] = '\0';
+            for (uint8_t i = 0; i <= cli_len; i++) cli_pending[i] = cli_buf[i];
+            cli_pending_len = cli_len;
+            cli_line_ready = 1;
             cli_len = 0;
         }
         return;
     }
-    if (c == 0x08 || c == 0x7F) {                       /* backspace */
+    if (c == 0x08 || c == 0x7F) {
         if (cli_len) { cli_len--; }
         return;
     }
@@ -400,27 +492,43 @@ void Cli_OnChar(char c)
 
 void Cli_Poll(void)
 {
+    /* ISR→主循环：处理缓冲好的命令（移出 ISR 防止 put() 阻塞 TX 死锁） */
+    if (cli_line_ready) {
+        cli_line_ready = 0;
+        Cli_Process(cli_pending, cli_pending_len);
+    }
+
     static uint32_t last_ms;
     uint32_t now = HAL_GetTick();
 
-    /* PC UI 监控模式：10Hz L, 帧（实时转速 + armed/phase） */
+    /* PC UI 监控模式（ESP32 对齐）：
+     *   ARM   → 10Hz L, 帧实时转速
+     *   TRIGGER（触发 REC 瞬间）→ 广播后停止 L 帧，专注记录（防串口拥堵）
+     *   DONE  → 广播 # RECORD done，UI 等 10s 后拉 LOG DUMP */
     if (pc_mon) {
-        static uint32_t last_l;
-        if (last_l == 0 || now - last_l >= 100) {
-            last_l = now;
-            uint8_t st = Snap_State();
-            int32_t rpm = Abi_GetRpm();
-            int32_t dir = (rpm > 0) ? 1 : ((rpm < 0) ? -1 : 0);
-            uint8_t armed = (st == 1 || st == 2) ? 1 : 0;
-            uint8_t phase = (st == 2) ? 2 : 0;
-            put("L,"); put_i32(rpm); put(".0,");  /* rpm 带小数：UI 按短帧解析 */
-            put_i32(dir);
-            put(",");  put_u32(armed);
-            put(",");  put_u32(phase);
-            put(",0,0\r\n");
+        uint8_t st = Snap_State();
+        static uint8_t last_st = 0xFF;
+        /* 触发边沿：1(armed) → 2(rec) */
+        if (last_st != 0xFF && last_st == 1 && st == 2) {
+            put("# TRIGGER record started\r\n");
+        }
+        last_st = st;
+
+        if (st != 2) {                 /* REC 期间停发 L 帧 */
+            static uint32_t last_l;
+            if (last_l == 0 || now - last_l >= 100) {
+                last_l = now;
+                int32_t rpm = Abi_GetRpm();
+                int32_t dir = (rpm > 0) ? 1 : ((rpm < 0) ? -1 : 0);
+                uint8_t armed = (st == 1) ? 1 : 0;
+                put("L,"); put_i32(rpm); put(".0,");  /* rpm 带小数：UI 按短帧解析 */
+                put_i32(dir);
+                put(",");  put_u32(armed);
+                put(",0,0,0\r\n");
+            }
         }
         /* 记录完成 → 广播供 UI 自动拉取（D, 行） */
-        if (!pc_done_flag && Snap_State() == 3 && Snap_Count() > 0) {
+        if (!pc_done_flag && st == 3 && Snap_Count() > 0) {
             pc_done_flag = 1;
             put("# RECORD done | n="); put_u32(Snap_Count());
             put(" seg=1 RECORD done\r\n");
