@@ -70,6 +70,10 @@ static void cli_help(void)
     put("IDX              - Index 圈数\r\n");
     put("ARM              - 预置触发（|rpm|>10 且转过一圈 → 回溯400点+记0.5s）\r\n");
     put("DISARM           - 取消触发预置\r\n");
+    put("MONITOR START    - PC UI 兼容：武装 + 每秒 L, 帧\r\n");
+    put("MONITOR STOP     - PC UI 兼容：解除武装\r\n");
+    put("LOG DUMP [USB]   - PC UI 兼容：snap 按 D, 文本行回传\r\n");
+    put("SNAP? / ABI?     - PC UI 兼容：状态 / 版本\r\n");
     put("SD INIT          - 初始化 SD 卡并挂载 FatFS\r\n");
     put("SD SAVE          - 手动把当前 snap 备份为 S<秒>.BIN（不覆盖）\r\n");
     put("SD LS            - 列出卡内文件\r\n");
@@ -152,6 +156,9 @@ static void cli_pwm(uint8_t n, char *argv[])
 
 static uint8_t cli_rpm_mon;   /* RPM ON 时每秒回显 */
 
+static uint8_t pc_mon;        /* PC UI 监控模式：推送 L, 帧 */
+static uint8_t pc_done_flag;  /* 记录完成已广播（防重发） */
+
 static void put_i32(int32_t v)
 {
     if (v < 0) { put("-"); v = -v; }
@@ -210,6 +217,50 @@ static void cli_snap(void)
     put(" (0=idle 1=arm 2=rec 3=done), count="); put_u32(Snap_Count());
     put(" ready="); put_u32(Snap_IsReady());
     put("\r\n");
+}
+
+/* MONITOR（PC UI 兼容）：START=ARM+推送 L, 帧；STOP=DISARM */
+static void cli_monitor(uint8_t n, char *argv[])
+{
+    if (n >= 2 && strcmp(argv[1], "START") == 0) {
+        Snap_Arm();
+        pc_mon = 1;
+        pc_done_flag = 0;
+        put("monitor start (armed)\r\n");
+        return;
+    }
+    if (n >= 2 && strcmp(argv[1], "STOP") == 0) {
+        Snap_Disarm();
+        pc_mon = 0;
+        put("monitor stop (disarmed)\r\n");
+        return;
+    }
+    put("用法: MONITOR START|STOP\r\n");
+}
+
+/* LOG DUMP（PC UI 兼容）：snap 点按 D, 文本行回传 + D END（UI 自动拉取路径） */
+static void cli_log_dump(void)
+{
+    uint32_t n = Snap_Count();
+    if (n == 0) { put("D END 0\r\n"); return; }
+    const SnapPt *p = Snap_Points();
+    uint32_t steps = Abi_GetStepsPerRev();
+    for (uint32_t i = 0; i < n; i++) {
+        int32_t rpm = 0;
+        if (i > 0) {
+            uint32_t dt_us = p[i].t_us - p[i - 1].t_us;
+            int32_t dc = (int32_t)(p[i].c_lo - p[i - 1].c_lo);
+            if (dt_us > 0)
+                rpm = (int32_t)(((int64_t)dc * 60000000LL) / (int64_t)dt_us / steps);
+        }
+        int32_t dir = (rpm > 0) ? 1 : ((rpm < 0) ? -1 : 0);
+        put("D,"); put_u32(p[i].t_us / 1000u);
+        put(",");  put_i32(rpm); put(".0");
+        put(",");  put_i32(dir);
+        put(",1,"); put_u32(p[i].idx);
+        put("\r\n");
+    }
+    put("D END "); put_u32(n); put("\r\n");
 }
 
 /* SD 卡（Task 4）：INIT / SAVE / LS / STAT */
@@ -300,6 +351,13 @@ static void Cli_Process(const char *line, uint16_t len)
     else if (strcmp(argv[0], "ARM") == 0)        { Snap_Arm();    put("armed (等转速过阈+一整圈自动触发)\r\n"); }
     else if (strcmp(argv[0], "DISARM") == 0)     { Snap_Disarm(); put("disarmed\r\n"); }
     else if (strcmp(argv[0], "SNAP") == 0)       cli_snap();
+    else if (strcmp(argv[0], "SNAP?") == 0)      cli_snap();
+    else if (strcmp(argv[0], "ABI?") == 0)       cli_id();
+    else if (strcmp(argv[0], "TIME") == 0)       put("time ok\r\n");
+    else if (strcmp(argv[0], "MONITOR") == 0)    cli_monitor(n, argv);
+    else if (strcmp(argv[0], "LOG") == 0)        cli_log_dump();
+    else if (strcmp(argv[0], "REC") == 0)        { put("rec now (snap arm)\r\n"); Snap_Arm(); }
+    else if (strcmp(argv[0], "REVS") == 0)       put("revs ok\r\n");
     else if (strcmp(argv[0], "SD") == 0)         cli_sd(n, argv);
     else if (strcmp(argv[0], "FLASH") == 0)      cli_flash();
     else if (strcmp(argv[0], "FSAVE") == 0)      cli_fsave();
@@ -343,8 +401,33 @@ void Cli_OnChar(char c)
 void Cli_Poll(void)
 {
     static uint32_t last_ms;
-    if (!cli_rpm_mon) { last_ms = 0; return; }
     uint32_t now = HAL_GetTick();
+
+    /* PC UI 监控模式：10Hz L, 帧（实时转速 + armed/phase） */
+    if (pc_mon) {
+        static uint32_t last_l;
+        if (last_l == 0 || now - last_l >= 100) {
+            last_l = now;
+            uint8_t st = Snap_State();
+            int32_t rpm = Abi_GetRpm();
+            int32_t dir = (rpm > 0) ? 1 : ((rpm < 0) ? -1 : 0);
+            uint8_t armed = (st == 1 || st == 2) ? 1 : 0;
+            uint8_t phase = (st == 2) ? 2 : 0;
+            put("L,"); put_i32(rpm); put(".0,");  /* rpm 带小数：UI 按短帧解析 */
+            put_i32(dir);
+            put(",");  put_u32(armed);
+            put(",");  put_u32(phase);
+            put(",0,0\r\n");
+        }
+        /* 记录完成 → 广播供 UI 自动拉取（D, 行） */
+        if (!pc_done_flag && Snap_State() == 3 && Snap_Count() > 0) {
+            pc_done_flag = 1;
+            put("# RECORD done | n="); put_u32(Snap_Count());
+            put(" seg=1 RECORD done\r\n");
+        }
+    }
+
+    if (!cli_rpm_mon) { last_ms = 0; return; }
     if (last_ms == 0) last_ms = now;
     if (now - last_ms < 1000) return;
     last_ms = now;

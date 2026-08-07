@@ -145,6 +145,26 @@ docs/                       plans/ 计划、工作日志、接线文档
 - 修正计划书 T1/T2/T3 历史子步骤勾选遗漏
 - 提交：Task6 58b42df；Task7 fb5bceb
 
+### 2026-08-07 夜：PC UI 协议适配（UI "捕捉不到转动" 修复）
+- **根因**：`pc/abi_monitor.py` 是旧字幕工程拷贝，命令/推送协议与本固件完全不匹配——
+  UI 发 `MONITOR START/STOP`、`SNAP?`、`ABI?`、`TIME`、`LOG DUMP USB`、`REC NOW`；固件只认 `ARM`/`DISARM`/`SNAP`/`DUMP`；
+  UI 实时转速只认 `L,` 短帧（`L,rpm.0,dir,armed,phase,remain,log_n`），固件推的是 `rpm = N` 文本行 → 点①监控后板子根本没进 armed，转速框永远是 "—"
+- **修复（固件 app_cli.c 加 PC 兼容层，UI 零改动）**：
+  - `MONITOR START` → Snap_Arm + 开启 10Hz `L,` 帧推送；`MONITOR STOP` → Snap_Disarm
+  - `SNAP?`/`ABI?` → cli_snap / cli_id；`TIME` → 空应答；`REC NOW` → Snap_Arm；`REVS` → 空应答
+  - `LOG DUMP [USB]` → snap 点按 `D,t_ms,rpm.0,dir,1,idx` 文本行回传 + `D END n`（UI 自动拉取路径）
+  - snap DONE → 广播 `# RECORD done | n=… seg=1 RECORD done` → UI `_schedule_read_once` 自动拉取
+- **细节坑**：L 帧 `parts[1]` 必须带小数（`0.0`），否则 UI 按长帧解析错位；`put(".0,")` 后不能再补 `put(",")`（会变空字段导致 UI ValueError 丢帧）
+- 实测（COM21）：`ABI?` 返回版本 ✓；`MONITOR START` 后 10Hz `L,0.0,0,1,0,0,0` 帧正常 ✓；帧格式与 UI 短帧解析逐字段对齐 ✓
+- **待实机验证**：电机通电转轴时 UI 实时转速跳动 + 触发记录自动拉取（本轮电机未通电，cnt=0）
+- 提交：`docs(h743): PC UI 协议适配`
+
+### 2026-08-07 深夜：拷贝曲线工作室等 PC 模块（曲线工作室"能开了"）
+- **根因**：`pc/abi_monitor.py` 是从旧字幕工程拷来的 UI，依赖 4 个外部模块但只拷了主文件 → `snap_edit`/`rpm_chart`/`curve_studio`/`abi_sim` 缺失，import 被 try/except 吞成 `None`，主流程能跑但「打开曲线工作室」报 `无法加载`
+- **修复**：从 `D:\oezcon\mcoder\ESP32_AS5047P_ABI_Monitor\pc\` 拷贝 `snap_edit.py`（剪辑/距离/滤波 7 函数）、`rpm_chart.py`（RpmChart 绘图）、`curve_studio.py`（open_curve_studio 独立窗口）、`abi_sim.py`（SimLink 仿真，可选）到本工程 `pc\`
+- **验证**：`py_compile` 4 模块全 OK；真实 import 均成功（snap_edit 7 函数、RpmChart、open_curve_studio、SimLink）；签名与 abi_monitor.py 调用逐一核对匹配；curve_studio 对 abi_monitor 的引用均有 try/except fallback
+- 提交：`feat(pc): 补曲线工作室/编辑/绘图模块（拷自旧工程）`
+
 ---
 
 ## 遇到的问题 & 如何解决（完整清单）
@@ -166,7 +186,8 @@ docs/                       plans/ 计划、工作日志、接线文档
 | 13 | DUMP/FLASH 串口无响应 | `openocd -c halt` 后 stuck | `-c reset run` 恢复 |
 | 14 | Flash 擦写时 CLI 回显被吞 | CLI 在 USART IRQ 执行+擦写阻塞 | 属正常，加长等待重试 |
 | 15 | 配置结构变大（36B）超 H7 32B FLASHWORD | AppCfg 加了 steps+pol | Config_Save 两次 32B 对齐写（64B 缓冲） |
-| 16 | PC UI"打不开" | **见交接最后一节（待用户后续处理）** | — |
+| 16 | PC UI"打不开" | 单实例端口锁被残留进程占用 | 已修复：锁冲突弹窗提示 + `启动PC_UI.bat` 一键 --usb（commit 41de68） |
+| 17 | PC UI 点①监控"捕捉不到转动" | UI 命令/推送协议与本固件不匹配（旧工程拷贝） | 固件加 PC 兼容层：MONITOR START/STOP、SNAP?、ABI?、TIME、LOG DUMP、L, 帧 10Hz、# RECORD done（见当日日志） |
 
 ---
 
