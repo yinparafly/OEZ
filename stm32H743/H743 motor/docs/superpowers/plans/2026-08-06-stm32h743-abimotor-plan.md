@@ -594,51 +594,44 @@ git commit -m "feat(h743): SDMMC1+FatFS 保存 snap bin"
 
 ---
 
-### Task 5: 串口 DUMP + PC 工具拷贝兼容
+### Task 5: Flash 芯片保存 + 串口 DUMP + PC 工具拷贝（含 README）
+
+> **用户要求"芯片保存之后，在卡里备份一份"**：章节重点改为先把 snap 写入内部 Flash（掉电不丢），再备份 SD；DUMP 从 Flash 直读按 PC 帧发串口。
 
 **Files:**
-- Create: `firmware/abi_monitor_h743/App/dump.c`
-- Copy: `D:\oezcon\mcoder\ESP32_AS5047P_ABI_Monitor\pc\abi_monitor.py`、`curve_studio.py` → `H743 motor/pc/`
-- Modify: 无 PC 端改动（只拷贝）
+- Create: `firmware/abi_monitor_h743/App/flash_save.c/h`
+- Copy: `abi_monitor.py` → `H743 motor/pc/`（未修改）
+- Create: `H743 motor/README.md`
 
 **Interfaces:**
-- Consumes: `Snap_BuildBin`
-- Produces: `void Dump_SendBin(void)`（921600 全速发送 BIN 帧）
+- Consumes: `Snap_IsReady`、`Snap_Count`、`Snap_Crc32`、`Snap_Points`
+- Produces: `uint8_t Flash_SaveSnap(void)`、`uint8_t Flash_IsData(void)`、`uint32_t Flash_StoredCount(void)`、`uint8_t Flash_Dump(void)`
 
-- [ ] **Step 1: dump.c**
+- [x] **Step 1: flash_save.c（芯片保存）**
 
-```c
-#include "usart.h"
-#include "snap_bin.h"
+内部 Flash 存最近一次 snap：`0x08100000`（Bank2 扇 0..3，512KB）→ 32B 头 {magic,n,hz,crc32} + n×SnapPt 点阵。
+H7 按 32B FLASHWORD 编程（源静 32B 对齐缓冲）；擦 4 扇区再整帧覆盖写。掉电不丢；PC 帧 DUMP 从 Flash 直读分块发串口。实现细节：`Flash_SaveSnap` 内部调用 `Snap_Crc32()` 计算点阵 zlib crc32 存入头，`Flash_Dump` 按 preamble+&lt;IHH+payload+crc32 全速发送（新增 `Usart_Write` 原始块发送）。
 
-void Dump_SendBin(void)
-{
-    static uint8_t buf[512*1024];   // 512KB 静态缓冲
-    uint32_t n = Snap_BuildBin(buf, sizeof(buf));
-    if (!n) return;
-    for (uint32_t i = 0; i < n; ) {
-        uint16_t chunk = (n - i > 65535) ? 65535 : (uint16_t)(n - i);
-        HAL_UART_Transmit(&huart1, buf + i, chunk, 1000);
-        i += chunk;
-    }
-}
-```
+- [x] **Step 2: CLI 接入**
 
-CLI：`DUMP` 命令触发。发送期间锁串口（PC 工具收完前不发其他文本）。921600 下 512KB ≈ 4.6s。
+- `FLASH` → 状态（data/stored/current/saved）
+- `FSAVE` → 手动保存
+- `DUMP` → 芯片记录 PC 帧发出
+- main.c 自动流程：DONE **上升沿** → `Flash_SaveSnap()` → `Sd_SaveSnap()`（芯片最先，掉电保留）
 
-- [ ] **Step 2: PC 侧拷贝**
+- [x] **Step 3: PC 侧拷贝**
 
-拷贝 `abi_monitor.py`/`curve_studio.py` 到 `H743 motor/pc/`，不修改任何代码。运行 `abi_monitor.py --help` 确认脚本依赖（pyserial/numpy）本机可跑。
+`abi_monitor.py` 拷贝到 `H743 motor/pc/`（不改代码），其 `SNAP_PREAMBLE`/`<IqI` 点格式与 Flash DUMP 帧一致。
 
-- [ ] **Step 3: 板级验证（PC 直连）**
+- [x] **Step 4: 板级验证（已上板通过）**
 
-`ARM`→转→`DUMP`；PC 端脚本监听 921600 端口收到完整 BIN，`curve_studio` 能画曲线。比对 SD 文件与串口 DUMP 字节一致。
+自动 DONE → `Flash save ok: n=xxxx` + `SD save ok: Sxxxxx.BIN`；`FLASH` 查 stored==current==snap count；**DUMP 收到完整帧** magic=AB1C0002、crc32 校验 OK（6273 点）；**OpenOCD 复位后 `FLASH` 仍 data=1 stored=n（芯片电源域保留）**；SD 文件与串口帧长度一致不覆盖。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
-git add "H743 motor/firmware/abi_monitor_h743" "H743 motor/pc"
-git commit -m "feat(h743): 串口DUMP v2 BIN + 拷贝PC工具(不改)"
+git add "H743 motor/firmware/abi_monitor_h743" "H743 motor/pc/abi_monitor.py" "H743 motor/README.md"
+git commit -m "feat(h743): Task5 Flash芯片保存+DUMP PC帧 + README"
 ```
 
 ---

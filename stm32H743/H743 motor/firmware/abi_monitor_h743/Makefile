@@ -42,6 +42,7 @@ C_SOURCES = \
   App/abi.c \
   App/snap_bin.c \
   App/sd_card.c \
+  App/flash_save.c \
   Drivers/User/Src/led.c \
   Drivers/User/Src/usart.c \
   FatFs/ff.c \

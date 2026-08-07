@@ -157,3 +157,35 @@ P1-1 DIO(SWDIO/PA13) â†’ SWDIOï¼›P1-2 SWCLK â†’ SWCLKï¼›P1-3 GNDï¼›P1-4 5Vï¼ˆä¸
 - [x] Task 4£ºSD ¿¨´æ´¢£¨SDMMC1 + FatFS ×Ô¶¯±¸·Ý£©
 - [ ] Task 5£ºBIN v2 Ö¡ + PC ¹¤¾ßÁªµ÷ / Flash ³Ö¾Ã»¯±£´æ
 - [ ] µç»ú¶¯Á¦µçÔ´½ÓÈëºó²ÅÄÜ×öµÄ£ºPWM Çý¶¯µç»ú + ×ªËÙ±Õ»·ÑéÖ¤£¨ÓÃ»§ÐèÔÚ½ÓÏßºóÌáÐÑ£©
+
+---
+
+### 2026-08-07£ºTask 5 Flash Ð¾Æ¬±£´æ + DUMP + README£¨ÉÏ°åÑéÖ¤Í¨¹ý£©
+- ÓÃ»§ÒªÇó"Ð¾Æ¬±£´æÖ®ºó£¬ÔÚ¿¨Àï±¸·ÝÒ»·Ý"£ºsnap ÏÈ´æÄÚ²¿ Flash£¨µôµç²»¶ª£©£¬ÔÙ±¸·Ý SD
+- ÐÂ½¨ `App/flash_save.c/h`£ºBank2 ÉÈÇø 0..3£¨0x08100000 Æð 512KB£©´æ×î½üÒ»´Î¼ÇÂ¼£¬
+  32B Í· {magic=SNAP_MAGIC_V2, n, hz=1000, crc32(zlib)} + n x SnapPt£»H7 32B FLASHWORD ±à³Ì
+  £¨¾²Ì¬ aligned(32) »º³å£©£»FLASH_Dump ´Ó Flash Ö±¶Á·Ö¿é°´ PC Ö¡£¨preamble+<IHH+payload+crc32£©´®¿ÚÈ«ËÙ·¢
+- usart.c/h ÐÂÔö `Usart_Write`£¨Ô­Ê¼×Ö½Ú¿é·¢ËÍ£¬DUMP ÓÃ£©
+- CLI£ºFLASH£¨×´Ì¬£©/ FSAVE£¨ÊÖ¶¯±£´æ£©/ DUMP£¨Ð¾Æ¬¼ÇÂ¼ PC Ö¡£©
+- main.c ×Ô¶¯±£´æ¸Ä **DONE ÉÏÉýÑØ**£¨g_done_prev£©£ºÃ¿´Î´¥·¢Íê³É ¡ú Flash_SaveSnap() ÏÈ¡¢SD ±¸·Ýºó
+  £¨ÐÞ¸´¾É g_snap_autosaved ÖÃ 1 ºóÓÀ²»¸´Î»¡¢Ö»µÚÒ»´Î±£´æµÄ bug£©
+- ¿½±´ `pc/abi_monitor.py`£¨Î´¸Ä£©¡ú `H743 motor/pc/`
+### Êµ»úÑéÖ¤£¨2026-08-07£©
+- ×Ô¶¯ DONE ¡ú `Flash save ok: n=6273` + `SD save ok: Sxxxxx.BIN`£»`FLASH` stored==current==snap count
+- **DUMP ÊÕÍêÕûÖ¡£º100436B£¬magic=AB1C0002 n=6273 hz=1000 crc_ok=True**
+- **OpenOCD ¸´Î»ºó `FLASH` ÈÔ data=1 stored=6273**£¨Ð¾Æ¬±£´æµôµç±£Áô£©?
+- ÅÅ²é¼ÇÂ¼£ºÔøÎóÅÐ"°å×ÓËÀ»ú/´®¿ÚÎÞÏìÓ¦"¡ª¡ªÊµÎªµ÷ÊÔÊ± OpenOCD `-c halt` ¼ì²é PC ºóÎ´ resume£¬
+  Ð¾Æ¬±»Í£×¡£»`reset run` ¼´»Ö¸´¡£CLI ÃüÁîÔÚ USART IRQ ÖÐÖ´ÐÐ£¬Flash ²ÁÐ´Ã¦ÂµÆÚ¼ä FLASH »ØÏÔ¿ÉÄÜ±»
+  ºÏ²¢/ÍÌµô£¬ÖØÊÔ¼´¿É£¬·Ç¹¦ÄÜÎÊÌâ
+- README£¨H743 motor/README.md£©³É£º½ÓÏß±í/¹¹½¨/CLI È«±í/BIN v2 Ö¡¸ñÊ½/0.5s ´°¿Ú½Ø¶ÏËµÃ÷/Flash ÇøÓò/PC ¹¤¾ßÓÃ·¨
+
+---
+
+## ´ý°ì
+- [x] ´®¿ÚÑéÖ¤ CLI£¨A9/A10 USB-TTL ×ª½ÓÏß£©
+- [x] Task 2£º±àÂëÆ÷ ABI ²¶»ñ£¨TIM2 ±ßÑØÖÐ¶Ï + TIM5 64 Î»Ê±¼ä´Á£©
+- [x] Task 3£ºÊÂ¼þ´æ´¢/»ØËÝ/³éÏ¡µµÎ»ÇÐ»»
+- [x] Task 4£ºSD ¿¨´æ´¢£¨SDMMC1 + FatFS ×Ô¶¯±¸·Ý£©
+- [x] Task 5£ºFlash Ð¾Æ¬±£´æ + DUMP PC Ö¡ + README
+- [ ] Task 6£ºÊµ²âÐ£×¼£¨Ò»È¦²½Êý EMA/¼«ÐÔ£©
+- [ ] µç»ú¶¯Á¦µçÔ´½ÓÈëºó²ÅÄÜ×öµÄ£ºPWM Çý¶¯µç»ú + ×ªËÙ±Õ»·ÑéÖ¤£¨ÓÃ»§ÐèÔÚ½ÓÏßºóÌáÐÑ£©

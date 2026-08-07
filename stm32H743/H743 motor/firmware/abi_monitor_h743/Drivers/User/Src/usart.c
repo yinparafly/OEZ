@@ -69,6 +69,11 @@ void Usart_Print(const char *s)
 
 void Usart_Printc(char c) { Usart_PutChar(c); }
 
+void Usart_Write(const uint8_t *buf, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++) Usart_PutChar((char)buf[i]);
+}
+
 uint8_t Usart_GetChar(char *c)
 {
     if (rx_head == rx_tail) return 0;

@@ -20,9 +20,10 @@
 #include "abi.h"
 #include "snap_bin.h"
 #include "sd_card.h"
+#include "flash_save.h"
 
-/* Task 4：DONE 自动备份去重标志（每次触发完成只尝试一次） */
-static uint8_t g_snap_autosaved;
+/* Task 5：DONE 上升沿自动保存（每次触发只保存一次） */
+static uint8_t g_done_prev;
 
 void SystemClock_Config(void);
 
@@ -43,7 +44,7 @@ int main(void)
 	Cli_Init();			// 打印 banner
 	SD_Init();			// Task 4 SD 卡（SDMMC1，失败不阻塞）
 	Sd_Mount();			// 卡已插则挂载（无卡约 5s 超时后继续）
-	g_snap_autosaved = 0;
+	g_done_prev = 0;
 
 	while (1)
 	{
@@ -51,16 +52,18 @@ int main(void)
 		Cli_Poll();		// 轮询处理命令行
 
 		/*
-		 * Task 4 自动备份：
-		 * Snap DONE 且卡已挂载 -> 写一次（成功/失败均只试一次，不阻塞主循环）。
-		 * 卡未挂载时跳过（用户 SD INIT 后其 Sd_SaveSnap 手动补录）。
+		 * Task 5 自动保存（芯片优先，SD 备份在后）：
+		 * DONE 上升沿（每次触发完成）-> 先写 Flash（无卡也能存，掉电不丢），
+		 * 再写 SD（卡已挂载时）。卡未挂载时跳过 SD（SD INIT 后可手动补录）。
 		 * DONE 状态保持，兼容 SNAP 轮询验证。
 		 */
-		if (Snap_IsReady() && !g_snap_autosaved) {
-			g_snap_autosaved = 1;
+		uint8_t done = Snap_IsReady();
+		if (done && !g_done_prev) {      // DONE 上升沿：本次触发刚完成
+			Flash_SaveSnap();		 // 芯片保存（内部打印 ok/fail）
 			if (SD_CardMounted())
-				Sd_SaveSnap();		// 内部打印 ok/fail
+				Sd_SaveSnap();		 // SD 备份（内部打印 ok/fail）
 		}
+		g_done_prev = done;
 	}
 }
 

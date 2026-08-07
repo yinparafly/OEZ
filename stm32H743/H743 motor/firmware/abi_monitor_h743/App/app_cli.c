@@ -12,6 +12,7 @@
 #include "abi.h"
 #include "snap_bin.h"
 #include "sd_card.h"
+#include "flash_save.h"
 #include "usart.h"
 #include "stm32h7xx_hal.h"
 #include <stdlib.h>
@@ -65,12 +66,14 @@ static void cli_help(void)
     put("IDX              - Index 圈数\r\n");
     put("ARM              - 预置触发（|rpm|>10 且转过一圈 → 回溯400点+记0.5s）\r\n");
     put("DISARM           - 取消触发预置\r\n");
-    put("SNAP             - 状态/点数\r\n");
     put("SD INIT          - 初始化 SD 卡并挂载 FatFS\r\n");
     put("SD SAVE          - 手动把当前 snap 备份为 S<秒>.BIN（不覆盖）\r\n");
     put("SD LS            - 列出卡内文件\r\n");
     put("SD STAT          - 卡信息\r\n");
     put("SD RAW [w] sec  - 裸扇区读写（诊断底层）\r\n");
+    put("FLASH            - 芯片保存状态（点数/是否已存）\r\n");
+    put("FSAVE            - 把当前 snap 写入芯片 Flash（掉电不丢）\r\n");
+    put("DUMP             - 芯片记录按 PC 帧发出（abi_monitor.py 曲线还原）\r\n");
     put("DBG              - GPIO 电平 + TIM2 寄存器\r\n");
 }
 
@@ -197,6 +200,30 @@ if (n < 2 || strcmp(argv[1], "INIT") == 0) {
     put("用法: SD INIT|SAVE|LS|RAW [sector]|STAT\r\n");
 }
 
+/* FLASH（Task 5）：芯片保存 */
+static void cli_flash(void)
+{
+    put("flash: data="); put_u32(Flash_IsData());
+    put(" stored="); put_u32(Flash_StoredCount());
+    put(" current="); put_u32(Flash_Count());
+    put(" saved="); put_u32(Flash_IsSaved());
+    put("\r\n");
+}
+
+static void cli_fsave(void)
+{
+    uint8_t e = Flash_SaveSnap();
+    put("fsave ret="); put_u32(e);
+    put(" (0=ok 1=no-data 2=no-data 3=erase-fail 4=prog-fail)\r\n");
+}
+
+static void cli_dump(void)
+{
+    uint8_t e = Flash_Dump();
+    put("\r\ndump ret="); put_u32(e);
+    put(" (0=ok 2=no-data 6=tx-fail)\r\n");
+}
+
 /* 诊断：GPIO 电平 + TIM2 寄存器（调试用） */
 static void cli_dbg(void)
 {
@@ -236,6 +263,9 @@ static void Cli_Process(const char *line, uint16_t len)
     else if (strcmp(argv[0], "DISARM") == 0)     { Snap_Disarm(); put("disarmed\r\n"); }
     else if (strcmp(argv[0], "SNAP") == 0)       cli_snap();
     else if (strcmp(argv[0], "SD") == 0)         cli_sd(n, argv);
+    else if (strcmp(argv[0], "FLASH") == 0)      cli_flash();
+    else if (strcmp(argv[0], "FSAVE") == 0)      cli_fsave();
+    else if (strcmp(argv[0], "DUMP") == 0)       cli_dump();
     else if (strcmp(argv[0], "DBG") == 0)        cli_dbg();
     else {
         put("未知命令: "); put(argv[0]); put(" (输入 HELP)\r\n");
