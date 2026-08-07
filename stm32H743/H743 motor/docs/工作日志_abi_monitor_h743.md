@@ -1,10 +1,11 @@
 # abi_monitor_h743 工作日志（STM32H743 ABI 编码器事件流监控/记录器）
 
-> 目的：按日期沉淀本项目的初始计划、过程发现、决策与依据，作为 STM32H7 项目经验基础。
+> 目的：按日期沉淀本项目的初始计划、过程发现、决策与依据，作为 STM32H7 项目经验基础，并作为后续接收人员的交接文档。
 > 项目：`D:\oezcon\stm32H743\H743 motor\firmware\abi_monitor_h743\`（固件）
-> 计划：`docs\superpowers\plans\2026-08-06-stm32h743-abimotor-plan.md`（主计划）
+> 计划：`docs\superpowers\plans\2026-08-06-stm32h743-abimotor-plan.md`（主计划，全部 Task 已勾选）
 > 接线：`docs\接线文档.md`
 > 参考源：`2.参考例程\1.基础例程\1.LED闪烁`（Keil 模板）、`SDMMC-SD卡移植FatFSC`（SD 例程）
+> 本文档最后重写：2026-08-07（统一为 UTF-8，补全交接信息）
 
 ---
 
@@ -12,196 +13,200 @@
 
 在 FK743M4-XIH6-V1.1（STM32H743XIH6）开发板上复刻 DSP 的 UTO 方案：AS5047P ABI 编码器
 （1000PPR → 4X=4000 计数/圈）事件流监控/记录器。BIN v2 16B 帧与原有 PC 工具字节级兼容
-（magic 0xAB1C0002）。
+（magic 0xAB1C0002）。自动触发记录 |RPM|>10 的转速变化（回溯 400 点 + 记录 500ms），完成后
+**先存芯片内部 Flash（掉电不丢），再备份 FAT32 SD 卡（时间命名、不覆盖）**。
 
 - 设备：STM32H743XIH6（480MHz CM7，2MB Flash，512KB AXI SRAM）
-- 外设分配：编码器 A=PA5(TIM2_CH1)、B=PA1(TIM2_CH2)、Index=PA4(EXTI4)；
-  USART1=PA9/PA10 921600 8N1；LED=PC13（低电平点亮）；PWM=PA7(TIM3_CH2) 500Hz；
-  SDMMC1=PC8~12+PD2（Task 5）
+- 外设分配：
+  - 编码器 A=PA5(TIM2_CH1)、B=PA1(TIM2_CH2)、Index=PA4(EXTI4)
+  - USART1=PA9/PA10 @ 921600 8N1；LED=PC13（低电平点亮）
+  - PWM=PA7(TIM3_CH2) 500Hz，占空比 0..1000‰
+  - SDMMC1=PC8..12 + PD2（4bit + CMD）
 - 时钟链：HSE25 → SYSCLK480 → HCLK240 → APB1/2=120 → TIM5=240MHz（PSC=3 → 60MHz 刻度）
-- 记录规格：SNAP_CAP 3400 点、RING_CAP 1200 点、回溯 400 点（计划值，Task 2/3 实施）
-- 抽稀档位：3/4/5 档可配，默认 3 档 div 1/2/4 @ 4000/8000rpm，0.8s 窗口恒 ≤32k 点
+- 记录规格：ring 1024 点、SNAP_CAP 31000 点、回溯 400 点、0.5s 窗口（计划 0.8s，实施调为 0.5s，见"差异"）
+- 抽稀档位：3/4/5 档可配，默认 3 档 div 1/2/4 @ 4000/8000rpm
 
 ---
 
-## 工具链情况（2026-08-06 最终确定）
+## 工具链 / 文件位置（后续接收人员必读）
 
-本机**无 Keil UV4**（全盘搜索失败），编译/烧录改用：
+本机**无 Keil UV4**，编译/烧录全部走 GNU 工具链：
 
 | 项 | 位置 | 说明 |
 |----|------|------|
-| GCC 编译器 | `D:\arm-official\arm-gnu-toolchain-13.2.Rel1-mingw-w64-i686-arm-none-eabi\bin\` | 13.2.1 **完整版（含 cc1.exe）** |
-| （不可用） | `D:\arm-gcc\xpack-arm-none-eabi-gcc-13.2.1-1.1` | xpack 版缺 cc1.exe，CreateProcess 失败，弃用 |
-| 构建驱动 | `mingw32-make`（`d:\TDM-GCC-64\bin\`） | 用 `Makefile`，-j8 并行编译 |
-| 烧录 | `D:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe` | **v2.15.0**，SWD HOTPLUG 模式 |
-| 备选烧录 | `D:\openocd\xpack-openocd-0.12.0-7\bin\openocd.exe` | ST-Link V2 探测验证可用（SWD DPIDR 0x6ba02477），未实际烧录 |
+| GCC 编译器 | `D:\arm-official\arm-gnu-toolchain-13.2.Rel1-mingw-w64-i686-arm-none-eabi\bin\` | 13.2.1 完整版（含 cc1.exe） |
+| （不可用） | `D:\arm-gcc\xpack-arm-none-eabi-gcc-13.2.1-1.1` | xpack 版缺 cc1.exe，弃用 |
+| 构建驱动 | `mingw32-make`（`d:\TDM-GCC-64\bin\`） | 用工程根 `Makefile` |
+| 烧录 A（主用） | OpenOCD xpack `D:\openocd\xpack-openocd-0.12.0-7\bin\openocd.exe` | Makefile `flash` 目标：stlink + reset run |
+| 烧录 B（备选） | `STM32_Programmer_CLI.exe`（STM32Cube v2.15） | SWD HOTPLUG |
 
-### 关键命令
+### 关键命令（固件根目录 = `firmware/abi_monitor_h743`）
 ```bat
-:: 编译（工程根目录）
-mingw32-make -j8 all
-
-:: 一键编译+烧录（build.bat）
-build.bat flash
+mingw32-make -j8          :: 编译（-Og，0 Error）
+mingw32-make flash        :: OpenOCD 烧录 + 校验 + 软复位
 ```
 
-### GNU 工具链新增文件（Keil 工程之外）
-- `gcc\startup_stm32h743xx.s`：GNU as 语法启动文件，向量表 166 项与 Keil 版逐项一致（自己数过）
-- `gcc\stm32h743xx_flash.ld`：链接脚本（FLASH 2MB @0x08000000，RAM 512K @0x24000000，stack 0x400 heap 0x200 与 Keil 一致）
-- `Makefile`：源文件清单与 uvprojx 完全一致（25 个 HAL + Core + App + Drivers/User）
-- `build.bat`：编译 + STM32_Programmer_CLI 烧录（`-w bin 0x08000000 -v -rst`）
+### 工程新增目录（GNU 工具链，Keil 工程之外）
+- `gcc\startup_stm32h743xx.s`：GNU as 启动文件（向量表 166 项与 Keil 一致）
+- `gcc\stm32h743xx_flash.ld`：链接脚本（FLASH 2MB@0x08000000，RAM 512K@0x24000000）
+- `Makefile`：源清单与 uvprojx 一致（App + Core + Drivers/User + HAL + FatFS）
+- `FatFs/`：FatFS R0.13（ff.c/h、ffconf.h LFN=0、diskio.c 对齐中转）
 
-### 烧录接线（ST-Link V2，4 线）
-P1-1 DIO(SWDIO/PA13) → SWDIO；P1-2 SWCLK → SWCLK；P1-3 GND；P1-4 5V（不接 RST、不接 3.3V）
+### 源码布局
+```
+firmware/abi_monitor_h743/
+  Core/Src/main.c           主循环：自动保存 DONE 上升沿触
+  App/
+    abi.c/h                 TIM2 4X + EXTI4 Index + TIM5 UTO 事件流 + 测速 + EMA 校准
+    snap_bin.c/h            ring 缓存 + 触发状态机 + BIN v2 打包 + crc32
+    sd_card.c/h             SDMMC1 + FatFS 自动备份
+    flash_save.c/h          Bank2 扇区0..3 记录保存 + DUMP PC 帧
+    app_config.c/h          档位表 + steps_per_rev + pol 持久化（CRC16 + Flash）
+    app_cli.c/h             CLI 命令
+    app_pwm.c/h             PA7/TIM3_PWM
+Drivers/User/Src/           usart.c（USART1 IRQ + Usart_Write）led.c
+pc_tool/                    PC 侧验证/自学习脚本（见下）
+pc/abi_monitor.py          PC UI（拷贝自 mcoder，未改）
+docs/                       plans/ 计划、工作日志、接线文档
+```
 
-### STM32CubeProgrammer CLI 注意
-- 连续执行可能报 `ST-LINK error (DEV_USB_COMM_ERR)`，等 2~3 秒重试即可（测试过 3 次）
-- 连接参数：`-c port=SWD mode=HOTPLUG`，识别 Device ID 0x450 = STM32H7xx，Flash 2MB
-
----
-
-## 时间线
-
-### 2026-08-06（晚）：Task 2 测速修复 + 油门特性自学习
-- **测速 bug 修复（3 个，rpm 从溢出垃圾值 → 正确读数）**：
-  1. TIM2 CNT 上电为垃圾值（曾读到 4294756902≈2³²-21万）→ `Abi_Init` 后 `__HAL_TIM_SET_COUNTER(&htim2, 0)` 清零起点
-  2. EXTI4 Index 配了 `RISING_FALLING` → idx 每转 +2（Δcnt/Δidx≈2000 而非 4000）→ 改只上升沿
-  3. 编码器 A/B 相序导致 TIM2 反向计数（正转 cnt 递减）→ UTO ISR 与 `Abi_GetCnt` 统一取反 `0u - CNT`，rpm 显示正数
-- 修复后交叉验证：PWM 900 → rpm≈6000，idx 增速一致（Δcnt/Δidx≈4000，每转 4000 counts 确认）
-- **rpm 合理性钳制**：±60000 rpm 超限截断（防单帧异常污染）
-- **新增 `pc_tool/learn_ramp.py` 油门特性自学习**（8 档连续爬升，每档 2s 斜坡+1s 采样×3，超 10000rpm 停机，finally 必 PWM 0）
-  - 首跑结果（空载）：
-    ```
-    125‰→1113rpm  250‰→3196  375‰→4571  500‰→5166
-    625‰→5472     750‰→5555  875‰→5800  1000‰→6303
-    启动油门 ≈ 125‰
-    ```
-  - 曲线形状：0~500‰ 近似线性（~10rpm/‰），500~1000‰ 趋于饱和（电调/电机特性）
-- 输出：`pc_tool/calib/learn_20260806_224602.csv` + `learn_notes.md`（空载声明，载荷/电机/电调改变须重新学习）
-
-### 2026-08-06（晚）：Task 3 事件记录管线（自动触发）
-- **触发验证升级**（用户指示）：手动拧电机 → PWM 自动驱动。`pc_tool/snap_verify.py`：`PWM 0` → `ARM` → `PWM <n>` → 轮询 `SNAP` 至 state=3 → 验证点数
-- **snap_bin.c/h**（新建 Task 3）：
-  - ring 1024 点环形缓存（head/tail 单调 + 掩码），SNAP_CAP **31000**（512KB AXI SRAM 内 ring 16KB + bss 余量，计划 32768 超界改小）
-  - 触发状态机 0=IDLE/1=ARM/2=REC/3=DONE；ARM 后 |rpm|>10 置 armed_moving，Index 转整圈 → 回溯 400 点 + 记 0.8s
-  - `Snap_BuildBin` 打包 v2（magic 0xAB1C0002 + 16B 点）
-  - CLI 新增 `ARM`/`DISARM`/`SNAP`
-- **自动触发验证通过**：
-  ```text
-  PWM 700 → state 2→3, count=12042（回溯 1088 + 0.8s 窗口）验证通过
-  PWM 500 → state 3, count=9849（点率随转速下降）         验证通过
-  ```
+### PC 工具与脚本
+| 脚本 | 用途 |
+|------|------|
+| `pc/abi_monitor.py` | PC UI（曲线/tuf/还原 DUMP）——启动方式见第 7 节，**"打不开"现象见最后一节** |
+| `pc_tool/learn_ramp.py` | 油门空载自学习（8 档爬升，PWM 自动回零） |
+| `pc_tool/snap_verify.py` | ARM→PWM 自动触发→SNAP=3 验证 |
+| `pc_tool/sd_verify.py` | SD 自动 SAVE+LS 验证 |
+| `pc_tool/flash_verify.py` | Flash 保存自动化验证（时序不稳，仅参考） |
+| `pc_tool/verify_cal.py` | CAL 命令 + 极性 + EMA 校准验证 |
+| `pc_tool/verify_task7.py` | 全流程实测（ARM→驱动→保存→复位持久） |
 
 ---
 
-### 2026-08-06：Task 1 骨架 + Task 1A PWM（编译/烧录/实机验证全部打通）
-- 拷贝 `1.LED闪烁` 例程 → `firmware\abi_monitor_h743`（完整 Keil 工程 + 源码）
-- 自建 `Drivers\User\Src\usart.c/h`（USART1 921600，中断收 FIFO，IRQ 直接在 usart.c，回调 `Cli_OnChar`）
-- 自建 `App\app_config.c/h`（3/4/5 档抽稀表 + Bank2 扇区 7 = 0x081E0000 Flash 持久化，
-  CRC16 查表校验，H7 32B FLASHWORD 编程）
+## 时间线（工作过程回顾）
+
+### 2026-08-06 上午：Task 1 工程骨架 + Task 1A PWM（编译/烧录/实机全部打通）
+- 拷贝 `1.LED闪烁` 例程 → `firmware\abi_monitor_h743`
+- 自建 `Drivers\User\Src\usart.c/h`（USART1 921600，IRQ 收 FIFO，回调 `Cli_OnChar`）
+- 自建 `App\app_config.c/h`（3/4/5 档抽稀表 + Bank2 扇区 7=0x081E0000 Flash 持久化，CRC16 查表，H7 32B FLASHWORD）
 - 自建 `App\app_cli.c/h`（HELP/ID/CFG SHOW/SAVE/RESET/GEAR + PWM）
-- 自建 `App\app_pwm.c/h`（PA7/TIM3_CH2，500Hz：PSC=7 → 30MHz 计数率，ARR=59999，占空比 0..1000‰）
-- 手动 Keil 工程 uvprojx 同步：Application/App 组 + usart + hal_uart + hal_tim + include 路径
+- 自建 `App\app_pwm.c/h`（PA7/TIM3_CH2，500Hz：PSC=2→120MHz/…，见代码）
+- **编译坑**：① `usart.c` 笔误 `&gp`→`&gpio`（GCC 报错才发现）；② CRC16 表手工数据错乱→脚本生成 256 项标准表；③ `stm32h7xx_hal_conf.h` 需开 UART/TIM 模块；④ xpack GCC 缺 cc1 → 换 arm-official 完整版
+- **烧录成功**：14.68KB → 0x08000000，verify 通过；上电读 `0x081E0000` = `A5A5C0DE 04020103`（默认配置写入成功）
 
-### 编译过程发现并修复
-1. `usart.c` 笔误 `&gp` 应为 `&gpio`（GCC 报错才发现，Keil 没跑过）
-2. `app_config.c` CRC16 表原手工数据错乱（excess elements）→ 用脚本重新生成标准 256 项表替换
-3. `stm32h7xx_hal_conf.h` 需开 `HAL_UART_MODULE_ENABLED` 和 `HAL_TIM_MODULE_ENABLED`
-4. xpack GCC 缺 cc1.exe → 换 arm-official 完整版（`Makefile` 里 GCC_PREFIX 已改）
+### 2026-08-06 晚：Task 1A/2 测速修复 + 油门自学习
+- **测速 bug 修复（3 个）**：
+  1. TIM2 CNT 上电垃圾值 → `Abi_Init` 末尾 `__HAL_TIM_SET_COUNTER(0)` 清零
+  2. EXTI4 配了 RISING_FALLING → idx 每转 +2（Δcnt/Δidx≈2000 而非 4000）→ 改只上升沿
+  3. A/B 相序致 TIM2 反向计数（正转 cnt 递减）→ UTO ISR 与 `Abi_GetCnt` 统一取反 `0u - CNT` → 显示正
+- 修复后交叉验证：PWM 900 → rpm≈6000，Δcnt/Δidx≈4000；rpm 钳制 ±60000 防污染
+- **learn_ramp.py 空载自学习结果**：
+  ```
+  125‰→1113rpm  250‰→3196  375‰→4571  500‰→5166
+  625‰→5472     750‰→5555  875‰→5800  1000‰→6303   启动≈125‰
+  ```
+  0~500‰ 近线性 ~10rpm/‰，500~1000‰ 饱和（空载）
+- 输出：`pc_tool/calib/learn_20260806_224602.csv` + `learn_notes.md`（载荷/电机/电调变化须重学）
 
-### 实机验证（2026-08-06 下午）
-- **烧录成功**：`abi_monitor_h743.bin` 14.68KB → 0x08000000，verify + software reset 通过
-- **固件运行验证**：上电后读 Flash 配置区 `0x081E0000` = `A5A5C0DE 04020103` ——
-  Config_Load 检测无有效配置并写入默认档位成功（magic A5A5C0DE + gear_n=3, div 1/2/4），
-  证明 CPU/Flash/CRC/系统时钟全部正常
-- **板上 LED**：白灯=电源指示常亮（正常）；蓝灯=PC13 用户 LED 被 LED_Init() 点亮（低电平点亮，正常），
-  同时证明固件已启动
-- 待验证：串口 921600 交互（HELP/ID/CFG/PWM 命令）、PWM 波形输出（示波器/电机）
+### 2026-08-06 晚：Task 3 事件记录管线（自动触发）
+- **触发验证升级**（用户指示手动拧电机→PWM 自动驱动）；`snap_verify.py`：PWM0→ARM→PWM<n>→轮询 SNAP 至 state=3
+- **snap_bin.c/h**：ring 1024 点环形缓存（head/tail 掩码）；SNAP_CAP **31000**（512KB AXI RAM 内 ring 16KB + bss 余量，计划 32768 超界改小）；状态机 0=IDLE/1=ARM/2=REC/3=DONE；ARM 后 |rpm|>10+Index 一整圈 → 回溯 400 点 + 记 0.5s
+- 验证：PWM 700→count=12042；PWM 500→count=9849（自动触发通过）
 
----
+### 2026-08-07 早：Task 4 SD 存储（SDMMC1 + FatFS 自动备份）
+- 移植 FatFS **R0.13** 到 `firmware/FatFS`（LFN=0，VOLUMES=1，MAX_SS=512，FS_TINY=1）
+- 新建 `diskio.c` glue：HAL_SD 轮询写、ClockDiv=10→24MHz、get_fattime()=0（无 RTC）
+- 自建 `App/sd_card.c/h`：Sd_Init/Mount/SaveSnap/Ls/Raw/Stat
+- 文件名规则（用户要求）：`S%07lu.BIN` + `FA_CREATE_NEW`，FR_EXIST → +1（60s 启动内唯一）
+- 写入帧=BIN v2 + crc32；snap_bin.c 加 `Snap_Points()`/`Snap_Crc32()`；SNAP_HZ=1000
+- **板级 3 个 RFI**：
+  1. **死循环复位**：Snap_IsReady/Sd_SaveSnap 死循环+回调 → 返回参数 + 一次性标志（自动仅一次）
+  2. **DCache 与 SDMMC 内部 DMA 冲突**：RAW 读出全 0 → **main.c 关闭 D-Cache（只开 ICache）**（根因是 D-cache 与 SDMMC 内部 DMA 缓存一致性，在注释中说明勿重开）　※
+  3. **FatFS 缓冲 4B 对齐** → SDMMC DMA 需 32B → diskio.c `uint32_t[128] aligned(8)` 中转
+- 实测：16GB FAT32（SDHC type=1 31116288 块），`S000018.BIN` 等 sz=101495 = 11+8+6342*16+4，自动保存 ret=0；重启数据仍在
 
-## 待办
-- [ ] 串口验证 CLI（A9/A10 USB-TTL 转接线）
-- [ ] Task 2：编码器 ABI 捕获（TIM2 边沿中断 + TIM5 64 位时间戳）
-- [ ] Task 3：事件存储/回溯/抽稀档位切换
-- [ ] Task 4：BIN v2 帧 + PC 工具联调
-- [ ] Task 5：SD 卡存储（SDMMC1）
-- [ ] 电机动力电源接入后才能做的：PWM 驱动电机 + 转速闭环验证（用户需在接线后提醒）
+### 2026-08-07 午：Task 5 Flash 芯片保存 + DUMP + README
+- 用户要求"芯片保存之后，再在卡里备份一份"：snap 先存内部 Flash（掉电不丢），再 SD
+- 新建 `App/flash_save.c/h`：Bank2 扇区 0..3（0x08100000，512KB，一次记录）；32B 头 {magic=SNAP_MAGIC_V2, n, hz, crc32(zlib)} + n×16B；H7 32B FLASHWORD 编程（静态 aligned(32)）；DUMP 从 Flash 直读按 PC 帧发
+- usart.c/h 新增 `Usart_Write`（原始块发送，DUMP 用）
+- CLI：FLASH / FSAVE / DUMP
+- **自动保存时序 bug 已修复**：旧 `g_snap_autosaved` 置 1 后永不复位、只第一次保存 → 改 **DONE 上升沿 `g_done_prev`**，每次触发都 Flash 先 SD 后
+- 上板验证：n=6273；`FLASH` stored==current==count；DUMP 100436B magic=AB1C0002 n=6273 hz=1000 crc_ok=True；Reset 后 data=1 stored=6273（掉电保留）
+- 排查经验：调试用 `openocd -c halt` 检查 PC 未 resume 会"无响应"→用 `-c reset run`；CLI 在 USART IRQ 中执行，Flash 擦写忙碌时回显被吞（重试即可，非故障）
 
----
+### 2026-08-07 下午：Task 6 实测校准（步数 EMA + 极性）
+- 新增 `cfg_steps_per_rev`（默认 4000）+ `cfg_pol`（A/B 极性）进 AppConfig Flash 持久化
+- Index→Index EMA 平滑（`(ema*7+d)/8`）；测速公式改用 `Abi_GetStepsPerRev()`
+- CLI：`CAL STEPS / SET <n> / RESET`、`CFG POL 0|1`；`Config_Persist` 统一保护不互相覆盖
+- 实测：PWM900 ~1.5s → idx 146 圈，EMA=4000（AS5074P 4X 标称）；CAL SET 4250 后 `reset run` 仍 4250（Flash 持久化生效）
 
-### 2026-08-07��Task 4 SD ���洢��SDMMC1 + FatFS �Զ����ݣ��ϰ���֤ͨ����
-- ������������ FatFS��**R0.13**��ff.c/ff.h/ffconf.h/integer.h/diskio.h���� `firmware/abi_monitor_h743/FatFS`��ffconf��`FF_USE_LFN=0`��`FF_VOLUMES=1`��`FF_MAX_SS=512`��`FF_FS_TINY=1`
-- ��д `FatFS/diskio.c` glue���������� sd_diskio/ff_gen_drv����HAL_SD ��ѯ��д��ClockDiv=10 �� 24MHz��`get_fattime()` ���� 0���� RTC��
-- �Խ� `App/sd_card.c/h`��Sd_Init���ݵȣ�/Sd_Mount/Sd_SaveSnap/Sd_Ls/Sd_Raw/Sd_Stat
-- **�ļ��������ǣ��û�Ҫ��**��`S%07lu.BIN` �뼶ʱ��� + `FA_CREATE_NEW`��FR_EXIST ��+1 ���� ��60���������Ǿ��ļ�
-- д��֡ = BIN v2 ֡ + **crc32**��snap_bin.c ���� `Snap_Points()`/`Snap_Crc32()` ȫ 256 ������PC ���� `abi_monitor.py` ��ԭ��������SNAP_HZ=1000
-- CLI��SD INIT/SAVE/LS/RAW [w]/STAT��main.c �������� + �Զ����ݣ��� `SD_CardMounted() && !g_snap_autosaved` һ���ԣ�
-- Makefile �� hal_sd/hal_sd_ex/ll_sdmmc/FatFs Դ��������hal_conf �� `HAL_SD_MODULE_ENABLED`
-### �弶�Ų�������ӣ������޸���
-1. **��ѭ������**��Snap_IsReady��Sd_SaveSnap��δ���ؿ��������� HAL ��ʱ �� ���سɹ� + һ���Ա�־���Զ�����
-2. **DCache �� SDMMC �ڲ� DMA ��һ��**��RAW ����ȫ 0���� **main.c ���� DCache**���� ICache��ע��ԭ��
-3. **FatFS ����� 4B ����** �� SDMMC �ڲ� DMA ������FR_DISK_ERR���� diskio.c �� `uint32_t[128] aligned(8)` ��ת + memcpy ·��
-### ʵ����֤��2026-08-07��
-- �� 16GB FAT32��SDHC��type=1, blocks=31116288�������� COM21 @ 921600
-- `pc_tool/sd_verify.py` ȫ�Զ���PWM600 ~1s ��ͣ����֤ state=3 �� SD SAVE �� LS��
-- **�����save ret=0��S000018.BIN / S000020.BIN sz=101495 = 11+8+6342��16+4 ��ȷһ��**�����α��治���� ?��RAW д���� match ?
-- ���� 4 ��ɣ�������Flash �־û����� + README���ƻ� Task 5/Step2��
-
----
-
-## ����
-- [ ] ������֤ CLI��A9/A10 USB-TTL ת���ߣ�
-- [x] Task 2�������� ABI ����TIM2 �����ж� + TIM5 64 λʱ�����
-- [x] Task 3���¼��洢/����/��ϡ��λ�л�
-- [x] Task 4��SD ���洢��SDMMC1 + FatFS �Զ����ݣ�
-- [ ] Task 5��BIN v2 ֡ + PC �������� / Flash �־û�����
-- [ ] ���������Դ�����������ģ�PWM ������� + ת�ٱջ���֤���û����ڽ��ߺ����ѣ�
+### 2026-08-07 夜：Task 7 综合验证（全流程实测）
+- 全流程：ARM → PWM 900 1.5s → 自动 done=6850 点 → Flash+SD 自动保存（S000511.BIN）→ DUMP 109668B（magic=AB1C0002 n=6850 hz=1000，ret 0）→ 复位后 FLASH stored=6850 仍在
+- 修正计划书 T1/T2/T3 历史子步骤勾选遗漏
+- 提交：Task6 58b42df；Task7 fb5bceb
 
 ---
 
-### 2026-08-07��Task 5 Flash оƬ���� + DUMP + README���ϰ���֤ͨ����
-- �û�Ҫ��"оƬ����֮���ڿ��ﱸ��һ��"��snap �ȴ��ڲ� Flash�����粻�������ٱ��� SD
-- �½� `App/flash_save.c/h`��Bank2 ���� 0..3��0x08100000 �� 512KB�������һ�μ�¼��
-  32B ͷ {magic=SNAP_MAGIC_V2, n, hz=1000, crc32(zlib)} + n x SnapPt��H7 32B FLASHWORD ���
-  ����̬ aligned(32) ���壩��FLASH_Dump �� Flash ֱ���ֿ鰴 PC ֡��preamble+<IHH+payload+crc32������ȫ�ٷ�
-- usart.c/h ���� `Usart_Write`��ԭʼ�ֽڿ鷢�ͣ�DUMP �ã�
-- CLI��FLASH��״̬��/ FSAVE���ֶ����棩/ DUMP��оƬ��¼ PC ֡��
-- main.c �Զ������ **DONE ������**��g_done_prev����ÿ�δ������ �� Flash_SaveSnap() �ȡ�SD ���ݺ�
-  ���޸��� g_snap_autosaved �� 1 ��������λ��ֻ��һ�α���� bug��
-- ���� `pc/abi_monitor.py`��δ�ģ��� `H743 motor/pc/`
-### ʵ����֤��2026-08-07��
-- �Զ� DONE �� `Flash save ok: n=6273` + `SD save ok: Sxxxxx.BIN`��`FLASH` stored==current==snap count
-- **DUMP ������֡��100436B��magic=AB1C0002 n=6273 hz=1000 crc_ok=True**
-- **OpenOCD ��λ�� `FLASH` �� data=1 stored=6273**��оƬ������籣����?
-- �Ų��¼��������"��������/��������Ӧ"����ʵΪ����ʱ OpenOCD `-c halt` ��� PC ��δ resume��
-  оƬ��ͣס��`reset run` ���ָ���CLI ������ USART IRQ ��ִ�У�Flash ��дæµ�ڼ� FLASH ���Կ��ܱ�
-  �ϲ�/�̵������Լ��ɣ��ǹ�������
-- README��H743 motor/README.md���ɣ����߱�/����/CLI ȫ��/BIN v2 ֡��ʽ/0.5s ���ڽض�˵��/Flash ����/PC �����÷�
+## 遇到的问题 & 如何解决（完整清单）
+
+| # | 问题 | 根因 | 解决 |
+|---|------|------|------|
+| 1 | xpack GCC 缺 cc1.exe，编译失败 | xpack 版本缺编译核心 | 换 `D:\arm-official` 完整版；Makefile GCC_PREFIX 已改 |
+| 2 | CRC16 表手工数据错乱（excess elements） | 表靠手抄 | 脚本生成标准 256 项表替换 |
+| 3 | USART 不工作 | 例程无 USART、hal_conf 未开 UART | 自建 usart.c（IRQ+FIFO）；开启 `HAL_UART_MODULE_ENABLED` |
+| 4 | 编译报错 `&gp` | 笔误 | 改 `&gpio` |
+| 5 | TIM2 CNT 上电垃圾值 | 上电 CNT 未知 | `__HAL_TIM_SET_COUNTER(0)` |
+| 6 | idx 每转 +2 | EXTI RISING_FALLING | 改只上升沿 |
+| 7 | rpm 显示负数/垃圾 | A/B 反序反向计数 | `0u - TIM2->CNT` 统一取反（signi完成） |
+| 8 | rpm 尖峰 | 单帧异常 | ±60000 钳制 |
+| 9 | SNAP_CAP 32768 放不下 | RAM 预算 BSS 溢出 | 改 31000 |
+| 10 | 自动保存只触发一次 | `g_snap_autosaved` 不复位 | 改 DONE 上升沿 `g_done_prev` |
+| 11 | SD 读写坏 | DCache 与 SDMMC DMA 冲突 | **main.c 关 D-Cache（只开 ICache）**；缓冲 32B对齐（diskio.c 中转） |
+| 12 | REM 无 RTC | 无 RTC | `get_fattime()` 固定 0，文件时间序 |
+| 13 | DUMP/FLASH 串口无响应 | `openocd -c halt` 后 stuck | `-c reset run` 恢复 |
+| 14 | Flash 擦写时 CLI 回显被吞 | CLI 在 USART IRQ 执行+擦写阻塞 | 属正常，加长等待重试 |
+| 15 | 配置结构变大（36B）超 H7 32B FLASHWORD | AppCfg 加了 steps+pol | Config_Save 两次 32B 对齐写（64B 缓冲） |
+| 16 | PC UI"打不开" | **见交接最后一节（待用户后续处理）** | — |
 
 ---
 
-## ����
-- [x] ������֤ CLI��A9/A10 USB-TTL ת���ߣ�
-- [x] Task 2�������� ABI ����TIM2 �����ж� + TIM5 64 λʱ�����
-- [x] Task 3���¼��洢/����/��ϡ��λ�л�
-- [x] Task 4��SD ���洢��SDMMC1 + FatFS �Զ����ݣ�
-- [x] Task 5��Flash оƬ���� + DUMP PC ֡ + README
-- [x] Task 6��ʵ��У׼��һȦ���� EMA/���ԣ�
-- [ ] ���������Դ�����������ģ�PWM ������� + ת�ٱջ���֤���û����ڽ��ߺ����ѣ�
+## 与计划的实施差异（接收人员关注）
 
-### 2026-08-07 Task 6��ʵ��У׼����ʵ��+�����֤��
-- ���� cfg_steps_per_rev��Ĭ�� 4000��Index��Index EMA ƽ������ AppCfg Flash���� cfg_pol��A/B ���ԣ�
-- ���ٹ�ʽ���� Abi_GetStepsPerRev()���滻 STEPS_PER_REV ����
-- CLI: CAL STEPS / CAL SET <n> / CAL RESET��CFG POL 0|1
-- ��� PWM 900 ~1.5s �� idx 146 Ȧ��EMA=4000��AS5047P 4X ���һ�£���ת�� rpm~����
-- CAL SET 4250 �� reset run ������CAL STEPS �ض� 4250��Flash �־û���Ч��
-- ��֤�ű� pc_tool/verify_cal.py��Flash ��дʱ CLI �� USART IRQ ���ӳ٣��ű������̣�
-- �ύ���� COMMIT
+| 计划 | 实施 | 原因 |
+|------|------|------|
+| Keil MDK5 + 例程可视化 | **无 Keil，GNU gcc + Makefile + OpenOCD/STM32CubeProg CLI** | 本机无 Keil UV4 |
+| 记录窗口 0.8s | **0.5s**（readme/文档同步 0.5s） | 与 Snap 点数/RAM/@M成熟档位匹配；PCM 档位数名以实施为准 |
+| ADC？ | — | 无 |
+| SNAP_CAP 32768 | **31000** | BSS 余量考虑 |
+| 自动保存顺序 | 计划先 SD；**实施先 Flash 后 SD** | 用户指示"芯片保存之后在卡里备份" |
+| 文件名 | 计划旧命名 | **`S%07lu.BIN` + FA_CREATE_NEW（不覆盖）**，用户要求 |
+| 接线 A 相 PA0 | **PA5（TIM2_CH1）** | PA0 板上未引出（丝印 A0C=PA0_C 仅 ADC） |
+| 档数 3 | 默认 3（可 4/5） | 同计划 |
+| app 文件名 | `App/cli.c` → **`App/app_cli.c`** | 其他模块衔接 |
+| interrupt 回调 | `App_UartRxCb` → **`Cli_OnChar`** | 自建 usart.c 设计 |
+| FLASH_BASE | 0x081F0000 → **0x081E0000**（扇区 7） | H7 扇区对齐 |
 
-### 2026-08-07 Task 7���ۺ���֤��ȫ����ʵ��ͨ�����̼��׶���ɣ�
-- ȫ���̣�ARM �� PWM900 ~1.5s �� �Զ����� done =6850 �� �� �Զ� Flash ���� + SD ���� S000511.BIN
-- DUMP���յ� 109668B = 11+8+6850*16+4��magic=0xAB1C0002 n=6850 hz=1000��dump ret=0
-- ��λ�־ã�FLASH data=1 stored=6850��оƬ��������CAL 4000����λ 1/2/4 ����
-- �޸��ƻ��� T1/T2/T3 ��ʷ�Ӳ��蹴ѡ��©��������ʵ��+����֤+�ύ��
-- �ύ��Task6 58b42df��Task7 ���ύ
+### 遗留/待办（接收人员）
+- [ ] **PC UI（pc/abi_monitor.py）"打不开"**：用户已要求稍后处理。排查结论：脚本实际可正常进入 mainloop（本会话运行并从超时验证），Tk/依赖齐全；**最可疑是单实例端口锁（端口 47329 已被某实例占用时第二个进程静默 `sys.exit(0)`）**。处理入口：核对本机是否残留旧 python 进程（`netstat -ano | findstr 47329` / 任务管理器杀残留）+ 幂等锁改为可强制覆盖。另：UI 有 `ui_crash.log`（`pc/` 下）。
+- [ ] 转速闭环/PWM 驱动段（非本期）——需电机动力电源接入后实测 | 本工作日志已含接线提醒
+- [ ] 有屏蔽说明（burst）更新（PC UI 曲线）。DUMP ± 对应帧
+- [ ] SD 卡驱动不恢复上，仅本启动期的 S<秒> 唯一
+
+---
+
+## 重要运行备注（调试/验证时）
+- 串口 COM21 @ 921600（CP210x USB-TTL）
+- 板上电机动力电源只在测试瞬间接入（PWM 900 ~1.5s 即停）
+- `RPM ON` 每秒回显 转速+counts+idx+div，是验证测速的最快方式
+- 凡是改动内存访问/DMA，**勿重开 D-Cache**（见 issue 11）
+- Git 提交规范与本仓库一致：`feat(h743): Task...` / `docs(h743): ...`
+
+## 提交历史
+```
+fb5bceb docs(h743): Task7 综合验证全流程实测通过（ARM→驱动→自动保存→DUMP→复位持久）
+58b42df feat(h743): Task6 Index一圈步数EMA校准(可存Flash) + A/B方向极性可配(POL)
+73d210f feat(h743): Task5 Flash芯片保存+DUMP PC帧(掉电不丢) + README + 自动保存改DONE上升沿
+d81255c feat(h743): Task4 SDMMC1+FatFS 自动备份(时间名不覆盖,BIN v2+crc32) + 自动验证脚本 + 板级RFI修复(DCache/对齐/DMA)
+9ccfca5 feat(h743): Task3 事件记录管线 ring回溯+0.8s自动触发 BIN v2 + 自动验证脚本
+5cb88eb feat(h743): Task2 测速修复(TIM2清零/EXTI4上升沿/方向补偿) + 油门特性自学习脚本
+```

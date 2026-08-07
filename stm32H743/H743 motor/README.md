@@ -96,6 +96,17 @@ python abi_monitor.py --usb      # 指定串口方式（默认优先蓝牙）
 
 > 每次触发后板子的 DUMP 内容与 SD 文件字节一致，可交叉比对其一致性。
 
+### 7.1 PC UI "打不开"排查（2026-08-07 记录）
+
+现象：双击 `abi_monitor.py` 后无窗口。排查结论（本机 Python 3.12、tkinter/pyserial/bleak 均正常，
+脚本可正常进入 mainloop）——**最可疑是单实例端口锁**：
+
+- 脚本启动时绑定 `127.0.0.1:47329`（仿真 47330），若已有一个实例在跑，
+  后续进程会打印 `ABI monitor already running` 并 `sys.exit(0)`（无窗口 = "打不开"）。
+- 处理：`netstat -ano | findstr 47329` 查占用 PID → `taskkill /PID <pid> /F`；或重启电脑清残留。
+- UI 运行期异常会写 `pc/ui_crash.log`，对照排查。
+- 若需串口模式，用 `--usb`（否则默认走蓝牙 BLE）。
+
 ---
 
 ### 已知约束 / 提示
