@@ -645,7 +645,7 @@ git commit -m "feat(h743): Task5 Flash芯片保存+DUMP PC帧 + README"
 - Consumes: `cfg_steps_per_rev`（app_config.c 新增字段）
 - Produces: `uint32_t Abi_GetStepsPerRev(void)`
 
-- [ ] **Step 1: Index→Index 实测步数（EMA 平滑）**
+- [x] **Step 1: Index→Index 实测步数（EMA 平滑）**
 
 照 DSP：每次 Index 触发记下 `prev_cnt`，下一次 Index 得到 `dpos_one_rev`，`steps_ema = (steps_ema*7 + dpos)/8`；存入配置 `cfg_steps_per_rev`（掉电保存）。测速公式改用它替换 4000 常量。
 
@@ -661,15 +661,15 @@ void Index_Calibrate(uint32_t cnt)
 }
 ```
 
-- [ ] **Step 2: CLI**
+- [x] **Step 2: CLI**
 
 `CAL STEPS` → 回显当前 EMA 步数；`CAL SET <n>` → 手动设置；`CAL RESET` → 恢复 4000。
 
-- [ ] **Step 3: 实测验证**
+- [x] **Step 3: 实测验证**
 
 电机连编码器（或手动慢转一整圈，从任一 Index 脉冲起）→ 记录 `dpos` 与标称 4000 对比。多圈后 `CAL STEPS` 稳定。若 A/B 反相（倒着转），CLI 加 `CFG POL` 切换 IC 极性（TIM2 IC 极性翻转），确保正向转动 counts 递增。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add "H743 motor/firmware/abi_monitor_h743"

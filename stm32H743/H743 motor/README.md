@@ -41,6 +41,10 @@ mingw32-make flash     # OpenOCD ST-Link 烧录 + 校验 + 软复位
 | `HELP` | 帮助 |
 | `ID` | 版本 & 波特率 |
 | `CFG SHOW / SAVE / RESET / GEAR n d1..dn b1..b(n-1)` | 档位抽稀表（默认 3 档 div 1/2/4 @ 4000/8000rpm，可存 Flash） |
+| `CFG POL 0\|1` | A/B 方向极性（0=计数反向取反（默认），1=正向直接计入） |
+| `CAL STEPS` | 显示 Index→Index 实测一圈步数（EMA 平滑） |
+| `CAL SET <n>` | 手动写一圈步数并保存 Flash（测速公式实时用） |
+| `CAL RESET` | 恢复默认 4000 |
 | `PWM 0..1000` | 测试电机占空比（‰，0 停机；Pm_Tick 斜坡靠近目标） |
 | `RPM [ON/OFF]` | 实时转速回显 |
 | `CNT / IDX` | 编码器计数 / Index 圈数 |

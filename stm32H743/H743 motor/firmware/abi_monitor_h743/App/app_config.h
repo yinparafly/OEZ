@@ -30,6 +30,10 @@
 #define CFG_FLASH_BASE      0x081E0000UL    /* Bank2 末扇区（扇区15=Bank2第8个=0x081E0000）*/
 #define CFG_MAGIC           0xA5A5C0DEUL
 
+/* 默认一圈步数（4X 标称 4000）/ 极性（0=反向计数需取反，1=正向计入） */
+#define CFG_STEPS_PER_REV_DEFAULT  4000UL
+#define CFG_POL_DEFAULT            0
+
 /*------------------------------------------ 宏 ------------------------------------*/
 
 #define CLAMP(x, lo, hi)   (((x) < (lo)) ? (lo) : (((x) > (hi)) ? (hi) : (x)))
@@ -40,6 +44,8 @@ extern uint32_t cfg_baud;
 extern uint8_t  cfg_gear_n;                          /* 当前档数 3/4/5 */
 extern uint8_t  cfg_gear_div[CFG_GEAR_MAX];          /* div 表 */
 extern uint32_t cfg_gear_bnd[CFG_GEAR_MAX - 1];      /* rpm 边界 */
+extern uint32_t cfg_steps_per_rev;                   /* 实测一圈步数（Index→Index EMA） */
+extern uint8_t  cfg_pol;                             /* A/B 方向极性（0=反向取反，1=正向） */
 
 void    Config_Load(void);
 void    Config_Save(void);
@@ -49,5 +55,7 @@ uint8_t Config_GetGearDiv(uint8_t i);
 uint32_t Config_GetGearBnd(uint8_t i);
 uint8_t Config_CheckGear(uint8_t n, const uint8_t *div, const uint32_t *bnd);
 void    Config_SetGear(uint8_t n, const uint8_t *div, const uint32_t *bnd);
+void    Config_SetStepsPerRev(uint32_t steps);
+void    Config_SetPol(uint8_t pol);
 
 #endif /* __APP_CONFIG_H */

@@ -16,13 +16,18 @@ uint32_t cfg_baud = CFG_UART_BAUD;
 uint8_t  cfg_gear_n  = 3;                                   /* 档数 3/4/5 */
 uint8_t  cfg_gear_div[CFG_GEAR_MAX] = {1, 2, 4, 0, 0};      /* div 表 */
 uint32_t cfg_gear_bnd[CFG_GEAR_MAX - 1] = {4000, 8000, 0, 0}; /* 边界 rpm */
+uint32_t cfg_steps_per_rev = CFG_STEPS_PER_REV_DEFAULT;    /* 实测一圈步数（Index→Index EMA） */
+uint8_t  cfg_pol  = CFG_POL_DEFAULT;                        /* A/B 方向极性 */
 
 #define CFG_FLASH_SECTOR    7               /* 0x081E0000 = Bank2 第 8 个扇区（0..7）*/
 
 typedef struct {
     uint32_t magic;                      /* 校验字 */
+    uint32_t steps_per_rev;              /* 实测一圈步数 */
     uint8_t  gear_n;
     uint8_t  gear_div[CFG_GEAR_MAX];
+    uint8_t  pol;                        /* A/B 方向极性 */
+    uint8_t  rsvd;
     uint32_t gear_bnd[CFG_GEAR_MAX - 1];
     uint16_t crc;                        /* CRC16，查表 */
     uint16_t pad;
@@ -79,9 +84,11 @@ static void Cfg_Default(AppCfg *c)
 {
     memset(c, 0, sizeof(AppCfg));
     c->magic = CFG_MAGIC;
+    c->steps_per_rev = CFG_STEPS_PER_REV_DEFAULT;
     c->gear_n = 3;
     c->gear_div[0] = 1; c->gear_div[1] = 2; c->gear_div[2] = 4;
     c->gear_bnd[0] = 4000; c->gear_bnd[1] = 8000;
+    c->pol = CFG_POL_DEFAULT;
     c->crc = Crc16((const uint8_t *)c, sizeof(AppCfg) - 4);
 }
 
@@ -98,6 +105,8 @@ void Config_Load(void)
     cfg_gear_n  = g_cfg.gear_n;
     memcpy(cfg_gear_div, g_cfg.gear_div, sizeof(cfg_gear_div));
     memcpy(cfg_gear_bnd, g_cfg.gear_bnd, sizeof(cfg_gear_bnd));
+    cfg_steps_per_rev = g_cfg.steps_per_rev;
+    cfg_pol = g_cfg.pol;
 }
 
 void Config_Save(void)
@@ -110,12 +119,27 @@ void Config_Save(void)
     erase.NbSectors = 1;
     uint32_t err = 0;
     if (HAL_FLASHEx_Erase(&erase, &err) == HAL_OK) {
-        /* H7 按 32B FLASH WORD 编程：一次性写入整个双字组 */
-        uint32_t buf[8] = { 0 };
+        /* H7 按 32B FLASH WORD 编程；配置 36B → 两次对齐写，多余区为 0 */
+        static uint64_t buf[8] __attribute__((aligned(32)));    /* 64B 对齐缓冲 */
+        memset(buf, 0, sizeof(buf));
         memcpy(buf, &g_cfg, sizeof(AppCfg));
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD, CFG_FLASH_BASE, (uint32_t)(uintptr_t)buf);
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD, CFG_FLASH_BASE + 32,
+                          (uint32_t)(uintptr_t)((uint8_t *)buf + 32));
     }
     HAL_FLASH_Lock();
+}
+
+/* 全局 → g_cfg → Flash（其他 setter 复用，互不覆盖） */
+static void Config_Persist(void)
+{
+    g_cfg.gear_n       = cfg_gear_n;
+    memcpy(g_cfg.gear_div, cfg_gear_div, sizeof(cfg_gear_div));
+    memcpy(g_cfg.gear_bnd, cfg_gear_bnd, sizeof(cfg_gear_bnd));
+    g_cfg.steps_per_rev = cfg_steps_per_rev;
+    g_cfg.pol           = cfg_pol;
+    g_cfg.crc = Crc16((const uint8_t *)&g_cfg, sizeof(AppCfg) - 4);
+    Config_Save();
 }
 
 uint8_t Config_GetGearN(void)      { return cfg_gear_n; }
@@ -138,22 +162,32 @@ uint8_t Config_CheckGear(uint8_t n, const uint8_t *div, const uint32_t *bnd)
 
 void Config_SetGear(uint8_t n, const uint8_t *div, const uint32_t *bnd)
 {
-    Cfg_Default(&g_cfg);   /* 先复位到默认，再覆盖 */
-    g_cfg.gear_n = n;
-    memcpy(g_cfg.gear_div, div, CFG_GEAR_MAX);
-    memcpy(g_cfg.gear_bnd, bnd, (CFG_GEAR_MAX - 1) * 4);
-    g_cfg.crc = Crc16((const uint8_t *)&g_cfg, sizeof(AppCfg) - 4);
-    Config_Save();
     cfg_gear_n = n;
-    memcpy(cfg_gear_div, g_cfg.gear_div, sizeof(cfg_gear_div));
-    memcpy(cfg_gear_bnd, g_cfg.gear_bnd, sizeof(cfg_gear_bnd));
+    memcpy(cfg_gear_div, div, CFG_GEAR_MAX);
+    for (uint8_t i = n; i < CFG_GEAR_MAX; i++) cfg_gear_div[i] = 0;
+    memcpy(cfg_gear_bnd, bnd, (CFG_GEAR_MAX - 1) * 4);
+    for (uint8_t i = n - 1; i < CFG_GEAR_MAX - 1; i++) cfg_gear_bnd[i] = 0;
+    Config_Persist();
 }
 
 void Config_Reset(void)
 {
-    Cfg_Default(&g_cfg);
-    Config_Save();
-    cfg_gear_n  = g_cfg.gear_n;
-    memcpy(cfg_gear_div, g_cfg.gear_div, sizeof(cfg_gear_div));
-    memcpy(cfg_gear_bnd, g_cfg.gear_bnd, sizeof(cfg_gear_bnd));
+    cfg_gear_n  = 3;
+    cfg_gear_div[0] = 1; cfg_gear_div[1] = 2; cfg_gear_div[2] = 4;
+    cfg_gear_div[3] = 0; cfg_gear_div[4] = 0;
+    cfg_gear_bnd[0] = 4000; cfg_gear_bnd[1] = 8000;
+    cfg_gear_bnd[2] = 0; cfg_gear_bnd[3] = 0;
+    Config_Persist();
+}
+
+void Config_SetStepsPerRev(uint32_t steps)
+{
+    cfg_steps_per_rev = CLAMP(steps, 1u, 200000u);
+    Config_Persist();
+}
+
+void Config_SetPol(uint8_t pol)
+{
+    cfg_pol = pol ? 1 : 0;
+    Config_Persist();
 }

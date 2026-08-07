@@ -187,5 +187,14 @@ P1-1 DIO(SWDIO/PA13) â†’ SWDIOï¼›P1-2 SWCLK â†’ SWCLKï¼›P1-3 GNDï¼›P1-4 5Vï¼ˆä¸
 - [x] Task 3£ºÊÂ¼þ´æ´¢/»ØËÝ/³éÏ¡µµÎ»ÇÐ»»
 - [x] Task 4£ºSD ¿¨´æ´¢£¨SDMMC1 + FatFS ×Ô¶¯±¸·Ý£©
 - [x] Task 5£ºFlash Ð¾Æ¬±£´æ + DUMP PC Ö¡ + README
-- [ ] Task 6£ºÊµ²âÐ£×¼£¨Ò»È¦²½Êý EMA/¼«ÐÔ£©
+- [x] Task 6£ºÊµ²âÐ£×¼£¨Ò»È¦²½Êý EMA/¼«ÐÔ£©
 - [ ] µç»ú¶¯Á¦µçÔ´½ÓÈëºó²ÅÄÜ×öµÄ£ºPWM Çý¶¯µç»ú + ×ªËÙ±Õ»·ÑéÖ¤£¨ÓÃ»§ÐèÔÚ½ÓÏßºóÌáÐÑ£©
+
+### 2026-08-07 Task 6£ºÊµ²âÐ£×¼£¨ÒÑÊµÏÖ+µç»úÑéÖ¤£©
+- ÐÂÔö cfg_steps_per_rev£¨Ä¬ÈÏ 4000£¬Index¡úIndex EMA Æ½»¬´æÈë AppCfg Flash£©Óë cfg_pol£¨A/B ¼«ÐÔ£©
+- ²âËÙ¹«Ê½¸ÄÓÃ Abi_GetStepsPerRev()£¬Ìæ»» STEPS_PER_REV ³£Á¿
+- CLI: CAL STEPS / CAL SET <n> / CAL RESET£»CFG POL 0|1
+- µç»ú PWM 900 ~1.5s ¡ú idx 146 È¦£¬EMA=4000£¨AS5047P 4X ±ê³ÆÒ»ÖÂ£©£¬×ªËÙ rpm~ºÏÀí
+- CAL SET 4250 ºó reset run ÖØÆô£¬CAL STEPS »Ø¶Á 4250£¨Flash ³Ö¾Ã»¯ÉúÐ§£©
+- ÑéÖ¤½Å±¾ pc_tool/verify_cal.py£¨Flash ²ÁÐ´Ê± CLI ÔÚ USART IRQ ÄÚÑÓ³Ù£¬½Å±¾ÒÑÈÝÈÌ£©
+- Ìá½»£º´ý COMMIT

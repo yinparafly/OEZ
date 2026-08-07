@@ -27,6 +27,17 @@ static volatile uint64_t g_tick64;
 static volatile int32_t  g_rpm;      /* 事件差分测速（有符号） */
 static volatile uint32_t g_idx_cnt;  /* Index 圈数 */
 
+/* Index→Index EMA 校准时基准：1 圈实测 4X 步数，EMA 平滑 */
+static uint32_t g_ema_prev_cnt;
+static volatile uint32_t g_ema_steps;   /* 0=未校准 */
+
+/* 方向修正：cfg_pol=0（默认）A/B 反相接法 → 计数反向，取反对齐正向；
+ * cfg_pol=1 正相接法 → 直接采用 CNT。ISR 与主循环共用。 */
+static uint32_t SignCnt(uint32_t raw)
+{
+    return cfg_pol ? raw : (0u - raw);
+}
+
 /*------------------------------------------ TIM2 编码器 4X --------------------*/
 
 static void Tim2_Encoder_Init(void)
@@ -84,8 +95,17 @@ void EXTI4_IRQHandler(void)
 {
     if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_4) != RESET) {
         __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_4);
+        Snap_OnIndex();                 /* state 无关回调（记录打到 Index 帧） */
+        uint32_t cnt = SignCnt(TIM2->CNT);   /* 用事件时刻 counts 校准 */
+        if (g_ema_prev_cnt) {
+            uint32_t d = cnt - g_ema_prev_cnt;
+            if (d > 0 && d < 100000u) {
+                if (!g_ema_steps) g_ema_steps = d;          /* 首圈直接取 */
+                else g_ema_steps = (uint32_t)(((uint64_t)g_ema_steps * 7 + d) / 8);
+            }
+        }
+        g_ema_prev_cnt = cnt;
         g_idx_cnt++;
-        Snap_OnIndex();
     }
 }
 
@@ -120,18 +140,18 @@ void TIM5_IRQHandler(void)
     g_tick64 += htim5.Instance->ARR;
     uint32_t us_now = (uint32_t)(g_tick64 / 60uL);
 
-    /* 2) 事件读取：A/B 相序使 TIM2 反向计数，取反后正转 = 递增（与 idx 同向） */
-    uint32_t cnt = 0u - TIM2->CNT;
+    /* 2) 事件读取：A/B 相序可能使 TIM2 反向计数，SignCnt 取反保证正向=递增 */
+    uint32_t cnt = SignCnt(TIM2->CNT);
     static uint32_t prev_cnt;
     int32_t dpos = (int32_t)(cnt - prev_cnt);
     prev_cnt = cnt;
 
-    /* 3) 测速：事件差分 rpm = dpos×60e6 / (dt_us×4000) */
+    /* 3) 测速：事件差分 rpm = dpos×60e6 / (dt_us×steps_per_rev) */
     static uint64_t prev_tick64;
     uint32_t dt_us = (uint32_t)((g_tick64 - prev_tick64) / 60uL);
     prev_tick64 = g_tick64;
     if (dt_us && dpos) {
-        int64_t rpm = (int64_t)dpos * 60000000LL / (int64_t)dt_us / (int64_t)STEPS_PER_REV;
+        int64_t rpm = (int64_t)dpos * 60000000LL / (int64_t)dt_us / (int64_t)Abi_GetStepsPerRev();
         if (rpm > 60000)  rpm = 60000;    /* 合理性钳制：>6 万 rpm 视为异常 */
         if (rpm < -60000) rpm = -60000;
         g_rpm = (int32_t)rpm;
@@ -171,7 +191,24 @@ void Abi_Init(void)
 int32_t Abi_GetRpm(void)      { return (int32_t)g_rpm; }
 uint32_t Abi_GetIndexCnt(void){ return g_idx_cnt; }
 uint32_t Abi_GetUsNow(void)   { return (uint32_t)(g_tick64 / 60uL); }
-uint32_t Abi_GetCnt(void)     { return 0u - TIM2->CNT; }   /* 与 UTO ISR 同向补偿 */
+uint32_t Abi_GetCnt(void)     { return SignCnt(TIM2->CNT); }   /* 与 UTO ISR 同向修正 */
+
+/* 测速一圈步数：持久化配置 cfg_steps_per_rev（默认 4000），恒 >=1 防除零 */
+uint32_t Abi_GetStepsPerRev(void)
+{
+    return (cfg_steps_per_rev && cfg_steps_per_rev < 200000u) ? cfg_steps_per_rev : STEPS_PER_REV;
+}
+
+/* Index 校准 EMA 当前值（0=尚未拿到首圈差分） */
+uint32_t Abi_GetCalib(void)   { return g_ema_steps; }
+
+/* CAL SET：把 EMA 步骤写入持久化配置并清零重校 */
+void Abi_SetCalibSteps(uint32_t steps)
+{
+    Config_SetStepsPerRev(steps);
+    g_ema_steps = 0;
+    g_ema_prev_cnt = 0;
+}
 
 /* 查档位表：|rpm| < bnd[i] → div[i]，否则末档 */
 uint8_t Abi_GetDiv(void)

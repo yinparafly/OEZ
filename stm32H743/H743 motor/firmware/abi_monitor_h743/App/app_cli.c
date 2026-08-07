@@ -60,6 +60,10 @@ static void cli_help(void)
     put("CFG RESET         - 恢复默认档位\r\n");
     put("CFG GEAR n d1..dn b1..b(n-1)\r\n");
     put("                  - 设置 n 档抽稀（5files_max=5, d=1/2/4/8/16, b 逐增）\r\n");
+    put("CFG POL 0|1       - A/B 方向极性（0=计数反向取反，1=正向计入）\r\n");
+    put("CAL STEPS         - 显示 Index→Index 实测步数（EMA）\r\n");
+    put("CAL SET <n>       - 手动写一圈步数（掉电保存）\r\n");
+    put("CAL RESET         - 恢复 4000\r\n");
     put("PWM 0..1000      - 测试电机占空比（‰，0 停机）\r\n");
     put("RPM [ON|OFF]    - 转速（ON 每秒回显一次）\r\n");
     put("CNT              - counts + Index + µs\r\n");
@@ -104,6 +108,14 @@ static void cli_cfg(uint8_t n, char *argv[])
     if (strcmp(argv[1], "SHOW") == 0)        { cli_cfg_show(); return; }
     if (strcmp(argv[1], "SAVE") == 0)        { Config_Save();  put("saved\r\n"); return; }
     if (strcmp(argv[1], "RESET") == 0)       { Config_Reset(); put("reset\r\n"); cli_cfg_show(); return; }
+    if (strcmp(argv[1], "POL") == 0) {
+        if (n < 3) { put("用法: CFG POL 0|1\r\n"); return; }
+        uint32_t pol = strtoul(argv[2], 0, 0);
+        if (pol > 1) { put("0 或 1\r\n"); return; }
+        Config_SetPol((uint8_t)pol);
+        put("pol = "); put_u32(cfg_pol); put("\r\n");
+        return;
+    }
 
     if (strcmp(argv[1], "GEAR") == 0) {
         uint8_t  div[CFG_GEAR_MAX] = { 0 };       /* d1..dn */
@@ -164,6 +176,31 @@ static void cli_cnt(void)
 static void cli_idx(void)
 {
     put("idx = "); put_u32(Abi_GetIndexCnt()); put("\r\n");
+}
+
+/* CAL：Index→Index 实测步数（Task 6 校准） */
+static void cli_cal(uint8_t n, char *argv[])
+{
+    if (n < 2 || strcmp(argv[1], "STEPS") == 0) {
+        put("steps_per_rev = "); put_u32(Abi_GetStepsPerRev());
+        put(" (EMA="); put_u32(Abi_GetCalib()); put(")\r\n");
+        return;
+    }
+    if (strcmp(argv[1], "SET") == 0) {
+        if (n < 3) { put("用法: CAL SET <n>\r\n"); return; }
+        uint32_t steps = strtoul(argv[2], 0, 0);
+        if (steps < 1 || steps > 200000u) { put("范围 1..200000\r\n"); return; }
+        Abi_SetCalibSteps(steps);
+        put("steps set + saved = "); put_u32(Abi_GetStepsPerRev()); put("\r\n");
+        return;
+    }
+    if (strcmp(argv[1], "RESET") == 0) {
+        Config_SetStepsPerRev(CFG_STEPS_PER_REV_DEFAULT);
+        Abi_SetCalibSteps(CFG_STEPS_PER_REV_DEFAULT);
+        put("steps reset = "); put_u32(Abi_GetStepsPerRev()); put("\r\n");
+        return;
+    }
+    put("用法: CAL STEPS|SET <n>|RESET\r\n");
 }
 
 /* SNAP：状态/点数（验证自动触发用） */
@@ -259,6 +296,7 @@ static void Cli_Process(const char *line, uint16_t len)
     else if (strcmp(argv[0], "RPM") == 0)        cli_rpm(n, argv);
     else if (strcmp(argv[0], "CNT") == 0)        cli_cnt();
     else if (strcmp(argv[0], "IDX") == 0)        cli_idx();
+    else if (strcmp(argv[0], "CAL") == 0)        cli_cal(n, argv);
     else if (strcmp(argv[0], "ARM") == 0)        { Snap_Arm();    put("armed (等转速过阈+一整圈自动触发)\r\n"); }
     else if (strcmp(argv[0], "DISARM") == 0)     { Snap_Disarm(); put("disarmed\r\n"); }
     else if (strcmp(argv[0], "SNAP") == 0)       cli_snap();

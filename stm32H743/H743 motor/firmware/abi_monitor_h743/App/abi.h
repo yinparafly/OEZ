@@ -33,5 +33,8 @@ uint32_t Abi_GetIndexCnt(void);
 uint32_t Abi_GetUsNow(void);   /* 64 位 µs 计数的低 32 位 */
 uint8_t  Abi_GetDiv(void);
 uint32_t Abi_GetCnt(void);     /* 当前 counts（调试用） */
+uint32_t Abi_GetStepsPerRev(void); /* 测速用一圈步数（cfg_steps_per_rev，默认 4000） */
+uint32_t Abi_GetCalib(void);       /* 当前 Index→Index EMA 步数（0=尚无首圈差分） */
+void Abi_SetCalibSteps(uint32_t steps); /* CAL SET：写入 EMA 基准并持久化 */
 
 #endif /* __ABI_H */
